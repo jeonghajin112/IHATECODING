@@ -33,90 +33,49 @@
 - [x] sanitized `projects-v1.json` fixture와 strict legacy schema 존재
 - [x] Rust preview bundle identifier가 production과 분리됨
 - [x] remote child WebView가 `main` WebView의 IPC capability를 상속하지 않음
-- [ ] lossless legacy reader 및 resource limit 구현
-- [ ] versioned Rust workspace model 및 schema 구현
-- [ ] crash-safe writer, backup rotation 및 corruption recovery 구현
+- [x] lossless legacy reader 및 resource limit 구현
+- [x] versioned Rust workspace model 및 schema 구현
+- [x] crash-safe writer, backup rotation 및 corruption recovery 구현
 - [ ] copied production catalog에 대한 가역 import 검수
 
-### 현재 구현 스냅샷: Phase 3A foundation
+### 현재 구현 스냅샷: Phase 3B automated slice
 
-이 절은 합격 선언이 아니라 2026-07-17 현재 구현과 목표 계약 사이의 경계를 기록한다.
-현재 backend는 legacy 호환 `ProjectCatalogV1`을 직접 저장하는 foundation이며, 아래
-Phase 3B `workspace-v1` 계약을 구현한 것으로 간주하지 않는다.
+이 절은 Phase 3 종료 선언이 아니라 2026-07-17 현재 자동화된 범위를 기록한다. 기존
+Phase 3A `ProjectCatalogV1` 저장소는 현재 터미널 UI의 실행 상태를 계속 담당하고,
+새 `workspace-v1`은 별도의 migration preview 저장소다. 가져온 프로젝트로 터미널을
+시작하거나 Codex/Grok을 resume하지 않는다. 실제 런타임 전환은 후속 Phase 4 작업이다.
 
-구현되어 자동 테스트가 존재하는 foundation:
+구현되어 자동 테스트가 존재하는 Phase 3B 범위:
 
-- PascalCase project/terminal catalog parser와 16 MiB 파일 상한
-- 필수 field, project/terminal ID 중복, project당 terminal 20개, 양수 ratio 및 RFC 3339
-  timestamp 검증
-- catalog/project/terminal의 `serde(flatten)` unknown field 보존과 기존 ID 기준 backend
-  merge 방어
-- 기본 `%LOCALAPPDATA%\IHATECODING\RustPreview\Projects\projects-v1.json` 경로,
-  process 내부 mutex, 같은 directory temp + flush + atomic replace
-- 최근 3개 backup, corrupt primary save 거부, 명시적 recovery/reset, main이 없고 backup이
-  있으면 일반 save 거부
-- main WebView의 비동기 load/save command와 메모리 내 empty/project tab
-- 새 terminal의 Codex/Grok ID를 `null`로 만들며 Phase 3에서 agent resume를 호출하지 않음
+- Tauri `app_local_data_dir()/state/workspace-v1.json`의 canonical schema v1,
+  backend-owned revision/timestamp/import provenance와 persisted tab/layout/alert 모델
+- 8 MiB 입력 상한, duplicate JSON member/UTF-8/trailing data/resource bound 검증,
+  unknown legacy field exact-byte snapshot 보존
+- detached copy의 read-only stable read, SHA-256/길이/mtime/file ID/ACL fingerprint 재검사,
+  inspect token에 결합된 two-phase import와 동일 hash idempotency
+- `expectedRevision` CAS, process-lifetime writer lock, 두 번째 instance read-only,
+  same-directory temp flush/재검증, `ReplaceFileW` write-through commit과 3세대 backup
+- corrupt/missing primary의 fail-closed load, opaque backup/temp 후보, 사용자가 고르는 복구,
+  corrupt primary exact-byte quarantine
+- local `main` WebView guard, `spawn_blocking` storage commands, structured redacted errors,
+  JavaScript safe-integer 경계와 read-only import/recovery/future-version frontend state machine
+- sidebar의 저장소 상태, 분리 복사본 검사/명시적 교체 및 verified recovery UI
 
-아직 구현되지 않아 이 문서의 관련 checkbox를 완료할 수 없는 Phase 3B 항목:
+자동 검증은 `cargo fmt --check`, 전체 `cargo clippy -D warnings`, Rust all-target tests,
+frontend test 56개와 frontend build를 통과했다. Rust suite에는 실제 20개 ConPTY와
+Job Object 종료 회귀도 계속 포함된다. 테스트는 UUID 기반 임시 디렉터리와 sanitized
+fixture만 사용하며 실제 production catalog 또는 agent session content를 읽지 않는다.
 
-- canonical `workspace-v1.json`, 필수 `schemaVersion`, monotonic `revision`,
-  `writtenAtUtc`, import provenance와 migration chain
-- empty/project/browser/output tab, active tab 및 layout 전체의 영속화
-- exact-byte legacy snapshot, SHA-256/metadata 검증과 inspect/commit을 분리한 two-phase import
-- `expectedRevision` CAS, process 간 lock, backend-owned storage flush drain과 storage change notification
-- final file identity/hard-link/reparse-point 검증 및 production tree descendant 차단
-- 여러 recovery candidate 선택, provenance 표시 및 import UI
+Phase 3 종료 전에 남은 gate:
 
-2026-07-17 foundation 회귀 검증은 `cargo fmt --check`, `cargo clippy -D warnings`, Rust
-all-target test 38개, frontend test 38개와 frontend build까지 통과했다. 실제 PowerShell을
-spawn한 직후 Job Object 할당 전에 멈추는 결정적 종료 경합 테스트도 포함한다. 이는 아래 P0-A부터
-P0-I까지의 fault/integration/manual gate를 대신하지 않는다.
+- 사용자가 만든 production catalog **복사본**으로 M1 가역 import/rollback 수동 검수
+- directory handle을 유지한 최종 target identity 및 reparse-swap 방어, 상속 ACL 확인
+- future schema raw payload를 손실 없이 보여 주는 IPC/read-only UX와 version golden chain
+- backend storage drain/change notification 및 crash/process-kill Windows 수동 matrix
+- M2~M5 corruption/path/privacy/multi-instance/performance 수동 기록
 
-### 현재 구현 격차 우선순위
-
-다음 우선순위는 foundation을 production migration에 사용하기 전에 닫아야 할 위험이다.
-
-**P0 — 데이터 원본 또는 무손실 계약을 깨뜨릴 수 있음**
-
-- startup의 정규화된 exact-path/same-parent 검사와 inspect source 차단은 구현됐다. 하지만
-  save target을 모든 production candidate에 대해 매 write마다 file identity로 비교하지
-  않는다. production tree descendant, hard-link identity, 비 ASCII case alias와 validation
-  이후 junction 교체가 남아 있어 원본 alias 차단 gate는 아직 완료할 수 없다.
-- detached-copy 검사는 boolean 확인과 typed parse뿐이다. exact-byte snapshot/hash가 없고
-  최초 import 값은 Rust→Tauri→JavaScript→Rust를 왕복하므로 `2^53`보다 큰 unknown JSON
-  정수 같은 값이 backend merge 보호를 받기 전에 달라질 수 있다.
-- corrupt/missing primary에 대한 단일-process save 거부는 구현됐지만, valid-main 검사와
-  atomic replace가 revision/file identity로 묶이지 않았다. 다른 instance가 그 사이 main을
-  변경하거나 손상시키면 stale snapshot이 새 bytes를 조용히 덮어쓸 수 있다.
-
-**P1 — 기능 누락, 복구 혼동 또는 일반적인 변경 유실 가능성**
-
-- `workspace-v1`, revision/CAS/process lock, persisted tabs/layout와 two-phase import가 없다.
-- backup fallback은 `recoveryRequired`로 구분되고 UI가 terminal 자동 시작과 쓰기를 막은 뒤
-  명시적 복구 버튼을 제공한다. 다만 여러 세대 중 후보 선택과 provenance 표시는 없다.
-- project 수, string/extension depth·size, ratio vector/key와 tab 수의 독립 상한이 없고,
-  unknown duplicate JSON member 거부도 검증되지 않았다.
-- backend는 project folder와 terminal start directory의 절대 경로/중복/관계를 검증하지
-  않는다. frontend 비교는 lexical 및 locale case folding에 의존한다.
-- main-window 정상 종료는 frontend save queue를 drain하고, 단일 backend terminal barrier가
-  queued start와 active process tree를 정리한 뒤에만 창을 파괴한다. 저장 실패 시 창을 유지한다.
-  다만 backend-owned storage flush drain과 backup rotation/I/O failure 지점별 crash injection
-  검증은 없다.
-- corrupt quarantine copy에는 별도 byte 상한이 없어 명시적 reset/recovery 중 과도한 disk
-  사용을 일으킬 수 있다.
-
-**P2 — 운영성, 진단과 방어 심화**
-
-- Tauri 오류가 안정적인 code/details 구조가 아닌 문자열이며 일부 frontend 검증 오류는
-  ID 또는 절대 경로를 포함한다.
-- backup/recovery provenance, timestamp/hash 목록, ACL fingerprint와 recovery telemetry가
-  없다. telemetry를 추가하더라도 경로/agent ID/raw state는 포함하면 안 된다.
-- 기본 preview 위치를 Tauri `app_local_data_dir()` resolver가 아니라 `LOCALAPPDATA`
-  environment 조합으로 계산한다.
-
-P0가 하나라도 열려 있으면 production catalog를 source 또는 target으로 직접 연결하지
-않는다. Phase 3A preview는 새 격리 저장소와 sanitized/복사본 테스트에만 사용한다.
+이 항목이 닫히기 전에는 production catalog를 직접 source/target으로 연결하지 않으며,
+C# baseline과 rollback branch/tag를 유지한다.
 
 ### 구현 전 해결해야 할 계약 충돌
 
@@ -159,12 +118,12 @@ root의 content hash, 길이, last-write time과 ACL fingerprint를 비교한다
 
 필수 자동 테스트 식별자:
 
-- [ ] `phase3_legacy_fixture_matches_csharp_shape`
-- [ ] `phase3_rejects_duplicate_json_members`
-- [ ] `phase3_rejects_oversized_catalog_before_parse`
+- [x] `phase3_legacy_fixture_matches_csharp_shape`
+- [x] `phase3_rejects_duplicate_json_members`
+- [x] `phase3_rejects_oversized_catalog_before_parse`
 - [ ] `phase3_bounds_projects_tabs_strings_ratios_and_extensions`
-- [ ] `phase3_unknown_fields_survive_lossless_import`
-- [ ] `phase3_unsupported_future_version_is_read_only`
+- [x] `phase3_unknown_fields_survive_lossless_import`
+- [x] `phase3_unsupported_future_version_is_read_only`
 
 합격 기준:
 
@@ -184,12 +143,12 @@ root의 content hash, 길이, last-write time과 ACL fingerprint를 비교한다
 
 필수 자동 테스트 식별자:
 
-- [ ] `phase3_import_never_opens_source_for_write`
-- [ ] `phase3_import_preserves_source_hash_metadata_and_acl`
-- [ ] `phase3_preview_path_cannot_alias_source`
-- [ ] `phase3_same_source_hash_is_idempotent`
-- [ ] `phase3_import_does_not_touch_agent_sessions`
-- [ ] `phase3_failed_import_leaves_no_committed_preview_state`
+- [x] `phase3_import_never_opens_source_for_write`
+- [x] `phase3_import_preserves_source_hash_metadata_and_acl`
+- [x] `phase3_preview_path_cannot_alias_source`
+- [x] `phase3_same_source_hash_is_idempotent`
+- [x] `phase3_import_does_not_touch_agent_sessions`
+- [x] `phase3_failed_import_leaves_no_committed_preview_state`
 
 합격 기준:
 
@@ -209,12 +168,12 @@ root의 content hash, 길이, last-write time과 ACL fingerprint를 비교한다
 
 필수 자동 테스트 식별자:
 
-- [ ] `phase3_import_preserves_project_and_terminal_order`
-- [ ] `phase3_import_preserves_names_paths_timestamps_and_alerts`
-- [ ] `phase3_import_preserves_and_normalizes_valid_width_ratios`
-- [ ] `phase3_invalid_selected_project_becomes_unselected`
-- [ ] `phase3_duplicate_resume_ids_are_flagged_not_started`
-- [ ] `phase3_initial_tabs_are_deterministic`
+- [x] `phase3_import_preserves_project_and_terminal_order`
+- [x] `phase3_import_preserves_names_paths_timestamps_and_alerts`
+- [x] `phase3_import_preserves_and_normalizes_valid_width_ratios`
+- [x] `phase3_invalid_selected_project_becomes_unselected`
+- [x] `phase3_duplicate_resume_ids_are_flagged_not_started`
+- [x] `phase3_initial_tabs_are_deterministic`
 
 합격 기준:
 
@@ -259,9 +218,9 @@ root의 content hash, 길이, last-write time과 ACL fingerprint를 비교한다
 
 - [ ] `phase3_save_uses_same_directory_unique_temp`
 - [ ] `phase3_save_flushes_before_atomic_replace`
-- [ ] `phase3_fault_at_every_write_boundary_keeps_one_valid_generation`
-- [ ] `phase3_revision_conflict_prevents_lost_update`
-- [ ] `phase3_second_instance_is_read_only_or_serialized`
+- [x] `phase3_fault_at_every_write_boundary_keeps_one_valid_generation`
+- [x] `phase3_revision_conflict_prevents_lost_update`
+- [x] `phase3_second_instance_is_read_only_or_serialized`
 - [ ] `phase3_acknowledged_save_survives_process_kill`
 
 합격 기준:
@@ -286,11 +245,11 @@ root의 content hash, 길이, last-write time과 ACL fingerprint를 비교한다
 
 필수 자동 테스트 식별자:
 
-- [ ] `phase3_truncated_main_recovers_verified_backup`
+- [x] `phase3_truncated_main_recovers_verified_backup`
 - [ ] `phase3_checksum_or_semantic_corruption_is_detected`
-- [ ] `phase3_all_candidates_invalid_never_autosaves_empty_state`
-- [ ] `phase3_recovery_quarantines_exact_corrupt_bytes`
-- [ ] `phase3_valid_main_ignores_uncommitted_temp`
+- [x] `phase3_all_candidates_invalid_never_autosaves_empty_state`
+- [x] `phase3_recovery_quarantines_exact_corrupt_bytes`
+- [x] `phase3_valid_main_ignores_uncommitted_temp`
 - [ ] `phase3_recovery_is_repeatable`
 
 합격 기준:

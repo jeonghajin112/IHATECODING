@@ -65,9 +65,11 @@ Codex, Grok, PowerShell, or Node processes.
 
 ## Phase 3 — projects and persistence
 
-Status: Phase 3A preview foundation implemented on
-`agent/rust-migration-phase3`; reversible import and multi-process revision
-gates remain before Phase 3 exit.
+Status: Phase 3B automated preview slice implemented on
+`agent/rust-migration-phase3b`. The isolated canonical store, two-phase copied
+catalog import, revision/process locking, recovery, and migration UI are wired.
+Manual copied-production, crash, path, ACL, and performance gates remain before
+Phase 3 exit.
 
 - implement Rust models for `projects-v1.schema.json`
 - first ship a read-only importer against copied state
@@ -75,6 +77,11 @@ gates remain before Phase 3 exit.
 - add atomic save, backup rotation, corruption recovery, and schema-version
   upgrades
 - restore project selection, pane names, width ratios, and pending alerts
+
+The current terminal UI still runs from the Phase 3A preview catalog. Phase 3B
+imports only into `workspace-v1` and exposes a read-only result; it never starts
+an imported PowerShell, browser, Codex thread, or Grok session. Switching the
+runtime UI to canonical workspace state is the next Phase 4 integration slice.
 
 Exit gate: fixture comparison plus a reversible import of a copied production
 catalog. The C# catalog remains untouched.

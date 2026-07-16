@@ -1,10 +1,12 @@
 # Phase 3 storage and Tauri contract
 
-This document deliberately separates what the 2026-07-17 Phase 3A foundation
-implements from the Phase 3B contract required before production migration.
-Nothing in the Phase 3B section is an implementation claim or permission to
-write the production C# catalog. Acceptance evidence is tracked in
-[PHASE3_ACCEPTANCE.md](../PHASE3_ACCEPTANCE.md).
+This document separates the Phase 3A runtime foundation from the Phase 3B
+contract required before production migration. The 2026-07-17 automated
+Phase 3B slice now implements the isolated canonical store, copied-catalog
+inspect/import, revision/process locking, recovery, and local-main command
+boundary described below. Remaining deviations and manual gates are tracked in
+[PHASE3_ACCEPTANCE.md](../PHASE3_ACCEPTANCE.md). Nothing here grants permission
+to write the production C# catalog.
 
 ## Phase 3A implemented contract
 
@@ -413,7 +415,8 @@ Returns:
   schemaVersion: number | null,
   revision: number | null,
   hasLegacyImport: boolean,
-  hasRecoveryCandidates: boolean
+  hasRecoveryCandidates: boolean,
+  writable: boolean
 }
 ```
 
@@ -425,6 +428,7 @@ Callable only from local `main` after explicit user file selection. Returns:
 
 ```text
 {
+  inspectToken,
   sourceFormat,
   sourceSha256,
   byteLength,
@@ -437,12 +441,15 @@ Callable only from local `main` after explicit user file selection. Returns:
 
 Messages and pointers identify fields but never echo their values.
 
-#### `import_legacy_catalog({ sourcePath, sourceSha256, mode })`
+#### `import_legacy_catalog({ inspectToken, sourcePath, sourceSha256, mode })`
 
 `mode` is only `replacePreview` in v1. The command revalidates a stable source,
-writes the exact import snapshot, creates canonical revision 1, and returns the
-same `WorkspaceSnapshot` shape as load. It never merges automatically and never
-writes the source.
+writes the exact import snapshot, creates canonical revision 1 when state is
+absent (or the next monotonic revision for an explicit replacement), and
+returns the same `WorkspaceSnapshot` shape as load. `inspectToken` is bound to
+the canonical source path, file identity/metadata, and SHA-256 and expires on
+application restart. The command never merges automatically and never writes
+the source.
 
 #### `load_workspace_state()`
 

@@ -1,7 +1,7 @@
 # IHATECODING Rust Preview
 
-Phase 3A adds isolated project persistence and the first workspace/tab shell on
-top of the Phase 2 multi-terminal engine:
+Phase 3B adds a separate canonical migration store and copied-catalog import to
+the Phase 3A workspace shell on top of the Phase 2 multi-terminal engine:
 
 - Tauri 2 using one main WebView2
 - the same xterm.js version as the C# baseline
@@ -25,9 +25,16 @@ top of the Phase 2 multi-terminal engine:
   backups, and explicit corruption recovery
 - backend-owned preservation of unknown future fields, including JSON integer
   values that JavaScript cannot represent exactly
+- a canonical `workspace-v1` store under Tauri `app_local_data_dir()` with
+  revision CAS, a process writer lock, three backups, and explicit quarantine
+  recovery
+- two-phase inspection/import of an explicitly selected detached catalog copy,
+  including exact-byte SHA-256 snapshots and source identity/metadata checks
+- a compact sidebar storage badge plus import and verified-candidate recovery UI
 
-Restored panes always start as fresh PowerShell sessions in this phase. Stored
-Codex and Grok identifiers remain inert; resuming those agents is a later gate.
+The current terminal UI still uses the Phase 3A runtime catalog. Phase 3B
+imports are read-only previews and never start a PowerShell, browser, Codex
+thread, or Grok session. Runtime cutover is a later phase.
 
 Run from this directory:
 
@@ -63,14 +70,21 @@ PowerShell child appears, while the remaining pane starts are still queued. It
 tracks late descendants during shutdown and requires four consecutive empty
 process samples before passing.
 
-The preview store defaults to:
+The current Phase 3A runtime store defaults to:
 
 ```text
 %LOCALAPPDATA%\IHATECODING\RustPreview\Projects\projects-v1.json
 ```
 
-Tests may redirect only this preview store with
+Tests may redirect only that Phase 3A store with
 `IHATECODING_RUST_PREVIEW_PROJECTS_DIR`. The application does not read or write
-the production C# `projects.json`, Codex config, Codex sessions, or Grok
-sessions. Import commit, cross-process revision locking, and Codex/Grok resume
-remain gated work rather than implied capabilities of this preview.
+the production C# `projects.json` and never enumerates Codex/Grok session
+contents. The canonical Phase 3B store is resolved by Tauri at:
+
+```text
+app_local_data_dir()/state/workspace-v1.json
+```
+
+Only a user-entered, detached copy path can be inspected and imported. The C#
+catalog remains untouched. Codex/Grok resume remains gated work rather than an
+implied capability of this preview.

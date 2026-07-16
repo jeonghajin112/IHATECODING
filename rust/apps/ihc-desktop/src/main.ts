@@ -48,6 +48,7 @@ import {
   type WorkspaceProject,
   type WorkspaceTabState,
 } from "./phase3-core";
+import { createPhase3BMigrationUI } from "./phase3b-ui";
 
 type StartTerminalResponse = {
   sessionId: string;
@@ -2323,6 +2324,7 @@ const projectName = requireInput("project-name");
 const projectPath = requireInput("project-path");
 const projectFormError = requireElement("project-form-error");
 const cancelProjectButton = requireButton("cancel-project");
+const migrationUi = createPhase3BMigrationUI();
 
 let controller: Phase3Controller | null = null;
 const workspace = new TerminalWorkspace(
@@ -2356,6 +2358,8 @@ controller = new Phase3Controller(
 
 const initializationPromise = controller.initialize();
 void initializationPromise;
+const migrationInitializationPromise = migrationUi.initialize();
+void migrationInitializationPromise;
 
 const currentAppWindow = getCurrentWindow();
 let closeBarrierRunning = false;
@@ -2376,8 +2380,9 @@ void currentAppWindow.onCloseRequested(async (event) => {
   controller?.beginShutdown();
   browser.beginShutdown();
   try {
-    await initializationPromise;
+    await Promise.all([initializationPromise, migrationInitializationPromise]);
     await controller?.flushSaves();
+    migrationUi.dispose();
     await browser.dispose();
     // Use one backend-owned barrier instead of twenty pane-local stop IPCs. It
     // rejects queued starts, waits until every spawned child belongs to a Job
@@ -2395,6 +2400,7 @@ void currentAppWindow.onCloseRequested(async (event) => {
 
 window.addEventListener("beforeunload", () => {
   if (closeBarrierRunning) return;
+  migrationUi.dispose();
   void browser.dispose();
   void workspace.dispose();
 });
