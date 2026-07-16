@@ -1,0 +1,280 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+/*XXCODING_XTERM_CSS*/
+  </style>
+  <style>
+    :root { color-scheme: dark; }
+    html, body, #terminal {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      background: #050505;
+    }
+    body { user-select: none; }
+    #terminal {
+      box-sizing: border-box;
+      padding: 5px 4px 3px 7px;
+    }
+    .xterm { height: 100%; }
+    .xterm-viewport {
+      scrollbar-color: transparent transparent;
+      scrollbar-width: none;
+      -ms-overflow-style: none;
+    }
+    .xterm-viewport::-webkit-scrollbar {
+      display: none;
+      width: 0;
+      height: 0;
+    }
+    .xterm-decoration-overview-ruler {
+      display: none !important;
+      visibility: hidden !important;
+      opacity: 0 !important;
+    }
+    .xterm .xterm-scrollable-element > .xterm-scrollbar {
+      background: transparent !important;
+    }
+    .xterm .xterm-scrollable-element > .xterm-visible.xterm-scrollbar {
+      opacity: 1 !important;
+    }
+    .xterm .xterm-scrollable-element > .xterm-invisible.xterm-scrollbar {
+      opacity: 0 !important;
+      pointer-events: none !important;
+    }
+    .xterm .xterm-scrollable-element > .xterm-scrollbar > .xterm-slider {
+      left: 2px !important;
+      width: 2px !important;
+      min-height: 18px;
+      border-radius: 999px;
+      background: #747474 !important;
+      box-shadow: none !important;
+      transition: background-color 80ms linear !important;
+    }
+    .xterm .xterm-scrollable-element > .xterm-scrollbar:hover > .xterm-slider,
+    .xterm .xterm-scrollable-element > .xterm-scrollbar > .xterm-slider.xterm-active {
+      left: 2px !important;
+      width: 2px !important;
+      background: #8a8a8a !important;
+    }
+    .xterm .xterm-helper-textarea {
+      ime-mode: active;
+    }
+  </style>
+</head>
+<body>
+  <div id="terminal"></div>
+  <script>
+/*XXCODING_XTERM_JS*/
+  </script>
+  <script>
+/*XXCODING_FIT_JS*/
+  </script>
+  <script>
+    (() => {
+      'use strict';
+
+      const post = message => chrome.webview.postMessage(message);
+      window.addEventListener('error', event => post({
+        type: 'web-error',
+        data: `${event.message || 'Terminal script error'} (${event.lineno || 0}:${event.colno || 0})`
+      }));
+      window.addEventListener('unhandledrejection', event => post({
+        type: 'web-error',
+        data: String(event.reason && event.reason.message ? event.reason.message : event.reason)
+      }));
+      const terminal = new Terminal({
+        cursorBlink: true,
+        cursorStyle: 'bar',
+        cursorWidth: 1,
+        fontFamily: '"Cascadia Mono", "D2Coding", Consolas, monospace',
+        fontSize: 12,
+        fontWeight: '400',
+        fontWeightBold: '600',
+        lineHeight: 1.08,
+        letterSpacing: 0,
+        scrollback: 10000,
+        smoothScrollDuration: 0,
+        rightClickSelectsWord: false,
+        scrollbar: {
+          showScrollbar: true,
+          showArrows: false,
+          width: 6
+        },
+        theme: {
+          background: '#050505',
+          foreground: '#f4f4f5',
+          cursor: '#f4f4f5',
+          cursorAccent: '#050505',
+          selectionBackground: '#3f3f46',
+          scrollbarSliderBackground: '#747474',
+          scrollbarSliderHoverBackground: '#8a8a8a',
+          scrollbarSliderActiveBackground: '#a0a0a0',
+          black: '#0c0c0c',
+          red: '#c50f1f',
+          green: '#13a10e',
+          yellow: '#c19c00',
+          blue: '#0037da',
+          magenta: '#881798',
+          cyan: '#3a96dd',
+          white: '#cccccc',
+          brightBlack: '#767676',
+          brightRed: '#e74856',
+          brightGreen: '#16c60c',
+          brightYellow: '#f9f1a5',
+          brightBlue: '#3b78ff',
+          brightMagenta: '#b4009e',
+          brightCyan: '#61d6d6',
+          brightWhite: '#f2f2f2'
+        }
+      });
+      const fitAddon = new FitAddon.FitAddon();
+      terminal.loadAddon(fitAddon);
+      terminal.open(document.getElementById('terminal'));
+
+      let fitTimer = 0;
+      let outputSettledTimer = 0;
+      let lastColumns = 0;
+      let lastRows = 0;
+      let userBrowsingScrollback = false;
+      const isAtBottom = () => {
+        const buffer = terminal.buffer.active;
+        return buffer.baseY - buffer.viewportY <= 1;
+      };
+      const reportSize = () => {
+        const columns = terminal.cols;
+        const rows = terminal.rows;
+        if (columns === lastColumns && rows === lastRows) return;
+        lastColumns = columns;
+        lastRows = rows;
+        post({ type: 'resize', columns, rows });
+      };
+      const fit = () => {
+        clearTimeout(fitTimer);
+        fitTimer = setTimeout(() => {
+          try {
+            fitAddon.fit();
+            reportSize();
+          } catch (_) { }
+        }, 35);
+      };
+
+      const copySelection = () => {
+        const text = terminal.getSelection();
+        if (!text) return false;
+        post({ type: 'copy', data: text });
+        return true;
+      };
+      const requestPaste = () => post({ type: 'paste' });
+      const modifierOnlyKeys = new Set([
+        'control', 'shift', 'alt', 'meta', 'capslock', 'numlock', 'scrolllock'
+      ]);
+
+      terminal.attachCustomKeyEventHandler(event => {
+        if (event.type !== 'keydown') return true;
+        const key = String(event.key || '').toLowerCase();
+        if (!modifierOnlyKeys.has(key)) {
+          userBrowsingScrollback = false;
+          terminal.scrollToBottom();
+          post({ type: 'user-input' });
+        }
+        if (event.isComposing || event.keyCode === 229) return true;
+
+        const commandModifier = event.ctrlKey || event.metaKey;
+        const consume = () => {
+          event.preventDefault();
+          event.stopPropagation();
+          return false;
+        };
+
+        if (commandModifier && key === 'c') {
+          if (terminal.hasSelection()) {
+            copySelection();
+            return consume();
+          }
+          // Keep Ctrl+C as SIGINT when there is no selection. Ctrl+Shift+C is
+          // always reserved for copy, matching Windows Terminal.
+          if (event.shiftKey) return consume();
+          return true;
+        }
+        if (commandModifier && key === 'v') {
+          if (!event.repeat) requestPaste();
+          return consume();
+        }
+        if (event.ctrlKey && key === 'insert') {
+          copySelection();
+          return consume();
+        }
+        if (event.shiftKey && !event.ctrlKey && !event.altKey && key === 'insert') {
+          if (!event.repeat) requestPaste();
+          return consume();
+        }
+        return true;
+      });
+
+      terminal.onData(data => post({ type: 'input', data }));
+      terminal.onBinary(data => post({ type: 'input', data }));
+      terminal.onResize(reportSize);
+      terminal.onScroll(() => {
+        if (isAtBottom()) userBrowsingScrollback = false;
+      });
+      terminal.element.addEventListener('focusin', () => post({ type: 'focus' }));
+      terminal.element.addEventListener('focusout', () => post({ type: 'blur' }));
+      terminal.element.addEventListener('wheel', event => {
+        if (event.deltaY < 0) userBrowsingScrollback = true;
+      }, { passive: true });
+
+      terminal.element.addEventListener('mousedown', () => {
+        post({ type: 'pointer-down' });
+        terminal.focus();
+      });
+      terminal.element.addEventListener('contextmenu', event => {
+        event.preventDefault();
+        if (!copySelection()) requestPaste();
+      }, true);
+
+      chrome.webview.addEventListener('message', event => {
+        const message = event.data || {};
+        if (message.type === 'output' && typeof message.data === 'string') {
+          const shouldFollow = !userBrowsingScrollback || isAtBottom();
+          terminal.write(message.data, () => {
+            if (shouldFollow) terminal.scrollToBottom();
+          });
+          clearTimeout(outputSettledTimer);
+          if (shouldFollow) {
+            outputSettledTimer = setTimeout(() => {
+              // Queue an empty write as a barrier. Its callback runs only after
+              // every preceding transcript chunk has been rendered by xterm.
+              terminal.write('', () => {
+                if (!userBrowsingScrollback) terminal.scrollToBottom();
+              });
+            }, 120);
+          }
+        } else if (message.type === 'focus') {
+          terminal.focus();
+        } else if (message.type === 'fit') {
+          fit();
+        } else if (message.type === 'paste' && typeof message.data === 'string') {
+          terminal.paste(message.data);
+        }
+      });
+
+      new ResizeObserver(fit).observe(document.getElementById('terminal'));
+      window.addEventListener('resize', fit);
+      requestAnimationFrame(() => {
+        fitAddon.fit();
+        reportSize();
+        post({
+          type: 'ready',
+          columns: terminal.cols,
+          rows: terminal.rows
+        });
+      });
+    })();
+  </script>
+</body>
+</html>

@@ -1,0 +1,36 @@
+PowerWorkspace/bin/
+PowerWorkspace/obj/
+PowerWorkspace/WebTerminal/node_modules/
+publish/
+PowerWorkspace.exe
+PowerWorkspace.previous.exe
+XXCODING.exe
+XXCODING.previous.exe
+XXCODING.previous.*.exe
+IHATECODING.exe
+IHATECODING.previous.exe
+IHATECODING.previous.*.exe
+*.log
+
+# Machine-local settings and credentials
+.env
+.env.*
+!.env.example
+*.local
+*.user
+*.suo
+.vs/
+.vscode/
+.idea/
+
+# Runtime project, session, and conversation data
+projects.json
+*.jsonl
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+.codex/
+.grok/
+**/.codex/
+**/.grok/
