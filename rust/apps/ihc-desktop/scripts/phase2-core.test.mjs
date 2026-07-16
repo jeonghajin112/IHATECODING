@@ -351,3 +351,88 @@ test("StartScheduler does not release a running slot merely because its signal a
   assert.equal(await running, "running complete");
   assert.equal(await second, "second complete");
 });
+
+test("StartScheduler reevaluates dynamic priority whenever a queued slot drains", async () => {
+  const scheduler = new core.StartScheduler(1);
+  const order = [];
+  let activeProject = "project-a";
+  let releaseBlocker = () => undefined;
+  let releaseProjectB = () => undefined;
+  let markProjectBStarted = () => undefined;
+  const projectBStarted = new Promise((resolve) => {
+    markProjectBStarted = resolve;
+  });
+
+  const blocker = scheduler.run(
+    () =>
+      new Promise((resolve) => {
+        order.push("blocker");
+        releaseBlocker = () => resolve("blocker");
+      }),
+  );
+  await Promise.resolve();
+
+  const projectA = scheduler.run(
+    async () => {
+      order.push("project-a");
+      return "project-a";
+    },
+    undefined,
+    () => (activeProject === "project-a" ? 10 : 0),
+  );
+  const projectB = scheduler.run(
+    () =>
+      new Promise((resolve) => {
+        order.push("project-b");
+        markProjectBStarted();
+        releaseProjectB = () => resolve("project-b");
+      }),
+    undefined,
+    () => (activeProject === "project-b" ? 10 : 0),
+  );
+
+  activeProject = "project-b";
+  releaseBlocker();
+  await projectBStarted;
+
+  activeProject = "project-c";
+  const projectC = scheduler.run(
+    async () => {
+      order.push("project-c");
+      return "project-c";
+    },
+    undefined,
+    () => (activeProject === "project-c" ? 10 : 0),
+  );
+  releaseProjectB();
+
+  assert.deepEqual(await Promise.all([blocker, projectA, projectB, projectC]), [
+    "blocker",
+    "project-a",
+    "project-b",
+    "project-c",
+  ]);
+  assert.deepEqual(order, ["blocker", "project-b", "project-c", "project-a"]);
+});
+
+test("StartScheduler preserves FIFO order when dynamic priorities tie", async () => {
+  const scheduler = new core.StartScheduler(1);
+  const order = [];
+  let releaseBlocker = () => undefined;
+  const blocker = scheduler.run(
+    () =>
+      new Promise((resolve) => {
+        releaseBlocker = resolve;
+      }),
+  );
+  await Promise.resolve();
+
+  const priority = () => 5;
+  const first = scheduler.run(async () => order.push("first"), undefined, priority);
+  const second = scheduler.run(async () => order.push("second"), undefined, priority);
+  const third = scheduler.run(async () => order.push("third"), undefined, priority);
+  releaseBlocker();
+
+  await Promise.all([blocker, first, second, third]);
+  assert.deepEqual(order, ["first", "second", "third"]);
+});

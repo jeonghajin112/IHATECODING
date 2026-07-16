@@ -78,25 +78,48 @@ Phase 3 exit.
   upgrades
 - restore project selection, pane names, width ratios, and pending alerts
 
-The current terminal UI still runs from the Phase 3A preview catalog. Phase 3B
-imports only into `workspace-v1` and exposes a read-only result; it never starts
-an imported PowerShell, browser, Codex thread, or Grok session. Switching the
-runtime UI to canonical workspace state is the next Phase 4 integration slice.
+Phase 4 now uses `workspace-v1` as the only live UI state. The Phase 3A preview
+catalog remains an isolated rollback/upgrade source and is never used as a
+second runtime store. Its explicit one-time upgrade preserves the source bytes
+and never resumes a Codex thread or Grok session.
 
 Exit gate: fixture comparison plus a reversible import of a copied production
 catalog. The C# catalog remains untouched.
 
 ## Phase 4 — workspace and tab UI
 
-Status: first shell slice implemented with the project sidebar, blank/project
-tabs, and project-specific fresh PowerShell restore. Drag, resize, snap, and
-full layout parity remain.
+Status: canonical runtime cutover and the automated Phase 4 workspace slice are
+implemented on `agent/rust-migration-phase4`. Manual Windows interaction,
+restart-layout, IME/clipboard, and 20-pane performance gates remain before the
+Phase 4 exit gate is signed off.
 
 - rebuild the left project sidebar and top workspace tabs
 - support blank tabs that can later host terminals, browser views, project
   output, or another project
 - port pane drag/reorder, insertion previews, horizontal resizing, and snapping
 - retain the black/white lightweight visual system
+
+Implemented evidence:
+
+- canonical CAS state is the single source for projects, tabs, selected project,
+  pane order, names, folders, and row width ratios
+- explicit SHA-bound Phase 3A preview upgrade that leaves the source bytes,
+  timestamps, and ACLs unchanged and refuses to overwrite canonical state
+- persisted blank/project/browser/output tab restoration without automatically
+  navigating a browser or resuming an agent
+- active-project-only terminal startup, save-before-spawn for new terminals,
+  a global 20-session restore gate, and dynamic priority for the visible
+  project's queued starts
+- save-before-close plus title/layout rollback on failed canonical writes, and
+  unload-before-replace for import, recovery, and preview upgrade
+- header drag with an 8 px activation threshold, stable-ID insertion preview,
+  and a single reorder/save on drop
+- horizontal-only internal-edge resizing, minimum widths, sibling-edge snap,
+  and one ratio save on pointer release
+- 85 frontend core/contract/integration tests plus the Rust storage/bridge suites
+
+The detailed automated and manual acceptance matrix is in
+`PHASE4_ACCEPTANCE.md`.
 
 Exit gate: saved layouts reopen identically and 20 panes remain responsive.
 

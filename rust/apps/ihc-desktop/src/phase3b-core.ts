@@ -64,7 +64,7 @@ export type WorkspaceTab = {
 
 export type ImportProvenance = {
   [key: string]: unknown;
-  sourceFormat: "powerWorkspace.projects/1";
+  sourceFormat: "powerWorkspace.projects/1" | "ihatecoding.phase3-preview/1";
   sourceSha256: string;
   snapshotFile: string;
   importedAtUtc: string;
@@ -932,9 +932,13 @@ function normalizeImportProvenance(
 ): ImportProvenance | null {
   if (value === null) return null;
   const provenance = requireRecord(value, "import provenance", pointer);
-  if (provenance.sourceFormat !== "powerWorkspace.projects/1") {
+  if (
+    provenance.sourceFormat !== "powerWorkspace.projects/1" &&
+    provenance.sourceFormat !== "ihatecoding.phase3-preview/1"
+  ) {
     fail("The import source format is not supported.", `${pointer}/sourceFormat`);
   }
+  const sourceFormat = provenance.sourceFormat;
   const sourceSha256 = requireString(provenance.sourceSha256, `${pointer}/sourceSha256`);
   if (!SHA256_PATTERN.test(sourceSha256)) {
     fail("The import source digest is invalid.", `${pointer}/sourceSha256`);
@@ -945,7 +949,7 @@ function normalizeImportProvenance(
   }
   return {
     ...cloneJsonRecord(provenance),
-    sourceFormat: "powerWorkspace.projects/1",
+    sourceFormat,
     sourceSha256,
     snapshotFile,
     importedAtUtc: requireRfc3339(

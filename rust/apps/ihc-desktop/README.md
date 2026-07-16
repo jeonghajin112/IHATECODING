@@ -1,7 +1,7 @@
 # IHATECODING Rust Preview
 
-Phase 3B adds a separate canonical migration store and copied-catalog import to
-the Phase 3A workspace shell on top of the Phase 2 multi-terminal engine:
+Phase 4 runs the workspace shell directly from the canonical Rust store on top
+of the Phase 2 multi-terminal engine:
 
 - Tauri 2 using one main WebView2
 - the same xterm.js version as the C# baseline
@@ -17,10 +17,10 @@ the Phase 3A workspace shell on top of the Phase 2 multi-terminal engine:
 - pane-local input, output, scroll, selection, and lifecycle state
 - an optional child browser WebView with no Rust IPC capability
 - a restrictive CSP for the privileged local WebView
-- a left project sidebar and top blank/project tabs
+- a left project sidebar and persisted blank/project/browser/output tabs
 - project creation from an explicit absolute folder path
 - project-specific PowerShell names, order, start folders, width ratios, and
-  unread flags stored in an isolated Rust preview catalog
+  unread flags stored in canonical `workspace-v1` state
 - serialized frontend saves plus atomic backend replacement, three verified
   backups, and explicit corruption recovery
 - backend-owned preservation of unknown future fields, including JSON integer
@@ -31,10 +31,18 @@ the Phase 3A workspace shell on top of the Phase 2 multi-terminal engine:
 - two-phase inspection/import of an explicitly selected detached catalog copy,
   including exact-byte SHA-256 snapshots and source identity/metadata checks
 - a compact sidebar storage badge plus import and verified-candidate recovery UI
+- a SHA-bound one-time upgrade from the isolated Phase 3A preview catalog that
+  preserves the source file
+- pane header drag/reorder, a stable matte-gray insertion preview, and
+  horizontal-only internal-edge resize with sibling snapping
+- durable-save-before-close behavior with title/layout rollback on save failure
+- unload-before-replace coordination for import, recovery, and preview upgrade
+- dynamic queued-start priority for the project currently on screen
 
-The current terminal UI still uses the Phase 3A runtime catalog. Phase 3B
-imports are read-only previews and never start a PowerShell, browser, Codex
-thread, or Grok session. Runtime cutover is a later phase.
+The canonical store is the only runtime UI source. Imported or upgraded Codex
+and Grok identifiers are retained as data but are never resumed in Phase 4.
+Browser and output tab state is restored without automatic navigation or
+execution.
 
 Run from this directory:
 
@@ -54,10 +62,9 @@ cargo test --all-targets
 cargo clippy --all-targets -- -D warnings
 ```
 
-After building the release executable, the Phase 3 persistence smoke test uses
-a temporary preview store. It starts 20 saved panes without clicks, restarts
-the same layout, checks that the catalog did not change, and verifies normal or
-forced shutdown without touching unrelated PowerShell processes:
+The older Phase 3A persistence smoke remains useful only for rollback testing.
+Phase 4 promotion is governed by the repository-level
+`rust/PHASE4_ACCEPTANCE.md` matrix.
 
 ```powershell
 .\scripts\phase3-persistence-smoke.ps1 -PaneCount 20 -CloseMode Normal
@@ -70,21 +77,21 @@ PowerShell child appears, while the remaining pane starts are still queued. It
 tracks late descendants during shutdown and requires four consecutive empty
 process samples before passing.
 
-The current Phase 3A runtime store defaults to:
+The rollback-only Phase 3A source defaults to:
 
 ```text
 %LOCALAPPDATA%\IHATECODING\RustPreview\Projects\projects-v1.json
 ```
 
-Tests may redirect only that Phase 3A store with
+Tests may redirect only that Phase 3A source with
 `IHATECODING_RUST_PREVIEW_PROJECTS_DIR`. The application does not read or write
 the production C# `projects.json` and never enumerates Codex/Grok session
-contents. The canonical Phase 3B store is resolved by Tauri at:
+contents. The canonical runtime store is resolved by Tauri at:
 
 ```text
 app_local_data_dir()/state/workspace-v1.json
 ```
 
 Only a user-entered, detached copy path can be inspected and imported. The C#
-catalog remains untouched. Codex/Grok resume remains gated work rather than an
-implied capability of this preview.
+catalog remains untouched. Codex/Grok resume remains Phase 5 work rather than
+an implied capability of this preview.

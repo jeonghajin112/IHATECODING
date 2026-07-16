@@ -23,31 +23,21 @@ import {
   type TerminalEvent,
 } from "./phase2-core";
 import {
-  MAX_PROJECT_PANES,
-  addBlankTab,
-  appendTerminal,
-  catalogMutationsAllowed,
-  cloneProjectCatalog,
-  closeWorkspaceTab,
-  createInitialTabState,
-  createSavedTerminal,
-  evaluateRestoreCapacity,
-  findProjectByFolder,
-  initialProject,
-  nextTerminalName,
-  normalizeProjectCatalog,
-  normalizeProjectCatalogLoadResponse,
-  openProjectTab,
-  removeTerminal,
-  renameTerminal,
-  selectWorkspaceTab,
-  uniqueProjectName,
-  validateProjectDraft,
-  type ProjectCatalog,
-  type SavedTerminalState,
+  MAX_WORKSPACE_TERMINALS as MAX_PROJECT_PANES,
   type WorkspaceProject,
-  type WorkspaceTabState,
-} from "./phase3-core";
+  type WorkspaceTerminal,
+} from "./phase3b-core";
+import {
+  computeHorizontalResize,
+  evaluateWorkspaceRestoreCapacity,
+  resolvePaneInsertionPreview,
+  type PaneGeometry,
+  type PaneInsertionTarget,
+} from "./phase4-core";
+import {
+  createPhase4WorkspaceController,
+  type Phase4WorkspaceController,
+} from "./phase4-controller";
 import { createPhase3BMigrationUI } from "./phase3b-ui";
 
 type StartTerminalResponse = {
@@ -101,6 +91,7 @@ class TerminalPane {
   private readonly titleEditor: HTMLInputElement;
   private readonly stateLabel: HTMLElement;
   private readonly closeButton: HTMLButtonElement;
+  private readonly resizeHandle: HTMLDivElement;
   private readonly resizeObserver: ResizeObserver;
   private readonly terminalDisposables: Array<{ dispose(): void }> = [];
   private readonly outputSequencer = new OutputSequencer<OutputBatch>();
@@ -160,13 +151,13 @@ class TerminalPane {
     private readonly workspace: TerminalWorkspace,
     private readonly scheduler: StartScheduler,
     projectId: string,
-    savedState: SavedTerminalState,
+    savedState: WorkspaceTerminal,
   ) {
-    this.terminalId = savedState.Id;
-    this.id = paneRuntimeId(projectId, savedState.Id);
+    this.terminalId = savedState.id;
+    this.id = paneRuntimeId(projectId, savedState.id);
     this.projectId = projectId;
-    this.title = savedState.Name;
-    this.startDirectory = savedState.StartDirectory;
+    this.title = savedState.name;
+    this.startDirectory = savedState.startDirectory;
 
     this.element = document.createElement("article");
     this.element.className = "terminal-pane";
@@ -213,7 +204,15 @@ class TerminalPane {
     this.viewport = document.createElement("div");
     this.viewport.className = "terminal-viewport";
     this.viewport.dataset.paneId = this.id;
-    this.element.append(header, this.viewport);
+    this.resizeHandle = document.createElement("div");
+    this.resizeHandle.className = "terminal-resize-handle";
+    this.resizeHandle.dataset.paneInteraction = "resize";
+    this.resizeHandle.hidden = true;
+    this.resizeHandle.tabIndex = -1;
+    this.resizeHandle.setAttribute("role", "separator");
+    this.resizeHandle.setAttribute("aria-orientation", "vertical");
+    this.resizeHandle.setAttribute("aria-label", `${this.title} 너비 조절`);
+    this.element.append(header, this.viewport, this.resizeHandle);
 
     this.terminal = new Terminal({
       cursorBlink: true,
@@ -265,7 +264,7 @@ class TerminalPane {
 
     this.closeButton.addEventListener("click", (event) => {
       event.stopPropagation();
-      this.workspace.closePane(this.id);
+      void this.workspace.closePane(this.id);
     });
     this.titleElement.addEventListener("dblclick", (event) => {
       event.stopPropagation();
@@ -275,6 +274,7 @@ class TerminalPane {
     this.titleEditor.addEventListener("keydown", (event) => {
       event.stopPropagation();
       if (event.key === "Enter") {
+        if (event.isComposing || event.keyCode === 229) return;
         event.preventDefault();
         this.commitTitleEdit();
       } else if (event.key === "Escape") {
@@ -287,6 +287,12 @@ class TerminalPane {
     });
     this.element.addEventListener("pointerdown", () => {
       this.workspace.activatePane(this.id, false);
+    });
+    header.addEventListener("pointerdown", (event) => {
+      this.workspace.beginPaneDrag(event, this.id, header);
+    });
+    this.resizeHandle.addEventListener("pointerdown", (event) => {
+      this.workspace.beginPaneResize(event, this.id, this.resizeHandle);
     });
     this.viewport.addEventListener("mousedown", () => {
       this.workspace.activatePane(this.id, false);
@@ -365,7 +371,9 @@ class TerminalPane {
           );
         }
         this.scheduleFit(0);
-      }, this.startAbortController.signal);
+      }, this.startAbortController.signal, () =>
+        this.workspace.startPriority(this.projectId),
+      );
     } catch (error) {
       if (
         error instanceof CancelledStart ||
@@ -394,6 +402,16 @@ class TerminalPane {
     this.element.setAttribute("aria-label", title);
     this.closeButton.title = `${title} 닫기`;
     this.closeButton.setAttribute("aria-label", `${title} 닫기`);
+    this.resizeHandle.setAttribute("aria-label", `${title} 너비 조절`);
+  }
+
+  setResizeHandleEnabled(enabled: boolean) {
+    this.resizeHandle.hidden = !enabled;
+    this.resizeHandle.tabIndex = enabled ? 0 : -1;
+  }
+
+  setDragging(dragging: boolean) {
+    this.element.dataset.dragging = String(dragging);
   }
 
   setCatalogWritable(writable: boolean) {
@@ -403,7 +421,7 @@ class TerminalPane {
   }
 
   scheduleFit(delay = 35) {
-    if (this.disposed) return;
+    if (this.disposed || this.workspace.shouldDeferFit()) return;
     window.clearTimeout(this.fitTimer);
     this.fitTimer = window.setTimeout(() => {
       this.fitTerminal();
@@ -1095,7 +1113,7 @@ class TerminalPane {
     this.titleEditor.hidden = true;
     this.titleElement.hidden = false;
     if (!title || title === this.title) return;
-    this.workspace.renamePane(this.id, title);
+    void this.workspace.renamePane(this.id, title);
   }
 
   private cancelTitleEdit() {
@@ -1106,22 +1124,112 @@ class TerminalPane {
   }
 }
 
+type ActiveTerminalRow = {
+  key: string;
+  element: HTMLDivElement;
+  paneIds: string[];
+  ratios: number[];
+  columns: number;
+};
+
+type PaneDragState = {
+  paneId: string;
+  projectId: string;
+  pointerId: number;
+  captureTarget: HTMLElement;
+  originX: number;
+  originY: number;
+  latestX: number;
+  latestY: number;
+  started: boolean;
+  geometry: PaneGeometry[];
+  preview: PaneInsertionTarget | null;
+  frame: number;
+};
+
+type PaneResizeState = {
+  paneId: string;
+  projectId: string;
+  pointerId: number;
+  captureTarget: HTMLElement;
+  row: ActiveTerminalRow;
+  dividerIndex: number;
+  originX: number;
+  latestX: number;
+  rowLeft: number;
+  totalWidth: number;
+  gap: number;
+  minPaneWidth: number;
+  siblingEdges: number[];
+  originalRatios: number[];
+  previewRatios: number[];
+  frame: number;
+};
+
 class TerminalWorkspace {
   private readonly panes = new Map<string, TerminalPane>();
   private readonly sessionOwners = new Map<string, string>();
   private readonly scheduler = new StartScheduler();
   private readonly restoredProjects = new Set<string>();
+  private readonly projectOrders = new Map<string, string[]>();
+  private readonly projectRatios = new Map<string, Record<string, number[]>>();
+  private readonly activeRows = new Map<string, ActiveTerminalRow>();
+  private readonly rowsHost = document.createElement("div");
+  private readonly inactivePaneBin = document.createElement("div");
+  private readonly interactionOverlay = document.createElement("div");
+  private readonly insertionLine = document.createElement("div");
+  private readonly snapGuide = document.createElement("div");
   private activePaneId: string | null = null;
   private activeProjectId: string | null = null;
   private workspaceView: "empty" | "terminals" | "browser" = "empty";
   private catalogWritable = false;
   private disposed = false;
+  private dragState: PaneDragState | null = null;
+  private resizeState: PaneResizeState | null = null;
   private stopBarrier: Promise<void> = Promise.resolve();
   private readonly onAppPointerDown = (event: PointerEvent) => {
     const target = event.target;
-    if (target instanceof Element && target.closest(".terminal-pane")) return;
+    if (
+      target instanceof Element &&
+      target.closest(".terminal-pane, [data-pane-interaction]")
+    ) {
+      return;
+    }
     this.clearActivePane();
   };
+  private readonly onLayoutPointerMove = (event: PointerEvent) => {
+    if (this.dragState?.pointerId === event.pointerId) {
+      this.updatePaneDrag(event);
+      return;
+    }
+    if (this.resizeState?.pointerId === event.pointerId) {
+      this.updatePaneResize(event);
+    }
+  };
+  private readonly onLayoutPointerUp = (event: PointerEvent) => {
+    if (this.dragState?.pointerId === event.pointerId) {
+      this.finishPaneDrag(false);
+      return;
+    }
+    if (this.resizeState?.pointerId === event.pointerId) {
+      this.finishPaneResize(false);
+    }
+  };
+  private readonly onLayoutPointerCancel = (event: PointerEvent) => {
+    if (
+      this.dragState?.pointerId === event.pointerId ||
+      this.resizeState?.pointerId === event.pointerId
+    ) {
+      this.cancelLayoutInteraction();
+    }
+  };
+  private readonly onLayoutKeyDown = (event: KeyboardEvent) => {
+    if (event.key === "Escape" && (this.dragState || this.resizeState)) {
+      event.preventDefault();
+      this.cancelLayoutInteraction();
+    }
+  };
+  private readonly onLayoutWindowBlur = () => this.cancelLayoutInteraction();
 
   constructor(
     private readonly app: HTMLElement,
@@ -1130,23 +1238,56 @@ class TerminalWorkspace {
     private readonly closeActiveButton: HTMLButtonElement,
     private readonly countElement: HTMLElement,
     private readonly statusElement: HTMLElement,
-    private readonly onPaneClosedCallback: (projectId: string, paneId: string) => void,
+    private readonly onPaneClosedCallback: (
+      projectId: string,
+      paneId: string,
+    ) => Promise<boolean>,
     private readonly onPaneRenamedCallback: (
       projectId: string,
       paneId: string,
       title: string,
+    ) => Promise<boolean>,
+    private readonly onPaneReorderedCallback: (
+      projectId: string,
+      paneId: string,
+      target: Pick<PaneInsertionTarget, "beforePaneId">,
+    ) => void,
+    private readonly onPaneRatiosChangedCallback: (
+      projectId: string,
+      layoutKey: string,
+      ratios: number[],
     ) => void,
   ) {
+    this.rowsHost.className = "terminal-rows";
+    this.inactivePaneBin.className = "inactive-pane-bin";
+    this.inactivePaneBin.setAttribute("aria-hidden", "true");
+    this.interactionOverlay.className = "pane-interaction-overlay";
+    this.interactionOverlay.dataset.paneInteraction = "overlay";
+    this.insertionLine.className = "pane-insertion-line";
+    this.insertionLine.hidden = true;
+    this.snapGuide.className = "pane-snap-guide";
+    this.snapGuide.hidden = true;
+    this.interactionOverlay.append(this.insertionLine, this.snapGuide);
+    this.terminalSurface.append(
+      this.rowsHost,
+      this.inactivePaneBin,
+      this.interactionOverlay,
+    );
     this.terminalSurface.dataset.empty = "true";
     this.app.addEventListener("pointerdown", this.onAppPointerDown);
+    window.addEventListener("pointermove", this.onLayoutPointerMove, true);
+    window.addEventListener("pointerup", this.onLayoutPointerUp, true);
+    window.addEventListener("pointercancel", this.onLayoutPointerCancel, true);
+    window.addEventListener("keydown", this.onLayoutKeyDown, true);
+    window.addEventListener("blur", this.onLayoutWindowBlur);
     this.closeActiveButton.addEventListener("click", () => {
-      if (this.activePaneId) this.closePane(this.activePaneId);
+      if (this.activePaneId) void this.closePane(this.activePaneId);
     });
   }
 
-  addPane(projectId: string, savedState: SavedTerminalState, focus = true) {
-    if (this.disposed || !this.catalogWritable) return null;
-    const existing = this.panes.get(paneRuntimeId(projectId, savedState.Id));
+  addPane(projectId: string, savedState: WorkspaceTerminal, focus = true) {
+    if (this.disposed) return null;
+    const existing = this.panes.get(paneRuntimeId(projectId, savedState.id));
     if (existing) return existing;
     const projectPaneCount = [...this.panes.values()].filter(
       (pane) => pane.projectId === projectId,
@@ -1169,8 +1310,10 @@ class TerminalWorkspace {
     const pane = new TerminalPane(this, this.scheduler, projectId, savedState);
     pane.setCatalogWritable(this.catalogWritable);
     this.panes.set(pane.id, pane);
+    const order = this.projectOrders.get(projectId) ?? [];
+    if (!order.includes(pane.id)) this.projectOrders.set(projectId, [...order, pane.id]);
     pane.element.hidden = projectId !== this.activeProjectId;
-    this.terminalSurface.append(pane.element);
+    this.inactivePaneBin.append(pane.element);
     if (projectId === this.activeProjectId && focus) this.activatePane(pane.id, false);
     this.updateLayout();
     void pane.startAfter(this.stopBarrier);
@@ -1184,46 +1327,86 @@ class TerminalWorkspace {
     return pane;
   }
 
-  restoreCapacity(project: WorkspaceProject) {
-    const incoming = this.restoredProjects.has(project.Id) ? 0 : project.Terminals.length;
-    return evaluateRestoreCapacity(this.panes.size, incoming, MAX_PANES);
+  restoreCapacity(
+    project: WorkspaceProject,
+    unloadingProjectId: string | null = null,
+  ) {
+    const unloadingCount = unloadingProjectId
+      ? [...this.panes.values()].filter((pane) => pane.projectId === unloadingProjectId)
+          .length
+      : 0;
+    const current = Math.max(0, this.panes.size - unloadingCount);
+    const targetRemainsRestored =
+      this.restoredProjects.has(project.id) && project.id !== unloadingProjectId;
+    const incoming = targetRemainsRestored ? 0 : project.terminals.length;
+    return evaluateWorkspaceRestoreCapacity(current, incoming, MAX_PANES);
+  }
+
+  startPriority(projectId: string) {
+    return projectId === this.activeProjectId && this.workspaceView === "terminals"
+      ? 100
+      : 0;
+  }
+
+  syncProject(project: WorkspaceProject) {
+    const ordered = project.terminals.map((terminal) =>
+      paneRuntimeId(project.id, terminal.id),
+    );
+    this.projectOrders.set(project.id, ordered);
+    this.projectRatios.set(
+      project.id,
+      Object.fromEntries(
+        Object.entries(project.paneWidthRatios).map(([key, ratios]) => [
+          key,
+          [...ratios],
+        ]),
+      ),
+    );
+    if (this.restoredProjects.has(project.id)) {
+      for (const terminal of project.terminals) {
+        const existing = this.panes.get(paneRuntimeId(project.id, terminal.id));
+        if (existing) existing.setTitle(terminal.name);
+        else this.addPane(project.id, terminal, false);
+      }
+    }
   }
 
   showProject(project: WorkspaceProject) {
-    if (this.disposed || !this.catalogWritable) return false;
+    if (this.disposed) return false;
+    this.cancelLayoutInteraction();
     const capacity = this.restoreCapacity(project);
     if (!capacity.allowed) {
       this.setFooterStatus(
-        `${project.Name}을 열려면 PowerShell ${capacity.incoming}개 슬롯이 필요하지만 ` +
+        `${project.name}을 열려면 PowerShell ${capacity.incoming}개 슬롯이 필요하지만 ` +
           `${capacity.available}개만 남았습니다. 다른 프로젝트 탭을 닫고 다시 시도하세요.`,
         "error",
       );
       return false;
     }
-    const projectChanged = this.activeProjectId !== project.Id;
-    this.activeProjectId = project.Id;
+    const projectChanged = this.activeProjectId !== project.id;
+    this.activeProjectId = project.id;
     for (const pane of this.panes.values()) {
-      pane.element.hidden = pane.projectId !== project.Id;
+      pane.element.hidden = pane.projectId !== project.id;
       pane.setActive(false);
     }
 
-    if (!this.restoredProjects.has(project.Id)) {
-      for (const terminal of project.Terminals) {
-        if (!this.addPane(project.Id, terminal, false)) {
+    if (!this.restoredProjects.has(project.id)) {
+      for (const terminal of project.terminals) {
+        if (!this.addPane(project.id, terminal, false)) {
           // Capacity was checked before any pane was created. A different failure
           // rolls the whole runtime project back instead of leaving a partial restore.
-          void this.unloadProject(project.Id);
-          this.setFooterStatus(`${project.Name} PowerShell 복원을 완료하지 못했습니다.`, "error");
+          void this.unloadProject(project.id);
+          this.setFooterStatus(`${project.name} PowerShell 복원을 완료하지 못했습니다.`, "error");
           return false;
         }
       }
-      this.restoredProjects.add(project.Id);
+      this.restoredProjects.add(project.id);
     }
 
     const visible = this.visiblePanes();
     const prior = this.activePaneId ? this.panes.get(this.activePaneId) : null;
     this.activePaneId =
-      !projectChanged && prior?.projectId === project.Id ? prior.id : null;
+      !projectChanged && prior?.projectId === project.id ? prior.id : null;
     for (const pane of visible) pane.setActive(pane.id === this.activePaneId);
     if (this.workspaceView !== "browser") {
       this.workspaceView = "terminals";
@@ -1236,6 +1419,7 @@ class TerminalWorkspace {
 
   showEmptyView() {
     if (this.disposed) return;
+    this.cancelLayoutInteraction();
     this.activeProjectId = null;
     this.activePaneId = null;
     for (const pane of this.panes.values()) {
@@ -1254,7 +1438,7 @@ class TerminalWorkspace {
     if (this.disposed) return;
     this.catalogWritable = writable;
     for (const pane of this.panes.values()) pane.setCatalogWritable(writable);
-    this.updateLayout();
+    this.updateControls();
   }
 
   clearActivePane() {
@@ -1268,6 +1452,7 @@ class TerminalWorkspace {
 
   async unloadProject(projectId: string) {
     if (this.disposed) return;
+    this.cancelLayoutInteraction();
     const targets = [...this.panes.values()].filter(
       (pane) => pane.projectId === projectId,
     );
@@ -1276,6 +1461,8 @@ class TerminalWorkspace {
       pane.element.remove();
     }
     this.restoredProjects.delete(projectId);
+    this.projectOrders.delete(projectId);
+    this.projectRatios.delete(projectId);
     if (this.activeProjectId === projectId) {
       this.activeProjectId = null;
       this.activePaneId = null;
@@ -1291,14 +1478,29 @@ class TerminalWorkspace {
     await barrier;
   }
 
-  closePane(paneId: string) {
+  async unloadAllProjects() {
+    if (this.disposed) return;
+    this.cancelLayoutInteraction();
+    const projectIds = [...new Set([...this.panes.values()].map((pane) => pane.projectId))];
+    for (const projectId of projectIds) await this.unloadProject(projectId);
+  }
+
+  async closePane(paneId: string): Promise<void> {
     if (!this.catalogWritable) return;
     const pane = this.panes.get(paneId);
     if (!pane) return;
 
     const orderedIds = this.visiblePanes().map((item) => item.id);
     const removedIndex = orderedIds.indexOf(paneId);
+    const saved = await this.onPaneClosedCallback(pane.projectId, pane.terminalId);
+    if (!saved || this.disposed || !this.panes.has(paneId)) return;
+
     this.panes.delete(paneId);
+    const order = this.projectOrders.get(pane.projectId) ?? [];
+    this.projectOrders.set(
+      pane.projectId,
+      order.filter((candidate) => candidate !== paneId),
+    );
     this.appendStopBarrier(pane.dispose());
     pane.element.remove();
 
@@ -1310,7 +1512,6 @@ class TerminalWorkspace {
     for (const item of this.visiblePanes()) {
       item.setActive(item.id === this.activePaneId);
     }
-    this.onPaneClosedCallback(pane.projectId, pane.terminalId);
     this.updateLayout();
     this.renderActiveStatus();
     if (this.workspaceView === "terminals" && this.activePaneId) {
@@ -1332,12 +1533,20 @@ class TerminalWorkspace {
     }
   }
 
-  renamePane(paneId: string, title: string) {
+  async renamePane(paneId: string, title: string): Promise<void> {
     if (!this.catalogWritable) return;
     const pane = this.panes.get(paneId);
     if (!pane) return;
+    const previousTitle = pane.title;
     pane.setTitle(title);
-    this.onPaneRenamedCallback(pane.projectId, pane.terminalId, title);
+    const saved = await this.onPaneRenamedCallback(
+      pane.projectId,
+      pane.terminalId,
+      title,
+    );
+    if (!saved && !this.disposed && this.panes.get(paneId) === pane) {
+      pane.setTitle(previousTitle);
+    }
     this.renderActiveStatus();
   }
 
@@ -1360,7 +1569,310 @@ class TerminalWorkspace {
     }
   }
 
+  shouldDeferFit() {
+    return this.dragState?.started === true || this.resizeState !== null;
+  }
+
+  beginPaneDrag(event: PointerEvent, paneId: string, captureTarget: HTMLElement) {
+    if (
+      this.disposed ||
+      !this.catalogWritable ||
+      event.button !== 0 ||
+      this.dragState !== null ||
+      this.resizeState !== null
+    ) {
+      return;
+    }
+    const target = event.target;
+    if (
+      !(target instanceof Element) ||
+      target.closest("button, input, textarea, select, [contenteditable='true']")
+    ) {
+      return;
+    }
+    const pane = this.panes.get(paneId);
+    if (!pane || pane.projectId !== this.activeProjectId || pane.element.hidden) return;
+    this.dragState = {
+      paneId,
+      projectId: pane.projectId,
+      pointerId: event.pointerId,
+      captureTarget,
+      originX: event.clientX,
+      originY: event.clientY,
+      latestX: event.clientX,
+      latestY: event.clientY,
+      started: false,
+      geometry: [],
+      preview: null,
+      frame: 0,
+    };
+  }
+
+  beginPaneResize(event: PointerEvent, paneId: string, captureTarget: HTMLElement) {
+    if (
+      this.disposed ||
+      !this.catalogWritable ||
+      event.button !== 0 ||
+      this.dragState !== null ||
+      this.resizeState !== null
+    ) {
+      return;
+    }
+    const pane = this.panes.get(paneId);
+    const row = [...this.activeRows.values()].find((item) =>
+      item.paneIds.includes(paneId),
+    );
+    const dividerIndex = row?.paneIds.indexOf(paneId) ?? -1;
+    if (
+      !pane ||
+      !row ||
+      pane.projectId !== this.activeProjectId ||
+      dividerIndex < 0 ||
+      dividerIndex >= row.paneIds.length - 1
+    ) {
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    const rowRect = row.element.getBoundingClientRect();
+    const gapValue = Number.parseFloat(getComputedStyle(row.element).columnGap);
+    const gap = Number.isFinite(gapValue) ? gapValue : 6;
+    const totalWidth = Math.max(1, rowRect.width - gap * (row.columns - 1));
+    const currentWidths = row.ratios.map((ratio) => ratio * totalWidth);
+    const average = totalWidth / row.columns;
+    const dynamicMinimum = Math.min(180, Math.max(80, average * 0.72));
+    const minPaneWidth = Math.max(1, Math.min(dynamicMinimum, ...currentWidths));
+    const siblingEdges = [...this.activeRows.values()]
+      .filter((candidate) => candidate !== row)
+      .flatMap((candidate) =>
+        candidate.paneIds
+          .slice(0, -1)
+          .map((candidateId) => this.panes.get(candidateId)?.element.getBoundingClientRect().right)
+          .filter((edge): edge is number => edge !== undefined),
+      );
+    this.resizeState = {
+      paneId,
+      projectId: pane.projectId,
+      pointerId: event.pointerId,
+      captureTarget,
+      row,
+      dividerIndex,
+      originX: event.clientX,
+      latestX: event.clientX,
+      rowLeft: rowRect.left,
+      totalWidth,
+      gap,
+      minPaneWidth,
+      siblingEdges,
+      originalRatios: [...row.ratios],
+      previewRatios: [...row.ratios],
+      frame: 0,
+    };
+    try {
+      captureTarget.setPointerCapture(event.pointerId);
+    } catch {
+      // The window listeners still provide a safe cancel path.
+    }
+    document.body.dataset.paneResizing = "true";
+  }
+
+  cancelLayoutInteraction() {
+    if (this.dragState) this.finishPaneDrag(true);
+    if (this.resizeState) this.finishPaneResize(true);
+  }
+
+  private updatePaneDrag(event: PointerEvent) {
+    const state = this.dragState;
+    if (!state) return;
+    state.latestX = event.clientX;
+    state.latestY = event.clientY;
+    if (!state.started) {
+      if (Math.hypot(state.latestX - state.originX, state.latestY - state.originY) < 8) {
+        return;
+      }
+      const visible = this.visiblePanes();
+      if (visible.length < 2) {
+        this.finishPaneDrag(true);
+        return;
+      }
+      state.geometry = visible.map((pane) => {
+        const rect = pane.element.getBoundingClientRect();
+        return {
+          paneId: pane.id,
+          left: rect.left,
+          top: rect.top,
+          width: rect.width,
+          height: rect.height,
+        };
+      });
+      state.started = true;
+      this.panes.get(state.paneId)?.setDragging(true);
+      document.body.dataset.paneDragging = "true";
+      try {
+        state.captureTarget.setPointerCapture(state.pointerId);
+      } catch {
+        // Window-level pointer listeners remain active if capture is unavailable.
+      }
+    }
+    event.preventDefault();
+    if (!state.frame) {
+      state.frame = requestAnimationFrame(() => this.renderPaneDragFrame());
+    }
+  }
+
+  private renderPaneDragFrame() {
+    const state = this.dragState;
+    if (!state?.started) return;
+    state.frame = 0;
+    const pane = this.panes.get(state.paneId);
+    if (!pane) return;
+    pane.element.style.transform = `translate3d(${state.latestX - state.originX}px, ${
+      state.latestY - state.originY
+    }px, 0)`;
+    state.preview = resolvePaneInsertionPreview(
+      state.geometry,
+      state.paneId,
+      { x: state.latestX, y: state.latestY },
+      state.preview,
+    );
+    const targetGeometry = state.preview.beforePaneId
+      ? state.geometry.find((item) => item.paneId === state.preview?.beforePaneId)
+      : state.geometry[state.geometry.length - 1];
+    if (!targetGeometry) return;
+    const surfaceRect = this.terminalSurface.getBoundingClientRect();
+    const lineX = state.preview.beforePaneId
+      ? targetGeometry.left
+      : targetGeometry.left + targetGeometry.width;
+    this.insertionLine.style.left = `${Math.round(lineX - surfaceRect.left)}px`;
+    this.insertionLine.style.top = `${Math.round(targetGeometry.top - surfaceRect.top)}px`;
+    this.insertionLine.style.height = `${Math.round(targetGeometry.height)}px`;
+    this.insertionLine.hidden = false;
+  }
+
+  private finishPaneDrag(cancelled: boolean) {
+    const state = this.dragState;
+    if (!state) return;
+    if (state.frame) {
+      cancelAnimationFrame(state.frame);
+      state.frame = 0;
+      if (!cancelled) this.renderPaneDragFrame();
+    }
+    this.dragState = null;
+    try {
+      if (state.captureTarget.hasPointerCapture(state.pointerId)) {
+        state.captureTarget.releasePointerCapture(state.pointerId);
+      }
+    } catch {
+      // Pointer capture may already have been released by Windows.
+    }
+    delete document.body.dataset.paneDragging;
+    this.insertionLine.hidden = true;
+    const pane = this.panes.get(state.paneId);
+    if (pane) {
+      pane.setDragging(false);
+      pane.element.style.transform = "";
+    }
+    if (cancelled || !state.started || !state.preview || !pane) return;
+
+    const current = [...(this.projectOrders.get(state.projectId) ?? [])];
+    const next = current.filter((candidate) => candidate !== state.paneId);
+    const insertionIndex = state.preview.beforePaneId
+      ? next.indexOf(state.preview.beforePaneId)
+      : next.length;
+    if (insertionIndex < 0) return;
+    next.splice(insertionIndex, 0, state.paneId);
+    if (next.every((candidate, index) => candidate === current[index])) return;
+    this.projectOrders.set(state.projectId, next);
+    const beforeTerminalId = state.preview.beforePaneId
+      ? this.panes.get(state.preview.beforePaneId)?.terminalId ?? null
+      : null;
+    this.updateLayout();
+    this.onPaneReorderedCallback(state.projectId, pane.terminalId, {
+      beforePaneId: beforeTerminalId,
+    });
+  }
+
+  private updatePaneResize(event: PointerEvent) {
+    const state = this.resizeState;
+    if (!state) return;
+    state.latestX = event.clientX;
+    event.preventDefault();
+    if (!state.frame) {
+      state.frame = requestAnimationFrame(() => this.renderPaneResizeFrame());
+    }
+  }
+
+  private renderPaneResizeFrame() {
+    const state = this.resizeState;
+    if (!state) return;
+    state.frame = 0;
+    try {
+      const resized = computeHorizontalResize({
+        ratios: state.originalRatios,
+        dividerIndex: state.dividerIndex,
+        totalWidthPx: state.totalWidth,
+        deltaX: state.latestX - state.originX,
+        minPaneWidthPx: state.minPaneWidth,
+        containerLeftPx: state.rowLeft + state.gap * state.dividerIndex,
+        siblingEdgesPx: state.siblingEdges,
+      });
+      state.previewRatios = resized.ratios;
+      this.applyRowRatios(state.row, resized.ratios);
+      if (resized.snappedToPx === null) {
+        this.snapGuide.hidden = true;
+      } else {
+        const surfaceRect = this.terminalSurface.getBoundingClientRect();
+        const rowRect = state.row.element.getBoundingClientRect();
+        this.snapGuide.style.left = `${Math.round(resized.snappedToPx - surfaceRect.left)}px`;
+        this.snapGuide.style.top = `${Math.round(rowRect.top - surfaceRect.top)}px`;
+        this.snapGuide.style.height = `${Math.round(rowRect.height)}px`;
+        this.snapGuide.hidden = false;
+      }
+    } catch (error) {
+      this.setFooterStatus(`너비를 조절할 수 없습니다: ${errorMessage(error)}`, "error");
+    }
+  }
+
+  private finishPaneResize(cancelled: boolean) {
+    const state = this.resizeState;
+    if (!state) return;
+    if (state.frame) {
+      cancelAnimationFrame(state.frame);
+      state.frame = 0;
+      if (!cancelled) this.renderPaneResizeFrame();
+    }
+    this.resizeState = null;
+    try {
+      if (state.captureTarget.hasPointerCapture(state.pointerId)) {
+        state.captureTarget.releasePointerCapture(state.pointerId);
+      }
+    } catch {
+      // Pointer capture may already have been released by Windows.
+    }
+    delete document.body.dataset.paneResizing;
+    this.snapGuide.hidden = true;
+    const ratios = cancelled ? state.originalRatios : state.previewRatios;
+    this.applyRowRatios(state.row, ratios);
+    if (!cancelled && !ratiosEqual(state.originalRatios, state.previewRatios)) {
+      const entries = this.projectRatios.get(state.projectId) ?? {};
+      this.projectRatios.set(state.projectId, {
+        ...entries,
+        [state.row.key]: [...state.previewRatios],
+      });
+      this.onPaneRatiosChangedCallback(
+        state.projectId,
+        state.row.key,
+        [...state.previewRatios],
+      );
+    }
+    requestAnimationFrame(() => {
+      for (const paneId of state.row.paneIds) this.panes.get(paneId)?.scheduleFit(0);
+    });
+  }
+
   showBrowserView() {
+    this.cancelLayoutInteraction();
     this.workspaceView = "browser";
     this.app.dataset.workspaceView = "browser";
     this.closeActiveButton.disabled = true;
@@ -1390,22 +1902,87 @@ class TerminalWorkspace {
     }
     this.disposed = true;
     this.catalogWritable = false;
+    this.cancelLayoutInteraction();
     this.app.removeEventListener("pointerdown", this.onAppPointerDown);
+    window.removeEventListener("pointermove", this.onLayoutPointerMove, true);
+    window.removeEventListener("pointerup", this.onLayoutPointerUp, true);
+    window.removeEventListener("pointercancel", this.onLayoutPointerCancel, true);
+    window.removeEventListener("keydown", this.onLayoutKeyDown, true);
+    window.removeEventListener("blur", this.onLayoutWindowBlur);
     const stops = Promise.all(
       [...this.panes.values()].map((pane) => pane.dispose()),
     ).then(() => undefined);
     this.panes.clear();
     this.sessionOwners.clear();
     this.restoredProjects.clear();
+    this.projectOrders.clear();
+    this.projectRatios.clear();
+    this.activeRows.clear();
     await this.appendStopBarrier(stops);
   }
 
   private updateLayout() {
     const visible = this.visiblePanes();
     const { columns, rows } = layoutFor(visible.length);
-    this.terminalSurface.style.setProperty("--grid-columns", String(columns));
-    this.terminalSurface.style.setProperty("--grid-rows", String(rows));
+    for (const pane of this.panes.values()) {
+      pane.element.hidden = true;
+      pane.setResizeHandleEnabled(false);
+      this.inactivePaneBin.append(pane.element);
+    }
+    this.rowsHost.replaceChildren();
+    this.activeRows.clear();
+    this.rowsHost.style.setProperty("--terminal-row-count", String(rows));
+
+    const storedRatios = this.activeProjectId
+      ? this.projectRatios.get(this.activeProjectId) ?? {}
+      : {};
+    for (let rowIndex = 0; rowIndex < rows && visible.length > 0; rowIndex += 1) {
+      const start = rowIndex * columns;
+      const rowPanes = visible.slice(start, start + columns);
+      if (rowPanes.length === 0) break;
+      const key = `${columns}x${rows}:row-${rowIndex}`;
+      const ratios = normalizedLayoutRatios(storedRatios[key], columns);
+      const rowElement = document.createElement("div");
+      rowElement.className = "terminal-row";
+      rowElement.dataset.layoutKey = key;
+      rowElement.dataset.row = String(rowIndex);
+      const row: ActiveTerminalRow = {
+        key,
+        element: rowElement,
+        paneIds: rowPanes.map((pane) => pane.id),
+        ratios,
+        columns,
+      };
+
+      for (let column = 0; column < columns; column += 1) {
+        const pane = rowPanes[column];
+        if (pane) {
+          pane.element.hidden = false;
+          pane.setResizeHandleEnabled(
+            this.catalogWritable && column < rowPanes.length - 1,
+          );
+          rowElement.append(pane.element);
+        } else {
+          const spacer = document.createElement("div");
+          spacer.className = "terminal-row-spacer";
+          spacer.setAttribute("aria-hidden", "true");
+          rowElement.append(spacer);
+        }
+      }
+      this.applyRowRatios(row, ratios);
+      this.activeRows.set(key, row);
+      this.rowsHost.append(rowElement);
+    }
+
     this.terminalSurface.dataset.empty = String(visible.length === 0);
+    this.updateControls();
+    requestAnimationFrame(() => {
+      for (const pane of visible) pane.scheduleFit(0);
+    });
+  }
+
+  private updateControls() {
+    const visible = this.visiblePanes();
     this.countElement.textContent = `${visible.length} / ${MAX_PROJECT_PANES}`;
     this.addButton.disabled =
       !this.catalogWritable ||
@@ -1416,8 +1993,24 @@ class TerminalWorkspace {
       !this.catalogWritable ||
       this.workspaceView === "browser" ||
       this.activePaneId === null;
-    requestAnimationFrame(() => {
-      for (const pane of visible) pane.scheduleFit(0);
+    for (const row of this.activeRows.values()) {
+      row.paneIds.forEach((paneId, index) => {
+        this.panes
+          .get(paneId)
+          ?.setResizeHandleEnabled(
+            this.catalogWritable && index < row.paneIds.length - 1,
+          );
+      });
+    }
+  }
+
+  private applyRowRatios(row: ActiveTerminalRow, ratios: readonly number[]) {
+    row.ratios = [...ratios];
+    [...row.element.children].forEach((child, index) => {
+      if (!(child instanceof HTMLElement)) return;
+      child.style.flexGrow = String(ratios[index] ?? 0);
+      child.style.flexShrink = "1";
+      child.style.flexBasis = "0px";
     });
   }
 
@@ -1443,9 +2036,16 @@ class TerminalWorkspace {
 
   private visiblePanes() {
     if (!this.activeProjectId) return [];
-    return [...this.panes.values()].filter(
+    const candidates = [...this.panes.values()].filter(
       (pane) => pane.projectId === this.activeProjectId,
     );
+    const byId = new Map(candidates.map((pane) => [pane.id, pane]));
+    const ordered = (this.projectOrders.get(this.activeProjectId) ?? [])
+      .map((paneId) => byId.get(paneId))
+      .filter((pane): pane is TerminalPane => pane !== undefined);
+    const known = new Set(ordered.map((pane) => pane.id));
+    ordered.push(...candidates.filter((pane) => !known.has(pane.id)));
+    return ordered;
   }
 
   private appendStopBarrier(stop: Promise<void>) {
@@ -1677,549 +2277,6 @@ class BrowserController {
   }
 }
 
-class ProjectCatalogAdapter {
-  async load() {
-    return normalizeProjectCatalogLoadResponse(
-      await invoke<unknown>("load_project_catalog"),
-    );
-  }
-
-  async save(catalog: ProjectCatalog) {
-    await invoke("save_project_catalog", { catalog: cloneProjectCatalog(catalog) });
-  }
-
-  async recoverBackup() {
-    return normalizeProjectCatalog(
-      await invoke<unknown>("recover_project_catalog_backup"),
-    );
-  }
-}
-
-class Phase3Controller {
-  private readonly adapter = new ProjectCatalogAdapter();
-  private catalog: ProjectCatalog = { Projects: [], SelectedProjectId: null };
-  private tabs: WorkspaceTabState = createInitialTabState(null, createLocalId);
-  private saveQueue: Promise<void> = Promise.resolve();
-  private saveFailure: unknown | null = null;
-  private recoveryTask: Promise<void> | null = null;
-  private initialized = false;
-  private writable = false;
-  private shuttingDown = false;
-  private tabTransitionPending = false;
-  private projectCreationPending = false;
-  private terminalCreationPending = false;
-
-  constructor(
-    private readonly workspace: TerminalWorkspace,
-    private readonly projectList: HTMLElement,
-    private readonly projectCount: HTMLElement,
-    private readonly tabList: HTMLElement,
-    private readonly currentProject: HTMLElement,
-    private readonly addTerminalButton: HTMLButtonElement,
-    private readonly addTabButton: HTMLButtonElement,
-    private readonly createProjectButton: HTMLButtonElement,
-    private readonly recoverProjectButton: HTMLButtonElement,
-    private readonly dialog: HTMLDialogElement,
-    private readonly form: HTMLFormElement,
-    private readonly nameInput: HTMLInputElement,
-    private readonly pathInput: HTMLInputElement,
-    private readonly formError: HTMLElement,
-    private readonly cancelProjectButton: HTMLButtonElement,
-  ) {
-    this.addTerminalButton.addEventListener("click", () => void this.addTerminal());
-    this.addTabButton.addEventListener("click", () => {
-      if (!this.canMutateCatalog()) return;
-      this.tabs = addBlankTab(this.tabs, createLocalId);
-      this.renderAndActivate();
-    });
-    this.createProjectButton.addEventListener("click", () => {
-      if (this.canMutateCatalog()) this.openProjectDialog();
-    });
-    this.recoverProjectButton.addEventListener("click", () => {
-      const task = this.recoverProjectCatalog();
-      this.recoveryTask = task;
-      void task.finally(() => {
-        if (this.recoveryTask === task) this.recoveryTask = null;
-      });
-    });
-    this.cancelProjectButton.addEventListener("click", () => this.dialog.close());
-    this.form.addEventListener("submit", (event) => {
-      event.preventDefault();
-      void this.createProject();
-    });
-    this.setWritable(false);
-  }
-
-  async initialize() {
-    try {
-      const loaded = await this.adapter.load();
-      if (this.shuttingDown) return;
-      this.catalog = loaded.catalog;
-      this.initialized = true;
-      if (loaded.recoveryRequired) {
-        this.tabs = createInitialTabState(null, createLocalId);
-        this.recoverProjectButton.hidden = false;
-        this.recoverProjectButton.disabled = false;
-        this.renderAndActivate(false);
-        this.workspace.setFooterStatus(
-          "정상 카탈로그 대신 검증된 백업을 찾았습니다. 백업 복구를 눌러 확인하세요.",
-          "error",
-        );
-        return;
-      }
-      this.tabs = createInitialTabState(initialProject(this.catalog), createLocalId);
-      this.setWritable(true);
-      this.renderAndActivate(false);
-      this.workspace.setFooterStatus("프로젝트를 불러왔습니다.");
-    } catch (error) {
-      if (this.shuttingDown) return;
-      this.initialized = true;
-      this.tabs = createInitialTabState(null, createLocalId);
-      this.setWritable(false);
-      this.renderAndActivate(false);
-      this.workspace.setFooterStatus(
-        `프로젝트 저장소를 불러오지 못해 읽기 전용으로 유지합니다: ${String(error)}`,
-        "error",
-      );
-    }
-  }
-
-  onPaneClosed(projectId: string, paneId: string) {
-    if (!this.canMutateCatalog(false)) return;
-    try {
-      this.catalog = removeTerminal(this.catalog, projectId, paneId);
-      this.queueSave(this.catalog, "PowerShell 삭제 상태를 저장하지 못했습니다");
-    } catch (error) {
-      this.workspace.setFooterStatus(String(error), "error");
-    }
-  }
-
-  onPaneRenamed(projectId: string, paneId: string, title: string) {
-    if (!this.canMutateCatalog(false)) return;
-    try {
-      this.catalog = renameTerminal(this.catalog, projectId, paneId, title);
-      this.queueSave(this.catalog, "PowerShell 이름을 저장하지 못했습니다");
-    } catch (error) {
-      this.workspace.setFooterStatus(String(error), "error");
-    }
-  }
-
-  beginShutdown() {
-    if (this.shuttingDown) return;
-    this.shuttingDown = true;
-    this.setWritable(false);
-    this.recoverProjectButton.disabled = true;
-    this.renderTabs();
-    this.renderSidebar();
-    this.workspace.setFooterStatus("프로젝트 상태를 저장한 뒤 종료하는 중…");
-  }
-
-  async flushSaves() {
-    while (this.recoveryTask) {
-      const recovery = this.recoveryTask;
-      await recovery;
-      if (this.recoveryTask === recovery) this.recoveryTask = null;
-    }
-    let observed: Promise<void>;
-    do {
-      observed = this.saveQueue;
-      await observed;
-    } while (observed !== this.saveQueue);
-    if (this.saveFailure !== null) throw this.saveFailure;
-  }
-
-  private renderAndActivate(persistSelection = true) {
-    this.renderTabs();
-    this.activateCurrentTab(persistSelection);
-    this.renderSidebar();
-  }
-
-  private renderTabs() {
-    this.tabList.replaceChildren();
-    const mutationEnabled = this.mutationsEnabled();
-    for (const tab of this.tabs.tabs) {
-      const element = document.createElement("div");
-      element.className = "workspace-tab";
-      element.dataset.active = String(tab.id === this.tabs.activeTabId);
-      element.setAttribute("role", "tab");
-      element.setAttribute("aria-selected", String(tab.id === this.tabs.activeTabId));
-      element.setAttribute("aria-disabled", String(!mutationEnabled));
-      element.tabIndex = mutationEnabled && tab.id === this.tabs.activeTabId ? 0 : -1;
-
-      const kind = document.createElement("span");
-      kind.className = "workspace-tab-kind";
-      kind.textContent = tab.kind === "project" ? ">_" : "○";
-      const title = document.createElement("span");
-      title.className = "workspace-tab-title";
-      title.textContent = tab.title;
-      const close = document.createElement("button");
-      close.className = "workspace-tab-close";
-      close.type = "button";
-      close.textContent = "×";
-      close.title = `${tab.title} 탭 닫기`;
-      close.setAttribute("aria-label", `${tab.title} 탭 닫기`);
-      close.disabled = !mutationEnabled;
-      close.addEventListener("click", (event) => {
-        event.stopPropagation();
-        if (!this.canMutateCatalog()) return;
-        void this.closeTab(tab.id, tab.projectId);
-      });
-
-      const select = () => {
-        if (!this.canMutateCatalog()) return;
-        this.tabs = selectWorkspaceTab(this.tabs, tab.id);
-        this.renderAndActivate();
-      };
-      element.addEventListener("click", select);
-      element.addEventListener("keydown", (event) => {
-        if (event.key !== "Enter" && event.key !== " ") return;
-        event.preventDefault();
-        select();
-      });
-      element.append(kind, title, close);
-      this.tabList.append(element);
-    }
-  }
-
-  private renderSidebar() {
-    const activeTab = this.activeTab();
-    const activeProjectId = activeTab?.kind === "project" ? activeTab.projectId : null;
-    this.projectCount.textContent = String(this.catalog.Projects.length);
-    this.projectList.replaceChildren();
-    const mutationEnabled = this.mutationsEnabled();
-    for (const project of this.catalog.Projects) {
-      const button = document.createElement("button");
-      button.className = "project-item";
-      button.type = "button";
-      button.disabled = !mutationEnabled;
-      button.dataset.active = String(project.Id === activeProjectId);
-      button.title = project.FolderPath;
-      const name = document.createElement("strong");
-      name.textContent = project.Name;
-      const folder = document.createElement("small");
-      folder.textContent = project.FolderPath;
-      button.append(name, folder);
-      button.addEventListener("click", () => this.openProject(project));
-      this.projectList.append(button);
-    }
-  }
-
-  private activateCurrentTab(persistSelection: boolean) {
-    const tab = this.activeTab();
-    if (tab?.kind === "project" && tab.projectId) {
-      const project = this.catalog.Projects.find((item) => item.Id === tab.projectId);
-      if (project) {
-        if (!this.workspace.showProject(project)) return;
-        this.currentProject.textContent = project.Name;
-        if (
-          persistSelection &&
-          this.writable &&
-          this.catalog.SelectedProjectId !== project.Id
-        ) {
-          this.catalog = { ...this.catalog, SelectedProjectId: project.Id };
-          this.queueSave(this.catalog, "선택한 프로젝트를 저장하지 못했습니다");
-        }
-        return;
-      }
-    }
-
-    this.currentProject.textContent = "프로젝트 없음";
-    this.workspace.showEmptyView();
-    if (persistSelection && this.writable && this.catalog.SelectedProjectId !== null) {
-      this.catalog = { ...this.catalog, SelectedProjectId: null };
-      this.queueSave(this.catalog, "빈 탭 상태를 저장하지 못했습니다");
-    }
-  }
-
-  private activeTab() {
-    return this.tabs.tabs.find((tab) => tab.id === this.tabs.activeTabId) ?? null;
-  }
-
-  private openProject(project: WorkspaceProject) {
-    if (!this.canMutateCatalog()) return;
-    const capacity = this.workspace.restoreCapacity(project);
-    if (!capacity.allowed) {
-      this.workspace.setFooterStatus(
-        `${project.Name}을 열 공간이 부족합니다. 다른 프로젝트 탭을 닫아 ` +
-          `PowerShell ${capacity.incoming - capacity.available}개 슬롯을 더 확보하세요.`,
-        "error",
-      );
-      return;
-    }
-    this.tabs = openProjectTab(this.tabs, project, createLocalId);
-    this.renderAndActivate();
-  }
-
-  private async closeTab(tabId: string, projectId: string | null) {
-    if (!this.canMutateCatalog()) return;
-    this.tabTransitionPending = true;
-    const next = closeWorkspaceTab(this.tabs, tabId, createLocalId);
-    this.tabs = next;
-    const nextActive = next.tabs.find((tab) => tab.id === next.activeTabId) ?? null;
-    const nextSelectedProjectId =
-      nextActive?.kind === "project" ? nextActive.projectId : null;
-    if (this.catalog.SelectedProjectId !== nextSelectedProjectId) {
-      this.catalog = {
-        ...this.catalog,
-        SelectedProjectId: nextSelectedProjectId,
-      };
-      this.queueSave(this.catalog, "닫은 프로젝트 탭 상태를 저장하지 못했습니다");
-    }
-    this.refreshMutationControls(true);
-    try {
-      if (
-        projectId &&
-        !next.tabs.some((tab) => tab.kind === "project" && tab.projectId === projectId)
-      ) {
-        this.workspace.setFooterStatus("프로젝트 PowerShell을 정리하는 중…");
-        await this.workspace.unloadProject(projectId);
-      }
-    } finally {
-      this.tabTransitionPending = false;
-      if (!this.shuttingDown) {
-        this.refreshMutationControls(false);
-        this.renderAndActivate();
-      }
-    }
-  }
-
-  private openProjectDialog() {
-    this.form.reset();
-    this.formError.textContent = "";
-    this.dialog.showModal();
-    requestAnimationFrame(() => this.nameInput.focus());
-  }
-
-  private async recoverProjectCatalog() {
-    if (
-      !this.initialized ||
-      this.writable ||
-      this.shuttingDown ||
-      this.recoverProjectButton.hidden ||
-      this.recoverProjectButton.disabled
-    ) {
-      return;
-    }
-    this.recoverProjectButton.disabled = true;
-    this.workspace.setFooterStatus("검증된 프로젝트 백업을 복구하는 중…");
-    try {
-      const recovered = await this.adapter.recoverBackup();
-      if (this.shuttingDown) return;
-      this.catalog = recovered;
-      this.tabs = createInitialTabState(initialProject(this.catalog), createLocalId);
-      this.recoverProjectButton.hidden = true;
-      this.setWritable(true);
-      this.renderAndActivate(false);
-      this.workspace.setFooterStatus("프로젝트 백업을 복구했습니다.");
-    } catch (error) {
-      if (this.shuttingDown) return;
-      this.recoverProjectButton.disabled = false;
-      this.workspace.setFooterStatus(
-        `프로젝트 백업을 복구하지 못했습니다: ${errorMessage(error)}`,
-        "error",
-      );
-    }
-  }
-
-  private async createProject() {
-    if (!this.canMutateCatalog() || this.projectCreationPending) return;
-    this.projectCreationPending = true;
-    this.refreshMutationControls(true);
-    this.formError.textContent = "";
-    let draft: ReturnType<typeof validateProjectDraft>;
-    try {
-      draft = validateProjectDraft(this.nameInput.value, this.pathInput.value);
-    } catch (error) {
-      this.formError.textContent = errorMessage(error);
-      this.projectCreationPending = false;
-      this.refreshMutationControls(true);
-      return;
-    }
-
-    const existing = findProjectByFolder(this.catalog.Projects, draft.folderPath);
-    if (existing) {
-      this.projectCreationPending = false;
-      this.refreshMutationControls(true);
-      this.dialog.close();
-      this.openProject(existing);
-      this.workspace.setFooterStatus("이미 등록된 폴더의 프로젝트를 열었습니다.");
-      return;
-    }
-
-    const project: WorkspaceProject = {
-      Id: createLocalId(),
-      Name: uniqueProjectName(this.catalog.Projects, draft.name),
-      FolderPath: draft.folderPath,
-      Terminals: [],
-      PaneWidthRatios: {},
-    };
-    const next: ProjectCatalog = {
-      ...this.catalog,
-      Projects: [...this.catalog.Projects, project],
-      SelectedProjectId: project.Id,
-    };
-    const prior = this.catalog;
-    this.catalog = next;
-    try {
-      await this.saveBeforeCommit(next);
-      if (this.shuttingDown) return;
-    } catch (error) {
-      if (this.catalog === next) this.catalog = prior;
-      const rollbackError = await this.persistRollback(prior);
-      if (this.shuttingDown) return;
-      const message =
-        `프로젝트를 만들지 못했습니다: ${errorMessage(error)}` +
-        (rollbackError
-          ? ` · 이전 상태 재확인 실패: ${errorMessage(rollbackError)}`
-          : "");
-      this.formError.textContent = message;
-      this.workspace.setFooterStatus(message, "error");
-      this.projectCreationPending = false;
-      this.refreshMutationControls(true);
-      return;
-    }
-
-    this.projectCreationPending = false;
-    this.refreshMutationControls(true);
-    this.dialog.close();
-    this.openProject(project);
-  }
-
-  private async addTerminal() {
-    if (!this.canMutateCatalog() || this.terminalCreationPending) return;
-    const tab = this.activeTab();
-    if (tab?.kind !== "project" || !tab.projectId) return;
-    const project = this.catalog.Projects.find((item) => item.Id === tab.projectId);
-    if (!project) return;
-    const terminal = createSavedTerminal(
-      createLocalId(),
-      nextTerminalName(project),
-      project.FolderPath,
-      new Date().toISOString(),
-    );
-    let next: ProjectCatalog | null = null;
-    const prior = this.catalog;
-    this.terminalCreationPending = true;
-    this.refreshMutationControls(true);
-    try {
-      next = appendTerminal(this.catalog, project.Id, terminal);
-      this.catalog = next;
-      await this.saveBeforeCommit(next);
-      if (this.shuttingDown) return;
-    } catch (error) {
-      if (next && this.catalog === next) this.catalog = prior;
-      const rollbackError = next ? await this.persistRollback(prior) : null;
-      if (this.shuttingDown) return;
-      this.workspace.setFooterStatus(
-        `PowerShell을 추가하지 못했습니다: ${errorMessage(error)}` +
-          (rollbackError
-            ? ` · 이전 상태 재확인 실패: ${errorMessage(rollbackError)}`
-            : ""),
-        "error",
-      );
-      this.terminalCreationPending = false;
-      this.refreshMutationControls(true);
-      return;
-    }
-
-    const activeTab = this.activeTab();
-    const projectStillOpen = this.tabs.tabs.some(
-      (item) => item.kind === "project" && item.projectId === project.Id,
-    );
-    const projectStillActive =
-      activeTab?.kind === "project" && activeTab.projectId === project.Id;
-    this.terminalCreationPending = false;
-    this.refreshMutationControls(true);
-    if (!projectStillOpen || !projectStillActive) {
-      this.workspace.setFooterStatus(
-        "프로젝트 탭 상태가 바뀌어 저장된 PowerShell을 실행하지 않았습니다.",
-        "error",
-      );
-      return;
-    }
-    if (!this.workspace.addPane(project.Id, terminal, true)) {
-      this.workspace.setFooterStatus(
-        "PowerShell 상태는 저장했지만 실행 슬롯을 확보하지 못했습니다.",
-        "error",
-      );
-    }
-  }
-
-  private queueSave(catalog: ProjectCatalog, context: string) {
-    void this.enqueueSave(catalog).catch((error) => {
-      this.workspace.setFooterStatus(`${context}: ${errorMessage(error)}`, "error");
-    });
-  }
-
-  private saveBeforeCommit(catalog: ProjectCatalog) {
-    return this.enqueueSave(catalog);
-  }
-
-  private async persistRollback(catalog: ProjectCatalog) {
-    try {
-      await this.enqueueSave(catalog);
-      return null;
-    } catch (error) {
-      return error;
-    }
-  }
-
-  private enqueueSave(catalog: ProjectCatalog) {
-    const snapshot = cloneProjectCatalog(catalog);
-    const operation = this.saveQueue.then(() => this.adapter.save(snapshot));
-    this.saveQueue = operation.then(
-      () => {
-        this.saveFailure = null;
-      },
-      (error: unknown) => {
-        this.saveFailure = error;
-      },
-    );
-    return operation;
-  }
-
-  private setWritable(writable: boolean) {
-    this.writable = writable;
-    this.refreshMutationControls(false);
-    if (!writable && this.dialog.open) this.dialog.close();
-  }
-
-  private refreshMutationControls(render: boolean) {
-    const enabled = this.mutationsEnabled();
-    this.createProjectButton.disabled = !enabled;
-    this.addTabButton.disabled = !enabled;
-    this.workspace.setCatalogWritable(enabled);
-    if (render) {
-      this.renderTabs();
-      this.renderSidebar();
-    }
-  }
-
-  private canMutateCatalog(report = true) {
-    const allowed = this.mutationsEnabled();
-    if (!allowed && report) {
-      this.workspace.setFooterStatus(
-        this.shuttingDown
-          ? "종료를 준비하고 있어 변경할 수 없습니다."
-          : "프로젝트 저장소가 준비되지 않아 변경할 수 없습니다.",
-        "error",
-      );
-    }
-    return allowed;
-  }
-
-  private mutationsEnabled() {
-    return catalogMutationsAllowed({
-      initialized: this.initialized,
-      writable: this.writable,
-      shuttingDown: this.shuttingDown,
-      tabTransitionPending: this.tabTransitionPending,
-      projectCreationPending: this.projectCreationPending,
-      terminalCreationPending: this.terminalCreationPending,
-    });
-  }
-}
-
 async function stopBackendSession(sessionId: string) {
   await invoke("stop_terminal", { sessionId }).catch(() => undefined);
 }
@@ -2258,13 +2315,27 @@ function nextAnimationFrame() {
   return new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
 }
 
-function createLocalId() {
-  if (typeof crypto.randomUUID === "function") return crypto.randomUUID();
-  return `pane-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-}
-
 function paneRuntimeId(projectId: string, terminalId: string) {
   return `${projectId.length}:${projectId}${terminalId}`;
+}
+
+function normalizedLayoutRatios(
+  stored: readonly number[] | undefined,
+  columns: number,
+) {
+  const source =
+    stored?.length === columns && stored.every((value) => Number.isFinite(value) && value > 0)
+      ? [...stored]
+      : Array.from({ length: columns }, () => 1);
+  const sum = source.reduce((total, value) => total + value, 0);
+  return source.map((value) => value / sum);
+}
+
+function ratiosEqual(left: readonly number[], right: readonly number[]) {
+  return (
+    left.length === right.length &&
+    left.every((value, index) => Math.abs(value - right[index]) < 1e-6)
+  );
 }
 
 function errorMessage(error: unknown) {
@@ -2317,16 +2388,22 @@ const tabList = requireElement("workspace-tab-list");
 const currentProject = requireElement("current-project");
 const addTabButton = requireButton("add-workspace-tab");
 const createProjectButton = requireButton("create-project");
-const recoverProjectButton = requireButton("recover-project-catalog");
 const projectDialog = requireDialog("project-dialog");
 const projectForm = requireForm("project-form");
 const projectName = requireInput("project-name");
 const projectPath = requireInput("project-path");
 const projectFormError = requireElement("project-form-error");
 const cancelProjectButton = requireButton("cancel-project");
-const migrationUi = createPhase3BMigrationUI();
+const upgradeButton = requireButton("open-phase3-upgrade");
+const upgradeDialog = requireDialog("phase3-upgrade-dialog");
+const upgradeProjectCount = requireElement("phase3-upgrade-project-count");
+const upgradeTerminalCount = requireElement("phase3-upgrade-terminal-count");
+const upgradeSourceSha = requireElement("phase3-upgrade-source-sha");
+const commitUpgradeButton = requireButton("commit-phase3-upgrade");
+const closeUpgradeButton = requireButton("close-phase3-upgrade");
+const upgradeError = requireElement("phase3-upgrade-error");
 
-let controller: Phase3Controller | null = null;
+let controller: Phase4WorkspaceController | null = null;
 const workspace = new TerminalWorkspace(
   app,
   terminalSurface,
@@ -2334,45 +2411,69 @@ const workspace = new TerminalWorkspace(
   closeActiveButton,
   sessionCount,
   statusElement,
-  (projectId, paneId) => controller?.onPaneClosed(projectId, paneId),
-  (projectId, paneId, title) => controller?.onPaneRenamed(projectId, paneId, title),
+  (projectId, paneId) =>
+    controller?.onPaneClosed(projectId, paneId) ?? Promise.resolve(false),
+  (projectId, paneId, title) =>
+    controller?.onPaneRenamed(projectId, paneId, title) ?? Promise.resolve(false),
+  (projectId, paneId, target) =>
+    controller?.onPaneReordered(projectId, paneId, target),
+  (projectId, layoutKey, ratios) =>
+    controller?.onPaneRatiosChanged(projectId, layoutKey, ratios),
 );
 const browser = new BrowserController(workspace, browserSurface, browserButton);
-controller = new Phase3Controller(
-  workspace,
+controller = createPhase4WorkspaceController(workspace, {
   projectList,
   projectCount,
   tabList,
   currentProject,
-  addButton,
+  addTerminalButton: addButton,
   addTabButton,
   createProjectButton,
-  recoverProjectButton,
   projectDialog,
   projectForm,
   projectName,
   projectPath,
   projectFormError,
   cancelProjectButton,
-);
+  upgradeButton,
+  upgradeDialog,
+  upgradeProjectCount,
+  upgradeTerminalCount,
+  upgradeSourceSha,
+  commitUpgradeButton,
+  closeUpgradeButton,
+  upgradeError,
+});
+const migrationUi = createPhase3BMigrationUI({
+  beforeReplace: async () => {
+    if (!controller) throw new Error("Rust 작업 공간 제어기가 준비되지 않았습니다.");
+    await controller.prepareForExternalReplacement();
+  },
+  afterReplace: async (committed) => {
+    await controller?.finishExternalReplacement(committed);
+  },
+});
 
 const initializationPromise = controller.initialize();
-void initializationPromise;
-const migrationInitializationPromise = migrationUi.initialize();
+const migrationInitializationPromise = initializationPromise.then(() =>
+  migrationUi.initialize(),
+);
 void migrationInitializationPromise;
 
 const currentAppWindow = getCurrentWindow();
 let closeBarrierRunning = false;
-let forceCloseArmed = false;
 void currentAppWindow.onCloseRequested(async (event) => {
   event.preventDefault();
   if (closeBarrierRunning) {
-    if (forceCloseArmed) {
-      void browser.dispose();
-      await currentAppWindow.destroy();
-    } else {
-      workspace.setFooterStatus("저장과 종료 처리가 진행 중입니다. 잠시 기다려 주세요.");
-    }
+    // A backend replacement or startup IPC can be indefinitely delayed by an
+    // unhealthy child/process. A second explicit close request is therefore
+    // the guaranteed escape hatch; Job Object ownership cleans descendants as
+    // the application process exits.
+    migrationUi.dispose();
+    controller?.dispose();
+    void browser.dispose();
+    void workspace.dispose();
+    await currentAppWindow.destroy();
     return;
   }
 
@@ -2383,6 +2484,7 @@ void currentAppWindow.onCloseRequested(async (event) => {
     await Promise.all([initializationPromise, migrationInitializationPromise]);
     await controller?.flushSaves();
     migrationUi.dispose();
+    controller?.dispose();
     await browser.dispose();
     // Use one backend-owned barrier instead of twenty pane-local stop IPCs. It
     // rejects queued starts, waits until every spawned child belongs to a Job
@@ -2390,7 +2492,6 @@ void currentAppWindow.onCloseRequested(async (event) => {
     await invoke("shutdown_terminal_engine");
     await currentAppWindow.destroy();
   } catch (error) {
-    forceCloseArmed = true;
     workspace.setFooterStatus(
       `정상 종료를 완료하지 못했습니다. X를 다시 누르면 강제 종료합니다: ${errorMessage(error)}`,
       "error",
@@ -2401,6 +2502,7 @@ void currentAppWindow.onCloseRequested(async (event) => {
 window.addEventListener("beforeunload", () => {
   if (closeBarrierRunning) return;
   migrationUi.dispose();
+  controller?.dispose();
   void browser.dispose();
   void workspace.dispose();
 });

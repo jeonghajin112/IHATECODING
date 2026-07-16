@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <link rel="stylesheet" href="/assets/main.css" />
-    <title>IHATECODING Rust Preview</title>
+    <title>IHATECODING Rust Preview · Phase 4</title>
     <script type="module" src="/assets/main.js" defer></script>
   </head>
   <body>
@@ -14,7 +14,7 @@
           <span class="brand-mark" aria-hidden="true">I</span>
           <span>
             <strong>IHATECODING</strong>
-            <small>RUST PREVIEW</small>
+            <small>RUST PREVIEW · PHASE 4</small>
           </span>
         </div>
 
@@ -33,6 +33,22 @@
             <button id="open-legacy-import" class="open-legacy-import" type="button">
               복사본 가져오기
             </button>
+            <button
+              id="open-phase3-upgrade"
+              class="open-legacy-import"
+              type="button"
+              hidden
+            >
+              이전 Rust Preview 복사
+            </button>
+            <button
+              id="recover-project-catalog"
+              type="button"
+              disabled
+              hidden
+              aria-hidden="true"
+              tabindex="-1"
+            ></button>
           </section>
         </div>
       </aside>
@@ -59,19 +75,10 @@
           <span class="current-label">CURRENT</span>
           <strong id="current-project" class="current-project">프로젝트 없음</strong>
           <span class="toolbar-spacer"></span>
-          <button
-            id="recover-project-catalog"
-            class="toolbar-action"
-            type="button"
-            disabled
-            hidden
-          >
-            백업 복구
-          </button>
           <button id="close-active-terminal" class="toolbar-action" type="button" disabled>
             현재 창 닫기
           </button>
-          <button id="toggle-browser" class="toolbar-action" type="button">
+          <button id="toggle-browser" class="toolbar-action" type="button" hidden>
             브라우저 PoC
           </button>
         </header>
@@ -140,6 +147,39 @@
             <button class="dialog-submit" type="submit">프로젝트 만들기</button>
           </div>
         </form>
+      </dialog>
+
+      <dialog
+        id="phase3-upgrade-dialog"
+        class="project-dialog migration-dialog"
+        aria-labelledby="phase3-upgrade-title"
+      >
+        <section class="phase3-upgrade-content">
+          <div class="dialog-heading">
+            <strong id="phase3-upgrade-title">이전 Rust Preview 작업 복사</strong>
+            <span>
+              기존 Phase 3 Preview 파일은 그대로 두고, 정확한 복사본을 만든 뒤 새 canonical
+              저장소에 한 번만 반영합니다. Codex/Grok 대화는 자동으로 실행하거나 재개하지 않습니다.
+            </span>
+          </div>
+          <div class="legacy-inspection-counts">
+            <span><strong id="phase3-upgrade-project-count">0</strong> 프로젝트</span>
+            <span><strong id="phase3-upgrade-terminal-count">0</strong> PowerShell</span>
+          </div>
+          <dl class="legacy-inspection-meta">
+            <div>
+              <dt>SHA-256</dt>
+              <dd id="phase3-upgrade-source-sha">-</dd>
+            </div>
+          </dl>
+          <p id="phase3-upgrade-error" class="project-form-error" role="alert"></p>
+          <div class="dialog-actions migration-dialog-actions">
+            <button id="close-phase3-upgrade" type="button">나중에</button>
+            <button id="commit-phase3-upgrade" class="dialog-submit" type="button" disabled>
+              안전하게 복사
+            </button>
+          </div>
+        </section>
       </dialog>
 
       <dialog

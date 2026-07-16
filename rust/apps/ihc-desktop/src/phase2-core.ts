@@ -281,13 +281,22 @@ export class StartAbortedError extends Error {
   }
 }
 
+/**
+ * Returns the queued start's current priority. The scheduler evaluates this
+ * immediately before selecting each pending job; larger values run first.
+ */
+export type StartPriority = () => number;
+
 type PendingStart<T> = {
   operation: (signal?: AbortSignal) => Promise<T>;
   signal?: AbortSignal;
+  priority: StartPriority;
   resolve: (value: T | PromiseLike<T>) => void;
   reject: (reason?: unknown) => void;
   abortQueued: () => void;
 };
+
+const DEFAULT_START_PRIORITY: StartPriority = () => 0;
 
 export class StartScheduler {
   private active = 0;
@@ -304,6 +313,7 @@ export class StartScheduler {
   run<T>(
     operation: (signal?: AbortSignal) => Promise<T>,
     signal?: AbortSignal,
+    priority: StartPriority = DEFAULT_START_PRIORITY,
   ): Promise<T> {
     if (signal?.aborted) return Promise.reject(new StartAbortedError());
 
@@ -311,6 +321,7 @@ export class StartScheduler {
       const entry: PendingStart<T> = {
         operation,
         signal,
+        priority,
         resolve,
         reject,
         abortQueued: () => {
@@ -329,7 +340,7 @@ export class StartScheduler {
 
   private drain(): void {
     while (this.active < this.maxConcurrent) {
-      const entry = this.pending.shift();
+      const entry = this.takeHighestPriority();
       if (!entry) return;
       entry.signal?.removeEventListener("abort", entry.abortQueued);
       if (entry.signal?.aborted) {
@@ -346,6 +357,44 @@ export class StartScheduler {
           this.drain();
         });
     }
+  }
+
+  private takeHighestPriority(): PendingStart<unknown> | undefined {
+    while (this.pending.length > 0) {
+      let selected: PendingStart<unknown> | undefined;
+      let selectedPriority = Number.NEGATIVE_INFINITY;
+
+      // Snapshot iteration keeps equal-priority jobs FIFO while allowing an
+      // evaluator failure/abort to remove its own entry safely during the scan.
+      for (const entry of [...this.pending]) {
+        if (!this.pending.includes(entry)) continue;
+        let priority: number;
+        try {
+          priority = entry.priority();
+          if (!Number.isFinite(priority)) {
+            throw new RangeError("StartScheduler priority must be a finite number");
+          }
+        } catch (error) {
+          const invalidIndex = this.pending.indexOf(entry);
+          if (invalidIndex >= 0) this.pending.splice(invalidIndex, 1);
+          entry.signal?.removeEventListener("abort", entry.abortQueued);
+          entry.reject(error);
+          continue;
+        }
+
+        if (selected === undefined || priority > selectedPriority) {
+          selected = entry;
+          selectedPriority = priority;
+        }
+      }
+
+      if (selected === undefined) continue;
+      const selectedIndex = this.pending.indexOf(selected);
+      if (selectedIndex < 0) continue;
+      this.pending.splice(selectedIndex, 1);
+      return selected;
+    }
+    return undefined;
   }
 }
 

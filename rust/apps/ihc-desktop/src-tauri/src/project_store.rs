@@ -1,3 +1,7 @@
+use crate::legacy_import::{
+    LegacyImportError, LegacyImportResult, Phase3PreviewCatalogSource,
+    read_phase3_preview_catalog_source,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -101,6 +105,15 @@ pub(crate) struct LoadProjectCatalogResponse {
     pub(crate) recovery_required: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Phase3PreviewUpgradeInspection {
+    pub(crate) available: bool,
+    pub(crate) project_count: usize,
+    pub(crate) terminal_count: usize,
+    pub(crate) source_sha256: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct WorkspaceProjectV1 {
     #[serde(rename = "Id")]
@@ -168,6 +181,83 @@ pub(crate) struct ProjectStore {
     inner: Arc<ProjectStoreInner>,
 }
 
+pub(crate) struct Phase3PreviewUpgradeGuard<'a> {
+    store: &'a ProjectStore,
+    _operation: MutexGuard<'a, ()>,
+}
+
+impl Phase3PreviewUpgradeGuard<'_> {
+    pub(crate) fn read_expected_source(
+        &self,
+        expected_sha256: &str,
+    ) -> LegacyImportResult<Phase3PreviewCatalogSource> {
+        if !is_lower_hex_sha256(expected_sha256) {
+            return Err(LegacyImportError::invalid(
+                "The Phase 3 preview upgrade digest is invalid.",
+            ));
+        }
+        let source = self.read_source()?.ok_or_else(|| {
+            LegacyImportError::invalid("There is no isolated Phase 3 preview catalog to upgrade.")
+        })?;
+        if source.source_sha256() != expected_sha256 {
+            return Err(LegacyImportError::changed());
+        }
+        Ok(source)
+    }
+
+    pub(crate) fn verify_unchanged(
+        &self,
+        source: &Phase3PreviewCatalogSource,
+    ) -> LegacyImportResult<()> {
+        source.verify_unchanged(&self.store.catalog_path())
+    }
+
+    fn inspection(&self) -> LegacyImportResult<Phase3PreviewUpgradeInspection> {
+        let Some(source) = self.read_source()? else {
+            return Ok(Phase3PreviewUpgradeInspection {
+                available: false,
+                project_count: 0,
+                terminal_count: 0,
+                source_sha256: None,
+            });
+        };
+        Ok(Phase3PreviewUpgradeInspection {
+            available: true,
+            project_count: source.project_count,
+            terminal_count: source.terminal_count,
+            source_sha256: Some(source.source_sha256().to_owned()),
+        })
+    }
+
+    fn read_source(&self) -> LegacyImportResult<Option<Phase3PreviewCatalogSource>> {
+        let primary = self.store.catalog_path();
+        let primary_exists = self
+            .store
+            .path_exists(&primary, "the isolated Phase 3 preview catalog")
+            .map_err(|_| LegacyImportError::io())?;
+        if !primary_exists {
+            if self
+                .store
+                .has_backup_files()
+                .map_err(|_| LegacyImportError::io())?
+            {
+                return Err(LegacyImportError::phase3_preview_recovery_required());
+            }
+            return Ok(None);
+        }
+
+        let source = read_phase3_preview_catalog_source(&primary)?;
+        // The dedicated converter is lossless, while this typed parse ensures
+        // the exact bytes were valid state previously accepted by Phase 3A.
+        parse_catalog_bytes(source.bytes()).map_err(|_| {
+            LegacyImportError::invalid(
+                "The isolated Phase 3 preview catalog is invalid and cannot be upgraded.",
+            )
+        })?;
+        Ok(Some(source))
+    }
+}
+
 impl ProjectStore {
     pub(crate) fn preview_default() -> Result<Self, String> {
         let override_directory = env::var_os(PREVIEW_PROJECTS_DIR_ENV).map(PathBuf::from);
@@ -201,6 +291,31 @@ impl ProjectStore {
     #[cfg(test)]
     fn new(directory: PathBuf) -> Self {
         Self::new_with_blocked_paths(directory, Vec::new())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_phase3_upgrade_test(directory: PathBuf) -> Self {
+        Self::new(directory)
+    }
+
+    pub(crate) fn inspect_phase3_preview_upgrade(
+        &self,
+    ) -> LegacyImportResult<Phase3PreviewUpgradeInspection> {
+        self.begin_phase3_preview_upgrade()?.inspection()
+    }
+
+    pub(crate) fn begin_phase3_preview_upgrade(
+        &self,
+    ) -> LegacyImportResult<Phase3PreviewUpgradeGuard<'_>> {
+        let operation = self
+            .inner
+            .operation_lock
+            .lock()
+            .map_err(|_| LegacyImportError::io())?;
+        Ok(Phase3PreviewUpgradeGuard {
+            store: self,
+            _operation: operation,
+        })
     }
 
     fn new_with_blocked_paths(directory: PathBuf, blocked_import_paths: Vec<PathBuf>) -> Self {
@@ -734,6 +849,13 @@ fn parse_catalog_bytes(bytes: &[u8]) -> Result<ProjectCatalogV1, String> {
         .map_err(|error| format!("The v1 project catalog is not valid JSON: {error}"))?;
     validate_catalog(&catalog)?;
     Ok(catalog)
+}
+
+fn is_lower_hex_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn read_and_parse_catalog(path: &Path, context: &str) -> Result<ProjectCatalogV1, String> {

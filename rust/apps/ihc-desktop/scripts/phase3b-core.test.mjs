@@ -183,6 +183,21 @@ test("canonical v1 load preserves unknown fields, order, layout, and clone isola
   assert.deepEqual(core.normalizeWorkspaceState(state), state);
 });
 
+test("Phase 3 preview upgrade provenance remains a supported canonical source", () => {
+  const source = workspace({
+    importProvenance: {
+      ...workspace().importProvenance,
+      sourceFormat: "ihatecoding.phase3-preview/1",
+    },
+  });
+  const loaded = core.normalizeWorkspaceLoadResponse(loadEnvelope(source));
+  assert.equal(loaded.kind, "ready");
+  assert.equal(
+    loaded.snapshot.state.importProvenance.sourceFormat,
+    "ihatecoding.phase3-preview/1",
+  );
+});
+
 test("future schemas remain lossless and read-only instead of becoming empty", () => {
   const future = workspace({
     schemaVersion: 2,

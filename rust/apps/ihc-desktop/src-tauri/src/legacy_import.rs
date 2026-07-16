@@ -10,13 +10,14 @@ use serde_json::{Map, Number, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 use std::time::SystemTime;
 use uuid::Uuid;
 
 pub(crate) const LEGACY_SOURCE_FORMAT: &str = "powerWorkspace.projects/1";
+pub(crate) const PHASE3_PREVIEW_SOURCE_FORMAT: &str = "ihatecoding.phase3-preview/1";
 pub(crate) const MAX_LEGACY_SOURCE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_STABLE_READ_ATTEMPTS: usize = 3;
 const MAX_JSON_DEPTH: usize = 64;
@@ -36,6 +37,7 @@ pub(crate) enum LegacyImportErrorCode {
     SourceChanged,
     TooLarge,
     PathDenied,
+    RecoveryRequired,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -57,7 +59,7 @@ impl LegacyImportError {
         }
     }
 
-    fn io() -> Self {
+    pub(crate) fn io() -> Self {
         Self::new(
             LegacyImportErrorCode::Io,
             "The detached catalog copy could not be read safely.",
@@ -65,11 +67,11 @@ impl LegacyImportError {
         )
     }
 
-    fn invalid(message: &'static str) -> Self {
+    pub(crate) fn invalid(message: &'static str) -> Self {
         Self::new(LegacyImportErrorCode::InvalidSource, message, false)
     }
 
-    fn changed() -> Self {
+    pub(crate) fn changed() -> Self {
         Self::new(
             LegacyImportErrorCode::SourceChanged,
             "The detached catalog copy changed during import.",
@@ -81,6 +83,14 @@ impl LegacyImportError {
         Self::new(
             LegacyImportErrorCode::PathDenied,
             "The selected file is not an allowed detached catalog copy.",
+            false,
+        )
+    }
+
+    pub(crate) fn phase3_preview_recovery_required() -> Self {
+        Self::new(
+            LegacyImportErrorCode::RecoveryRequired,
+            "The isolated Phase 3 preview catalog requires explicit recovery before upgrade.",
             false,
         )
     }
@@ -208,6 +218,98 @@ pub(crate) struct PreparedLegacyImport {
     pub(crate) snapshot_already_present: bool,
     pub(crate) draft: LegacyWorkspaceDraft,
     pub(crate) recoverable_warnings: Vec<ImportDiagnostic>,
+}
+
+/// A validated, exact-byte snapshot of the application-owned Phase 3 preview
+/// catalog. The retained read handle denies write/delete sharing on Windows so
+/// the source cannot be replaced while the canonical commit is in flight.
+pub(crate) struct Phase3PreviewCatalogSource {
+    snapshot: SourceSnapshot,
+    read_guard: File,
+    pub(crate) project_count: usize,
+    pub(crate) terminal_count: usize,
+    pub(crate) draft: LegacyWorkspaceDraft,
+}
+
+impl Phase3PreviewCatalogSource {
+    pub(crate) fn source_sha256(&self) -> &str {
+        &self.snapshot.sha256
+    }
+
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.snapshot.bytes
+    }
+
+    pub(crate) fn verify_unchanged(&self, path: &Path) -> LegacyImportResult<()> {
+        let after = source_stamp(&self.read_guard)?;
+        let canonical_after = fs::canonicalize(path).map_err(|_| LegacyImportError::changed())?;
+        let path_file = open_read_only(path).map_err(|_| LegacyImportError::changed())?;
+        let path_identity = file_identity(&path_file).map_err(|_| LegacyImportError::changed())?;
+        let mut reader = self
+            .read_guard
+            .try_clone()
+            .map_err(|_| LegacyImportError::io())?;
+        reader
+            .seek(SeekFrom::Start(0))
+            .map_err(|_| LegacyImportError::io())?;
+        let mut bytes = Vec::with_capacity(self.snapshot.bytes.len());
+        reader
+            .take(MAX_LEGACY_SOURCE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| LegacyImportError::io())?;
+        if after != self.snapshot.stamp
+            || canonical_after != self.snapshot.canonical_path
+            || path_identity != self.snapshot.stamp.identity
+            || bytes != self.snapshot.bytes
+            || sha256_hex(&bytes) != self.snapshot.sha256
+        {
+            return Err(LegacyImportError::changed());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct Phase3PreviewSourceFingerprint(SourceStamp);
+
+#[cfg(test)]
+pub(crate) fn phase3_preview_source_fingerprint(
+    path: &Path,
+) -> LegacyImportResult<Phase3PreviewSourceFingerprint> {
+    let file = open_read_only(path).map_err(|_| LegacyImportError::io())?;
+    source_stamp(&file).map(Phase3PreviewSourceFingerprint)
+}
+
+pub(crate) fn read_phase3_preview_catalog_source(
+    path: &Path,
+) -> LegacyImportResult<Phase3PreviewCatalogSource> {
+    require_absolute(path)?;
+    let snapshot = read_stable_source(path)?;
+    let read_guard = open_phase3_preview_read_guard(path).map_err(|_| LegacyImportError::io())?;
+    if source_stamp(&read_guard)? != snapshot.stamp
+        || fs::canonicalize(path).map_err(|_| LegacyImportError::changed())?
+            != snapshot.canonical_path
+    {
+        return Err(LegacyImportError::changed());
+    }
+
+    let analysis = analyze_phase3_preview_catalog(&snapshot.bytes, &snapshot.sha256)?;
+    if !analysis.blocking_errors.is_empty() {
+        return Err(LegacyImportError::invalid(
+            "The isolated Phase 3 preview catalog is invalid and cannot be upgraded.",
+        ));
+    }
+    let draft = analysis.draft.ok_or_else(|| {
+        LegacyImportError::invalid("The isolated Phase 3 preview catalog could not be converted.")
+    })?;
+    Ok(Phase3PreviewCatalogSource {
+        snapshot,
+        read_guard,
+        project_count: analysis.project_count,
+        terminal_count: analysis.terminal_count,
+        draft,
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -593,6 +695,22 @@ fn protected_file_paths(policy: &LegacyImportPolicy) -> Vec<PathBuf> {
 
 fn open_read_only(path: &Path) -> std::io::Result<File> {
     OpenOptions::new().read(true).open(path)
+}
+
+#[cfg(windows)]
+fn open_phase3_preview_read_guard(path: &Path) -> std::io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+
+    OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(path)
+}
+
+#[cfg(not(windows))]
+fn open_phase3_preview_read_guard(path: &Path) -> std::io::Result<File> {
+    open_read_only(path)
 }
 
 fn read_stable_source(path: &Path) -> LegacyImportResult<SourceSnapshot> {
@@ -1204,6 +1322,21 @@ type ResumeOwner = (usize, usize, String);
 type ResumeOwners = HashMap<(u8, Uuid), Vec<ResumeOwner>>;
 
 fn analyze_legacy_catalog(bytes: &[u8], source_sha256: &str) -> LegacyImportResult<LegacyAnalysis> {
+    analyze_catalog(bytes, source_sha256, false)
+}
+
+fn analyze_phase3_preview_catalog(
+    bytes: &[u8],
+    source_sha256: &str,
+) -> LegacyImportResult<LegacyAnalysis> {
+    analyze_catalog(bytes, source_sha256, true)
+}
+
+fn analyze_catalog(
+    bytes: &[u8],
+    source_sha256: &str,
+    allow_phase3_preview_schema: bool,
+) -> LegacyImportResult<LegacyAnalysis> {
     let value = parse_unique_bounded_json(bytes)?;
     let Some(root) = value.as_object() else {
         return Ok(blocked_analysis("invalidLegacyShape", ""));
@@ -1211,7 +1344,11 @@ fn analyze_legacy_catalog(bytes: &[u8], source_sha256: &str) -> LegacyImportResu
 
     let mut warnings = Vec::new();
     let mut blocking = Vec::new();
-    if root.contains_key("schemaVersion") || root.contains_key("SchemaVersion") {
+    let phase3_schema_is_supported = match root.get("SchemaVersion") {
+        None => true,
+        Some(value) => allow_phase3_preview_schema && value.as_u64() == Some(1),
+    };
+    if root.contains_key("schemaVersion") || !phase3_schema_is_supported {
         blocking.push(ImportDiagnostic::new(
             "unsupportedVersion",
             "/schemaVersion",

@@ -34,6 +34,11 @@ type StorageDisplayMode = "loading" | "ready" | "read-only" | "recovery" | "erro
 
 const SHA256_PATTERN = /^[0-9a-f]{64}$/i;
 
+export interface WorkspaceReplacementHooks {
+  beforeReplace(): Promise<void>;
+  afterReplace(committed: boolean): Promise<void>;
+}
+
 export class Phase3BMigrationUI {
   private readonly listeners = new AbortController();
   private inspection: LegacyInspection | null = null;
@@ -66,14 +71,20 @@ export class Phase3BMigrationUI {
   private readonly recoverySection = requireElement("storage-recovery");
   private readonly recoveryList = requireElement("recovery-candidate-list");
 
-  constructor() {
+  constructor(private readonly replacementHooks?: WorkspaceReplacementHooks) {
     if (!(this.panel instanceof HTMLElement)) {
       throw new Error("Missing storage panel");
     }
 
     const signal = this.listeners.signal;
     this.openButton.addEventListener("click", () => this.open(), { signal });
-    this.closeButton.addEventListener("click", () => this.dialog.close(), { signal });
+    this.closeButton.addEventListener(
+      "click",
+      () => {
+        if (!this.busy) this.dialog.close();
+      },
+      { signal },
+    );
     this.form.addEventListener(
       "submit",
       (event) => {
@@ -84,6 +95,13 @@ export class Phase3BMigrationUI {
     );
     this.commitButton.addEventListener("click", () => void this.commitImport(), { signal });
     this.sourcePath.addEventListener("input", () => this.invalidateInspection(), { signal });
+    this.dialog.addEventListener(
+      "cancel",
+      (event) => {
+        if (this.busy) event.preventDefault();
+      },
+      { signal },
+    );
     this.dialog.addEventListener(
       "close",
       () => {
@@ -106,7 +124,7 @@ export class Phase3BMigrationUI {
   }
 
   private open(): void {
-    if (this.disposed || this.dialog.open) return;
+    if (this.disposed || this.busy || this.dialog.open) return;
     this.error.textContent = "";
     this.result.textContent = "";
     this.dialog.showModal();
@@ -242,19 +260,21 @@ export class Phase3BMigrationUI {
     this.result.textContent = "검사한 복사본을 Rust Preview 저장소에 반영하고 있습니다…";
 
     try {
-      const value = await invoke<unknown>("import_legacy_catalog", {
-        inspectToken: inspection.inspectToken,
-        sourcePath,
-        sourceSha256: inspection.sourceSha256,
-        mode: "replacePreview",
-      });
+      const value = await this.performReplacement(generation, () =>
+        invoke<unknown>("import_legacy_catalog", {
+          inspectToken: inspection.inspectToken,
+          sourcePath,
+          sourceSha256: inspection.sourceSha256,
+          mode: "replacePreview",
+        }),
+      );
       if (!this.isCurrent(generation)) return;
       const preview = normalizeImportPreview(value);
       const projects = preview.draft?.projects ?? [];
       const terminals = projects.reduce((sum, project) => sum + project.terminals.length, 0);
       this.result.textContent =
         `Rust Preview 교체 완료 · 프로젝트 ${projects.length}개 · PowerShell ${terminals}개 ` +
-        "(읽기 전용 미리보기이며 실행하거나 재개하지 않았습니다.)";
+        "(canonical 상태로 반영했으며 Codex/Grok 세션은 자동 재개하지 않았습니다.)";
       this.inspection = null;
       this.inspectedPath = "";
       this.setBusy(false);
@@ -327,7 +347,9 @@ export class Phase3BMigrationUI {
     this.error.textContent = "";
     this.result.textContent = `${candidateId} 복구를 적용하고 있습니다…`;
     try {
-      await invoke<unknown>("recover_workspace_state", { candidateId });
+      await this.performReplacement(generation, () =>
+        invoke<unknown>("recover_workspace_state", { candidateId }),
+      );
       if (!this.isCurrent(generation)) return;
       this.result.textContent = "검증된 백업으로 복구했습니다.";
       this.setBusy(false);
@@ -366,6 +388,7 @@ export class Phase3BMigrationUI {
 
   private setBusy(busy: boolean): void {
     this.busy = busy;
+    this.closeButton.disabled = busy;
     this.sourcePath.disabled = busy;
     this.inspectButton.disabled = busy;
     this.updateActions();
@@ -407,10 +430,54 @@ export class Phase3BMigrationUI {
   private isCurrent(generation: number): boolean {
     return !this.disposed && generation === this.operationGeneration;
   }
+
+  private async performReplacement<T>(
+    generation: number,
+    replace: () => Promise<T>,
+  ): Promise<T> {
+    const hooks = this.replacementHooks;
+    if (hooks === undefined) return replace();
+
+    let prepared = false;
+    let committed = false;
+    let finalized = false;
+    const finalize = async (didCommit: boolean): Promise<void> => {
+      if (!prepared || finalized) return;
+      finalized = true;
+      await hooks.afterReplace(didCommit);
+    };
+
+    try {
+      await hooks.beforeReplace();
+      prepared = true;
+      if (!this.isCurrent(generation)) {
+        await finalize(false);
+        throw new Error("Workspace replacement was superseded before commit.");
+      }
+
+      const value = await replace();
+      committed = true;
+      await finalize(true);
+      return value;
+    } catch (error) {
+      if (prepared && !committed && !finalized) {
+        try {
+          await finalize(false);
+        } catch (hookError) {
+          throw new Error(
+            `Workspace replacement failed and restoration also failed: ${errorMessage(error)} · ${errorMessage(hookError)}`,
+          );
+        }
+      }
+      throw error;
+    }
+  }
 }
 
-export function createPhase3BMigrationUI(): Phase3BMigrationUI {
-  return new Phase3BMigrationUI();
+export function createPhase3BMigrationUI(
+  replacementHooks?: WorkspaceReplacementHooks,
+): Phase3BMigrationUI {
+  return new Phase3BMigrationUI(replacementHooks);
 }
 
 function normalizeStatus(

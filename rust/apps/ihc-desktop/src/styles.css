@@ -479,14 +479,7 @@ button:disabled {
 }
 
 .terminal-grid {
-  --grid-columns: 1;
-  --grid-rows: 1;
   position: relative;
-  display: grid;
-  grid-template-columns: repeat(var(--grid-columns), minmax(0, 1fr));
-  grid-template-rows: repeat(var(--grid-rows), minmax(0, 1fr));
-  gap: 6px;
-  padding: 6px;
   overflow: hidden;
   visibility: hidden;
   pointer-events: none;
@@ -501,10 +494,58 @@ button:disabled {
 .empty-workspace {
   position: absolute;
   inset: 0;
+  z-index: 0;
 }
 
 .terminal-grid[data-empty="false"] .empty-workspace {
   display: none;
+}
+
+.terminal-rows {
+  --terminal-row-count: 1;
+  position: absolute;
+  inset: 6px;
+  z-index: 1;
+  display: grid;
+  grid-template-rows: repeat(var(--terminal-row-count), minmax(0, 1fr));
+  gap: 6px;
+  min-width: 0;
+  min-height: 0;
+}
+
+.terminal-row {
+  display: flex;
+  gap: 6px;
+  min-width: 0;
+  min-height: 0;
+  overflow: visible;
+}
+
+.terminal-row-spacer {
+  min-width: 0;
+  min-height: 0;
+  pointer-events: none;
+}
+
+.inactive-pane-bin {
+  display: none;
+}
+
+.pane-interaction-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 30;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.pane-insertion-line,
+.pane-snap-guide {
+  position: absolute;
+  width: 1px;
+  min-height: 1px;
+  background: #4a4a4f;
+  box-shadow: none;
 }
 
 .terminal-pane {
@@ -513,11 +554,12 @@ button:disabled {
   grid-template-rows: 34px minmax(0, 1fr);
   min-width: 0;
   min-height: 0;
-  overflow: hidden;
+  overflow: visible;
   border: 1px solid #29292c;
   border-radius: 4px;
   background: #050505;
-  contain: layout paint;
+  contain: layout;
+  transition: border-color 120ms ease;
 }
 
 .terminal-pane[hidden] {
@@ -532,6 +574,13 @@ button:disabled {
   border-color: #b85c5c;
 }
 
+.terminal-pane[data-dragging="true"] {
+  z-index: 20;
+  pointer-events: none;
+  opacity: 0.92;
+  will-change: transform;
+}
+
 .terminal-header {
   display: grid;
   grid-template-columns: 12px minmax(0, 1fr) auto;
@@ -541,6 +590,12 @@ button:disabled {
   padding: 0 5px 0 10px;
   border-bottom: 1px solid #29292c;
   background: #111112;
+  cursor: grab;
+  user-select: none;
+}
+
+body[data-pane-dragging="true"] .terminal-header {
+  cursor: grabbing;
 }
 
 .terminal-state-dot {
@@ -635,6 +690,41 @@ button:disabled {
   overflow: hidden;
   user-select: text;
   background: #050505;
+}
+
+.terminal-resize-handle {
+  position: absolute;
+  top: 0;
+  right: -6px;
+  bottom: 0;
+  z-index: 25;
+  width: 7px;
+  cursor: col-resize;
+  touch-action: none;
+}
+
+.terminal-resize-handle[hidden] {
+  display: none;
+}
+
+.terminal-resize-handle::after {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  color: #71717a;
+  content: "↔";
+  font-family: "Segoe UI Symbol", sans-serif;
+  font-size: 10px;
+  line-height: 1;
+  opacity: 0;
+  transform: translate(-50%, -50%);
+  transition: opacity 90ms ease;
+}
+
+.terminal-resize-handle:hover::after,
+.terminal-resize-handle:focus-visible::after,
+body[data-pane-resizing="true"] .terminal-resize-handle::after {
+  opacity: 1;
 }
 
 .terminal-viewport > .xterm {
@@ -790,9 +880,16 @@ button:disabled {
   width: min(610px, calc(100vw - 36px));
 }
 
-.migration-dialog form {
+.migration-dialog form,
+.phase3-upgrade-content {
   max-height: min(760px, calc(100vh - 44px));
   overflow: auto;
+}
+
+.phase3-upgrade-content {
+  display: grid;
+  gap: 15px;
+  padding: 20px;
 }
 
 #legacy-source-path {

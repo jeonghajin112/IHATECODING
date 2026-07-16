@@ -6,11 +6,11 @@ mod workspace_store;
 use legacy_import::{
     CommitLegacyCatalogRequest, InspectLegacyCatalogRequest, LegacyImportError,
     LegacyImportErrorCode, LegacyImportMode, LegacyImportPolicy, LegacyImportService,
-    LegacyInspection, LegacyTabKind, LegacyWorkspaceDraft,
+    LegacyInspection, LegacyTabKind, LegacyWorkspaceDraft, PHASE3_PREVIEW_SOURCE_FORMAT,
 };
 use project_store::{
     InspectProjectCatalogCopyRequest, LoadProjectCatalogResponse, PROJECT_CATALOG_SCHEMA_VERSION,
-    ProjectCatalogV1, ProjectStore,
+    Phase3PreviewUpgradeInspection, ProjectCatalogV1, ProjectStore,
 };
 use pty::{StartTerminalResponse, TerminalEngineStatus, TerminalEvent, TerminalManager};
 use serde::Serialize;
@@ -49,6 +49,7 @@ impl From<LegacyImportError> for Phase3bCommandError {
             LegacyImportErrorCode::SourceChanged => StorageErrorCode::SourceChanged,
             LegacyImportErrorCode::TooLarge => StorageErrorCode::TooLarge,
             LegacyImportErrorCode::PathDenied => StorageErrorCode::PathDenied,
+            LegacyImportErrorCode::RecoveryRequired => StorageErrorCode::RecoveryRequired,
         };
         Self::Storage(StorageError {
             code,
@@ -404,6 +405,64 @@ async fn import_legacy_catalog(
     .await
 }
 
+#[tauri::command]
+async fn inspect_phase3_preview_upgrade(
+    webview: Webview,
+    project_store: State<'_, ProjectStore>,
+) -> Result<Phase3PreviewUpgradeInspection, Phase3bCommandError> {
+    ensure_main_webview(&webview)?;
+    drop(webview);
+    let project_store = project_store.inner().clone();
+    phase3b_blocking(move || inspect_phase3_preview_upgrade_blocking(&project_store)).await
+}
+
+#[tauri::command]
+async fn commit_phase3_preview_upgrade(
+    webview: Webview,
+    project_store: State<'_, ProjectStore>,
+    store: State<'_, WorkspaceStore>,
+    source_sha256: String,
+) -> Result<CanonicalWorkspaceSnapshot, Phase3bCommandError> {
+    ensure_main_webview(&webview)?;
+    drop(webview);
+    let project_store = project_store.inner().clone();
+    let store = store.inner().clone();
+    phase3b_blocking(move || {
+        commit_phase3_preview_upgrade_blocking(&project_store, &store, &source_sha256)
+    })
+    .await
+}
+
+fn inspect_phase3_preview_upgrade_blocking(
+    project_store: &ProjectStore,
+) -> Result<Phase3PreviewUpgradeInspection, Phase3bCommandError> {
+    project_store
+        .inspect_phase3_preview_upgrade()
+        .map_err(Into::into)
+}
+
+fn commit_phase3_preview_upgrade_blocking(
+    project_store: &ProjectStore,
+    store: &WorkspaceStore,
+    source_sha256: &str,
+) -> Result<CanonicalWorkspaceSnapshot, Phase3bCommandError> {
+    let guard = project_store.begin_phase3_preview_upgrade()?;
+    let source = guard.read_expected_source(source_sha256)?;
+    guard.verify_unchanged(&source)?;
+    let provenance = ImportProvenanceV1::from_import(
+        PHASE3_PREVIEW_SOURCE_FORMAT.to_owned(),
+        source.source_sha256().to_owned(),
+        format!("{}.projects.json", source.source_sha256()),
+    )?;
+    let state = workspace_state_from_legacy(source.draft.clone());
+    let snapshot = store.initialize_from_phase3_preview(state, provenance, source.bytes())?;
+    // The ProjectStore operation lock and retained Windows read handle prevent
+    // in-process writes and write/delete sharing for the whole commit. This
+    // final exact-byte/metadata/ACL check also fails closed on other platforms.
+    guard.verify_unchanged(&source)?;
+    flatten_snapshot(snapshot)
+}
+
 fn ensure_main_webview(webview: &Webview) -> Result<(), Phase3bCommandError> {
     if webview.label() == MAIN_WEBVIEW_LABEL {
         return Ok(());
@@ -649,7 +708,9 @@ pub fn run() {
             list_recovery_candidates,
             recover_workspace_state,
             inspect_legacy_catalog,
-            import_legacy_catalog
+            import_legacy_catalog,
+            inspect_phase3_preview_upgrade,
+            commit_phase3_preview_upgrade
         ])
         .build(tauri::generate_context!())
         .expect("error while building IHATECODING Rust Preview")
@@ -663,6 +724,7 @@ pub fn run() {
 #[cfg(test)]
 mod phase3b_bridge_tests {
     use super::*;
+    use sha2::{Digest, Sha256};
     use std::{fs, path::Path};
     use uuid::Uuid;
 
@@ -687,6 +749,78 @@ mod phase3b_bridge_tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    fn phase3_preview_fixture() -> Vec<u8> {
+        let mut root: Value =
+            serde_json::from_slice(include_bytes!("../../../../fixtures/projects-v1.json"))
+                .unwrap();
+        root["SchemaVersion"] = Value::from(1);
+        root["UnknownTopLevel"] = serde_json::json!({ "keep": [1, 2, 3] });
+        root["Projects"][0]["UnknownProject"] = Value::String("preserved".to_owned());
+        root["Projects"][0]["Terminals"][0]["UnknownTerminal"] = Value::Bool(true);
+
+        let mut second = root["Projects"][0].clone();
+        second["Id"] = Value::String("44444444444444444444444444444444".to_owned());
+        second["Name"] = Value::String("Second Project".to_owned());
+        second["FolderPath"] = Value::String(r"C:\Example\Beta".to_owned());
+        second["Terminals"][0]["Id"] = Value::String("55555555555555555555555555555555".to_owned());
+        second["Terminals"][0]["Name"] = Value::String("SECOND".to_owned());
+        second["Terminals"][0]["StartDirectory"] = Value::String(r"C:\Example\Beta".to_owned());
+        second["Terminals"][0]["CodexThreadId"] = Value::Null;
+        second["Terminals"][0]["GrokSessionId"] =
+            Value::String("66666666-6666-6666-6666-666666666666".to_owned());
+        second["Terminals"][0]["CompletionPending"] = Value::Bool(false);
+        root["Projects"].as_array_mut().unwrap().push(second);
+        root["SelectedProjectId"] = Value::String("44444444444444444444444444444444".to_owned());
+        serde_json::to_vec_pretty(&root).unwrap()
+    }
+
+    struct Phase3UpgradeLayout {
+        _directory: TestDirectory,
+        source: PathBuf,
+        project_store: ProjectStore,
+        workspace_store: WorkspaceStore,
+    }
+
+    impl Phase3UpgradeLayout {
+        fn new(with_source: bool) -> Self {
+            let directory = TestDirectory::new();
+            let phase3_root = directory.path("phase3-preview");
+            fs::create_dir_all(&phase3_root).unwrap();
+            let source = phase3_root.join("projects-v1.json");
+            if with_source {
+                fs::write(&source, phase3_preview_fixture()).unwrap();
+            }
+            let project_store = ProjectStore::new_for_phase3_upgrade_test(phase3_root);
+            let workspace_store = WorkspaceStore::open(&directory.path("app-local")).unwrap();
+            Self {
+                _directory: directory,
+                source,
+                project_store,
+                workspace_store,
+            }
+        }
+
+        fn inspect(&self) -> Phase3PreviewUpgradeInspection {
+            inspect_phase3_preview_upgrade_blocking(&self.project_store).unwrap()
+        }
+
+        fn commit(&self, source_sha256: &str) -> CanonicalWorkspaceSnapshot {
+            commit_phase3_preview_upgrade_blocking(
+                &self.project_store,
+                &self.workspace_store,
+                source_sha256,
+            )
+            .unwrap()
+        }
+    }
+
+    fn command_error_code(error: Phase3bCommandError) -> String {
+        serde_json::to_value(error).unwrap()["code"]
+            .as_str()
+            .unwrap()
+            .to_owned()
     }
 
     #[test]
@@ -744,5 +878,192 @@ mod phase3b_bridge_tests {
         assert_eq!(snapshot.state.projects[0].terminals.len(), 1);
         assert_eq!(fs::read(&source).unwrap(), FIXTURE);
         assert!(Path::new(&snapshot.import_provenance.unwrap().snapshot_file).is_relative());
+    }
+
+    #[test]
+    fn phase4a_upgrade_inspect_reports_absent_without_reading_a_backup() {
+        let layout = Phase3UpgradeLayout::new(false);
+        let inspection = layout.inspect();
+        assert!(!inspection.available);
+        assert_eq!(inspection.project_count, 0);
+        assert_eq!(inspection.terminal_count, 0);
+        assert_eq!(inspection.source_sha256, None);
+
+        let error = commit_phase3_preview_upgrade_blocking(
+            &layout.project_store,
+            &layout.workspace_store,
+            &"0".repeat(64),
+        )
+        .unwrap_err();
+        assert_eq!(command_error_code(error), "invalidSource");
+        assert_eq!(
+            layout.workspace_store.load().unwrap().mode,
+            StorageMode::Absent
+        );
+    }
+
+    #[test]
+    fn phase4a_upgrade_commits_exact_snapshot_and_preserves_source_and_semantics() {
+        let layout = Phase3UpgradeLayout::new(true);
+        let source_bytes = fs::read(&layout.source).unwrap();
+        let source_fingerprint =
+            legacy_import::phase3_preview_source_fingerprint(&layout.source).unwrap();
+        let source_modified = fs::metadata(&layout.source).unwrap().modified().ok();
+        let inspection = layout.inspect();
+        assert!(inspection.available);
+        assert_eq!(inspection.project_count, 2);
+        assert_eq!(inspection.terminal_count, 2);
+        let digest = inspection.source_sha256.unwrap();
+        assert_eq!(digest, format!("{:x}", Sha256::digest(&source_bytes)));
+
+        let snapshot = layout.commit(&digest);
+        assert_eq!(snapshot.revision, 1);
+        let state = &snapshot.state.state;
+        assert_eq!(state.projects.len(), 2);
+        assert_eq!(state.projects[0].name, "Example Project");
+        assert_eq!(state.projects[1].name, "Second Project");
+        assert_eq!(state.projects[0].terminals[0].name, "MAIN");
+        assert!(state.projects[0].terminals[0].completion_pending);
+        assert_eq!(
+            state.projects[0].terminals[0].codex_thread_id.as_deref(),
+            Some("33333333-3333-3333-3333-333333333333")
+        );
+        assert_eq!(
+            state.projects[1].terminals[0].grok_session_id.as_deref(),
+            Some("66666666-6666-6666-6666-666666666666")
+        );
+        assert_eq!(
+            state.selected_project_id.as_deref(),
+            Some("44444444444444444444444444444444")
+        );
+        assert_eq!(state.tabs.len(), 1);
+        assert_eq!(state.tabs[0].project_id, state.selected_project_id);
+        assert_eq!(state.active_tab_id, Some(state.tabs[0].id.clone()));
+        assert_eq!(state.legacy_extensions["UnknownTopLevel"]["keep"][2], 3);
+        assert_eq!(
+            state.projects[0].legacy_extensions["UnknownProject"],
+            "preserved"
+        );
+        assert_eq!(
+            state.projects[0].terminals[0].legacy_extensions["UnknownTerminal"],
+            true
+        );
+        let provenance = snapshot.state.import_provenance.as_ref().unwrap();
+        assert_eq!(provenance.source_format, PHASE3_PREVIEW_SOURCE_FORMAT);
+        assert_eq!(provenance.source_sha256, digest);
+        assert_eq!(
+            fs::read(
+                layout
+                    .workspace_store
+                    .state_root()
+                    .join("imports")
+                    .join(&provenance.snapshot_file)
+            )
+            .unwrap(),
+            source_bytes
+        );
+        assert_eq!(fs::read(&layout.source).unwrap(), source_bytes);
+        assert_eq!(
+            fs::metadata(&layout.source).unwrap().modified().ok(),
+            source_modified
+        );
+        assert_eq!(
+            legacy_import::phase3_preview_source_fingerprint(&layout.source).unwrap(),
+            source_fingerprint
+        );
+    }
+
+    #[test]
+    fn phase4a_upgrade_detects_sha_mismatch_and_source_change_before_commit() {
+        let layout = Phase3UpgradeLayout::new(true);
+        let inspected = layout.inspect().source_sha256.unwrap();
+        let mismatch = commit_phase3_preview_upgrade_blocking(
+            &layout.project_store,
+            &layout.workspace_store,
+            &"0".repeat(64),
+        )
+        .unwrap_err();
+        assert_eq!(command_error_code(mismatch), "sourceChanged");
+
+        let mut changed: Value = serde_json::from_slice(&phase3_preview_fixture()).unwrap();
+        changed["Projects"][0]["Name"] = Value::String("Changed".to_owned());
+        fs::write(&layout.source, serde_json::to_vec_pretty(&changed).unwrap()).unwrap();
+        let changed_error = commit_phase3_preview_upgrade_blocking(
+            &layout.project_store,
+            &layout.workspace_store,
+            &inspected,
+        )
+        .unwrap_err();
+        assert_eq!(command_error_code(changed_error), "sourceChanged");
+        assert_eq!(
+            layout.workspace_store.load().unwrap().mode,
+            StorageMode::Absent
+        );
+        assert!(!layout.workspace_store.state_root().join("imports").exists());
+    }
+
+    #[test]
+    fn phase4a_upgrade_refuses_an_existing_canonical_workspace_without_writing() {
+        let layout = Phase3UpgradeLayout::new(true);
+        layout
+            .workspace_store
+            .save(SaveWorkspaceRequest {
+                expected_revision: 0,
+                state: WorkspaceStateV1::empty(),
+            })
+            .unwrap();
+        let primary = layout
+            .workspace_store
+            .state_root()
+            .join("workspace-v1.json");
+        let before = fs::read(&primary).unwrap();
+        let digest = layout.inspect().source_sha256.unwrap();
+        let error = commit_phase3_preview_upgrade_blocking(
+            &layout.project_store,
+            &layout.workspace_store,
+            &digest,
+        )
+        .unwrap_err();
+        assert_eq!(command_error_code(error), "revisionConflict");
+        assert_eq!(fs::read(primary).unwrap(), before);
+        assert!(!layout.workspace_store.state_root().join("imports").exists());
+    }
+
+    #[test]
+    fn phase4a_upgrade_fails_closed_for_backup_only_and_invalid_primary_state() {
+        let layout = Phase3UpgradeLayout::new(false);
+        fs::write(
+            layout.source.with_file_name("projects-v1.json.bak1"),
+            phase3_preview_fixture(),
+        )
+        .unwrap();
+        let backup_only =
+            inspect_phase3_preview_upgrade_blocking(&layout.project_store).unwrap_err();
+        assert_eq!(command_error_code(backup_only), "recoveryRequired");
+
+        fs::write(&layout.source, b"invalid-primary").unwrap();
+        let invalid = inspect_phase3_preview_upgrade_blocking(&layout.project_store).unwrap_err();
+        assert_eq!(command_error_code(invalid), "invalidSource");
+        assert_eq!(
+            layout.workspace_store.load().unwrap().mode,
+            StorageMode::Absent
+        );
+    }
+
+    #[test]
+    fn phase4a_upgrade_retry_of_the_same_digest_is_idempotent() {
+        let layout = Phase3UpgradeLayout::new(true);
+        let digest = layout.inspect().source_sha256.unwrap();
+        let first = layout.commit(&digest);
+        let primary = layout
+            .workspace_store
+            .state_root()
+            .join("workspace-v1.json");
+        let before = fs::read(&primary).unwrap();
+        let second = layout.commit(&digest);
+        assert_eq!(first.revision, 1);
+        assert_eq!(second.revision, 1);
+        assert_eq!(fs::read(primary).unwrap(), before);
+        assert_eq!(second.state.state.projects.len(), 2);
     }
 }

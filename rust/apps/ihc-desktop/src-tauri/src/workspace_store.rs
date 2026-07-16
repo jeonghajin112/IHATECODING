@@ -21,6 +21,8 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 
 pub(crate) const WORKSPACE_SCHEMA_VERSION: u32 = 1;
+pub(crate) const LEGACY_IMPORT_SOURCE_FORMAT: &str = "powerWorkspace.projects/1";
+pub(crate) const PHASE3_PREVIEW_SOURCE_FORMAT: &str = "ihatecoding.phase3-preview/1";
 
 const STATE_DIRECTORY_NAME: &str = "state";
 const WORKSPACE_FILE_NAME: &str = "workspace-v1.json";
@@ -131,7 +133,7 @@ impl WorkspaceStateV1 {
             tabs: vec![WorkspaceTabV1 {
                 id: "initial-empty".to_owned(),
                 kind: "empty".to_owned(),
-                title: "Empty".to_owned(),
+                title: "새 탭".to_owned(),
                 project_id: None,
                 browser: None,
                 output: None,
@@ -602,6 +604,89 @@ impl WorkspaceStore {
         Ok(snapshot_from_document(document))
     }
 
+    /// Initializes the canonical store from the application-owned Phase 3A
+    /// preview exactly once. A retry of the same completed upgrade is
+    /// idempotent; every other existing canonical generation is left intact.
+    pub(crate) fn initialize_from_phase3_preview(
+        &self,
+        mut state: WorkspaceStateV1,
+        provenance: ImportProvenanceV1,
+        source_bytes: &[u8],
+    ) -> StorageResult<WorkspaceSnapshot> {
+        let _operation = self.lock()?;
+        self.require_writable()?;
+        normalize_and_validate_state(&mut state)?;
+        validate_provenance(&provenance)?;
+        if provenance.source_format != PHASE3_PREVIEW_SOURCE_FORMAT {
+            return Err(StorageError::invalid(
+                "The Phase 3 preview upgrade provenance is invalid.",
+                "/importProvenance/sourceFormat",
+            ));
+        }
+        if source_bytes.len() as u64 > MAX_WORKSPACE_BYTES
+            || format!("{:x}", Sha256::digest(source_bytes)) != provenance.source_sha256
+        {
+            return Err(StorageError::new(
+                StorageErrorCode::InvalidSource,
+                "The Phase 3 preview source bytes do not match their inspected digest.",
+                false,
+            ));
+        }
+
+        let primary = self.primary_path();
+        if path_exists(&primary, "workspace state")? {
+            let bytes = read_limited(&primary, "workspace state").map_err(|error| {
+                if matches!(
+                    error.code,
+                    StorageErrorCode::InvalidState | StorageErrorCode::TooLarge
+                ) {
+                    StorageError::recovery(
+                        "The current workspace state is invalid; explicit recovery is required.",
+                    )
+                } else {
+                    error
+                }
+            })?;
+            let document = parse_document(&bytes).map_err(|error| match error.code {
+                StorageErrorCode::UnsupportedVersion => error,
+                _ => StorageError::recovery(
+                    "The current workspace state is invalid; explicit recovery is required.",
+                ),
+            })?;
+            if document.import_provenance.as_ref().is_some_and(|existing| {
+                existing.source_format == PHASE3_PREVIEW_SOURCE_FORMAT
+                    && existing.source_sha256 == provenance.source_sha256
+            }) {
+                self.ensure_exact_import_snapshot(&provenance, source_bytes)?;
+                return Ok(snapshot_from_document(document));
+            }
+            return Err(StorageError::new(
+                StorageErrorCode::RevisionConflict,
+                "The canonical workspace is already initialized; Phase 3 preview upgrade was refused.",
+                false,
+            )
+            .at("/revision"));
+        }
+        if self.any_backup_exists()? || self.any_uncommitted_temp_exists()? {
+            return Err(StorageError::recovery(
+                "The workspace state is missing while recovery evidence exists.",
+            ));
+        }
+
+        self.ensure_exact_import_snapshot(&provenance, source_bytes)?;
+        let document = WorkspaceDocumentV1 {
+            schema_version: WORKSPACE_SCHEMA_VERSION,
+            revision: 1,
+            written_at_utc: current_utc_timestamp()?,
+            state,
+            import_provenance: Some(provenance),
+        };
+        validate_document(&document)?;
+        let bytes = serialize_document(&document)?;
+        self.commit(&bytes, None)?;
+        Ok(snapshot_from_document(document))
+    }
+
     pub(crate) fn recover(&self, candidate_id: &str) -> StorageResult<WorkspaceSnapshot> {
         let _operation = self.lock()?;
         self.require_writable()?;
@@ -886,6 +971,42 @@ impl WorkspaceStore {
         guard.disarm();
         sync_parent_directory(&self.inner.root, "workspace state")?;
         self.cleanup_uncommitted_temps();
+        Ok(())
+    }
+
+    fn ensure_exact_import_snapshot(
+        &self,
+        provenance: &ImportProvenanceV1,
+        source_bytes: &[u8],
+    ) -> StorageResult<()> {
+        reject_reparse_components(&self.inner.root)?;
+        let imports = self.inner.root.join("imports");
+        fs::create_dir_all(&imports)
+            .map_err(|_| StorageError::io("Could not create the workspace import directory."))?;
+        reject_reparse_components(&imports)?;
+        let destination = imports.join(&provenance.snapshot_file);
+        if path_exists(&destination, "workspace import snapshot")? {
+            let existing = read_limited(&destination, "workspace import snapshot")?;
+            if existing == source_bytes
+                && format!("{:x}", Sha256::digest(&existing)) == provenance.source_sha256
+            {
+                return Ok(());
+            }
+            return Err(StorageError::new(
+                StorageErrorCode::InvalidState,
+                "The existing workspace import snapshot does not match its digest.",
+                false,
+            ));
+        }
+        durable_atomic_raw_copy(&destination, source_bytes, "workspace import snapshot")?;
+        let stored = read_limited(&destination, "workspace import snapshot")?;
+        if stored != source_bytes
+            || format!("{:x}", Sha256::digest(&stored)) != provenance.source_sha256
+        {
+            return Err(StorageError::io(
+                "Could not verify the workspace import snapshot.",
+            ));
+        }
         Ok(())
     }
 
@@ -1379,6 +1500,14 @@ fn validate_provenance(provenance: &ImportProvenanceV1) -> StorageResult<()> {
         false,
         "/importProvenance/sourceFormat",
     )?;
+    if provenance.source_format != LEGACY_IMPORT_SOURCE_FORMAT
+        && provenance.source_format != PHASE3_PREVIEW_SOURCE_FORMAT
+    {
+        return Err(StorageError::invalid(
+            "The import source format is unsupported.",
+            "/importProvenance/sourceFormat",
+        ));
+    }
     if provenance.source_sha256.len() != 64
         || !provenance
             .source_sha256
