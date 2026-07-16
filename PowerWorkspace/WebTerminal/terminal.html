@@ -141,9 +141,30 @@
       let lastColumns = 0;
       let lastRows = 0;
       let userBrowsingScrollback = false;
+      let selectionGestureActive = false;
+      let interactionEpoch = 0;
       const isAtBottom = () => {
         const buffer = terminal.buffer.active;
-        return buffer.baseY - buffer.viewportY <= 1;
+        return buffer.viewportY === buffer.baseY;
+      };
+      const canAutoFollow = () =>
+        !userBrowsingScrollback &&
+        !selectionGestureActive &&
+        !terminal.hasSelection();
+      const invalidatePendingFollow = () => {
+        interactionEpoch += 1;
+        clearTimeout(outputSettledTimer);
+      };
+      const pauseAutoFollow = () => {
+        userBrowsingScrollback = true;
+        invalidatePendingFollow();
+      };
+      const resumeAutoFollowForInput = () => {
+        userBrowsingScrollback = false;
+        selectionGestureActive = false;
+        invalidatePendingFollow();
+        terminal.scrollToBottom();
+        post({ type: 'user-input' });
       };
       const reportSize = () => {
         const columns = terminal.cols;
@@ -170,18 +191,10 @@
         return true;
       };
       const requestPaste = () => post({ type: 'paste' });
-      const modifierOnlyKeys = new Set([
-        'control', 'shift', 'alt', 'meta', 'capslock', 'numlock', 'scrolllock'
-      ]);
 
       terminal.attachCustomKeyEventHandler(event => {
         if (event.type !== 'keydown') return true;
         const key = String(event.key || '').toLowerCase();
-        if (!modifierOnlyKeys.has(key)) {
-          userBrowsingScrollback = false;
-          terminal.scrollToBottom();
-          post({ type: 'user-input' });
-        }
         if (event.isComposing || event.keyCode === 229) return true;
 
         const commandModifier = event.ctrlKey || event.metaKey;
@@ -201,36 +214,73 @@
           if (event.shiftKey) return consume();
           return true;
         }
-        if (commandModifier && key === 'v') {
-          if (!event.repeat) requestPaste();
-          return consume();
-        }
         if (event.ctrlKey && key === 'insert') {
           copySelection();
           return consume();
         }
-        if (event.shiftKey && !event.ctrlKey && !event.altKey && key === 'insert') {
+        if (commandModifier && key === 'v') {
+          resumeAutoFollowForInput();
           if (!event.repeat) requestPaste();
           return consume();
+        }
+        if (event.shiftKey && !event.ctrlKey && !event.altKey && key === 'insert') {
+          resumeAutoFollowForInput();
+          if (!event.repeat) requestPaste();
+          return consume();
+        }
+        if (event.shiftKey &&
+            (key === 'pageup' || key === 'pagedown' || key === 'home' || key === 'end')) {
+          if (key === 'pageup' || key === 'home') pauseAutoFollow();
+          return true;
         }
         return true;
       });
 
-      terminal.onData(data => post({ type: 'input', data }));
-      terminal.onBinary(data => post({ type: 'input', data }));
+      terminal.onData(data => {
+        resumeAutoFollowForInput();
+        post({ type: 'input', data });
+      });
+      terminal.onBinary(data => {
+        resumeAutoFollowForInput();
+        post({ type: 'input', data });
+      });
       terminal.onResize(reportSize);
       terminal.onScroll(() => {
-        if (isAtBottom()) userBrowsingScrollback = false;
+        const browsing = !isAtBottom();
+        if (browsing !== userBrowsingScrollback) {
+          userBrowsingScrollback = browsing;
+          invalidatePendingFollow();
+        } else if (browsing) {
+          clearTimeout(outputSettledTimer);
+        }
+      });
+      terminal.onSelectionChange(() => {
+        if (terminal.hasSelection()) pauseAutoFollow();
       });
       terminal.element.addEventListener('focusin', () => post({ type: 'focus' }));
       terminal.element.addEventListener('focusout', () => post({ type: 'blur' }));
       terminal.element.addEventListener('wheel', event => {
-        if (event.deltaY < 0) userBrowsingScrollback = true;
+        if (event.deltaY < 0) pauseAutoFollow();
       }, { passive: true });
 
-      terminal.element.addEventListener('mousedown', () => {
+      terminal.element.addEventListener('mousedown', event => {
+        if (event.button === 0) {
+          selectionGestureActive = true;
+          invalidatePendingFollow();
+        }
         post({ type: 'pointer-down' });
         terminal.focus();
+      });
+      window.addEventListener('mouseup', event => {
+        if (event.button !== 0 || !selectionGestureActive) return;
+        selectionGestureActive = false;
+        invalidatePendingFollow();
+        if (!terminal.hasSelection() && isAtBottom()) userBrowsingScrollback = false;
+      }, true);
+      window.addEventListener('blur', () => {
+        if (!selectionGestureActive) return;
+        selectionGestureActive = false;
+        invalidatePendingFollow();
       });
       terminal.element.addEventListener('contextmenu', event => {
         event.preventDefault();
@@ -240,17 +290,21 @@
       chrome.webview.addEventListener('message', event => {
         const message = event.data || {};
         if (message.type === 'output' && typeof message.data === 'string') {
-          const shouldFollow = !userBrowsingScrollback || isAtBottom();
+          const shouldFollow = canAutoFollow() && isAtBottom();
+          const writeEpoch = interactionEpoch;
           terminal.write(message.data, () => {
-            if (shouldFollow) terminal.scrollToBottom();
+            if (shouldFollow && writeEpoch === interactionEpoch && canAutoFollow())
+              terminal.scrollToBottom();
           });
           clearTimeout(outputSettledTimer);
           if (shouldFollow) {
+            const settledEpoch = interactionEpoch;
             outputSettledTimer = setTimeout(() => {
               // Queue an empty write as a barrier. Its callback runs only after
               // every preceding transcript chunk has been rendered by xterm.
               terminal.write('', () => {
-                if (!userBrowsingScrollback) terminal.scrollToBottom();
+                if (settledEpoch === interactionEpoch && canAutoFollow())
+                  terminal.scrollToBottom();
               });
             }, 120);
           }

@@ -78,6 +78,13 @@ public sealed class MainWindow : Window
         "M4.94 4.96A9.97 9.97 0 0 1 15.775 2.778A8.7 8.7 0 0 1 17.808 3.888L14.802 5.278C12.003 4.101 8.797 4.9 6.84 6.86C4.276 9.425 3.694 13.814 6.48 16.782L6.758 17.066L0.124 23C1.999 21.027 3.895 18.573 2.76 15.81C1.24 12.112 2.125 7.78 4.94 4.96M23.9 0.1C21.636 3.274 20.716 5.489 21.703 9.74L21.696 9.733C22.449 12.934 21.644 16.483 19.043 19.088C15.764 22.373 10.517 23.104 6.196 20.148L9.21 18.75C11.968 19.834 14.985 19.357 17.153 17.186C19.322 15.016 19.808 11.854 18.719 9.223C18.512 8.723 17.891 8.598 17.456 8.919L8.59 15.472L21.29 2.702V2.712Z");
 
     private readonly Grid _workspace = new() { Margin = new Thickness(3) };
+    private readonly Grid _tabContentLayer = new() { Background = BackgroundBrush };
+    private readonly FrameworkElement _emptyWorkspace = BuildEmptyWorkspaceView();
+    private readonly StackPanel _tabItems = new()
+    {
+        Orientation = Orientation.Horizontal,
+        VerticalAlignment = VerticalAlignment.Stretch,
+    };
     private readonly StackPanel _usageLeft = new()
     {
         Orientation = Orientation.Horizontal,
@@ -86,6 +93,7 @@ public sealed class MainWindow : Window
     private readonly TextBlock _sessionCount = Text("0 / 20", 11, MutedBrush);
     private readonly TextBlock _activeProjectLabel = Text("프로젝트를 선택하세요", 11, MutedBrush);
     private readonly TextBlock _projectCountLabel = Text("0", 10, MutedBrush);
+    private readonly Button _addPowerShellButton = ToolbarButton("＋  PowerShell", BlueBrush);
     private readonly ListBox _projectList = new()
     {
         Background = Brushes.Transparent,
@@ -96,6 +104,7 @@ public sealed class MainWindow : Window
     };
     private readonly List<WorkspaceProject> _projects = [];
     private readonly List<TerminalSession> _sessions = [];
+    private readonly List<WorkspaceTab> _workspaceTabs = [];
     private readonly Dictionary<string, Border> _projectAlertBadges = new(StringComparer.Ordinal);
     private readonly HashSet<string> _restoredProjects = new(StringComparer.Ordinal);
     private readonly HashSet<int> _registeredHotkeys = [];
@@ -116,6 +125,8 @@ public sealed class MainWindow : Window
     private TerminalSession? _draggedSession;
     private TerminalSession? _paneResizeSession;
     private WorkspaceProject? _selectedProject;
+    private string? _lastSelectedProjectId;
+    private WorkspaceTab? _activeWorkspaceTab;
     private FrameworkElement? _dragCaptureElement;
     private Border? _dragInsertionLine;
     private Window? _dragInsertionWindow;
@@ -145,6 +156,7 @@ public sealed class MainWindow : Window
     private List<double>? _paneResizeSnapTargets;
     private bool _usageReadInProgress;
     private bool _suppressProjectSelection;
+    private bool _synchronizeWorkspaceTab;
     private bool _isSessionDragging;
     private bool _dragHasValidDrop;
     private bool _shutdownStarted;
@@ -177,21 +189,30 @@ public sealed class MainWindow : Window
             handledEventsToo: true);
         root.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(240) });
         root.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(42) });
         root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(54) });
         root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
         root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(40) });
 
         var sidebar = BuildProjectSidebar();
-        Grid.SetRowSpan(sidebar, 3);
+        Grid.SetRowSpan(sidebar, 4);
         root.Children.Add(sidebar);
 
+        var tabBar = BuildWorkspaceTabBar();
+        Grid.SetRow(tabBar, 0);
+        Grid.SetColumn(tabBar, 1);
+        root.Children.Add(tabBar);
+
         var toolbar = BuildToolbar();
-        Grid.SetRow(toolbar, 0);
+        Grid.SetRow(toolbar, 1);
         Grid.SetColumn(toolbar, 1);
         root.Children.Add(toolbar);
 
-        var workspaceFrame = new Border { Background = BackgroundBrush, Child = _workspace };
-        Grid.SetRow(workspaceFrame, 1);
+        _emptyWorkspace.Visibility = Visibility.Collapsed;
+        _tabContentLayer.Children.Add(_emptyWorkspace);
+        _tabContentLayer.Children.Add(_workspace);
+        var workspaceFrame = new Border { Background = BackgroundBrush, Child = _tabContentLayer };
+        Grid.SetRow(workspaceFrame, 2);
         Grid.SetColumn(workspaceFrame, 1);
         root.Children.Add(workspaceFrame);
 
@@ -203,11 +224,12 @@ public sealed class MainWindow : Window
             Padding = new Thickness(16, 0, 16, 0),
             Child = _usageLeft,
         };
-        Grid.SetRow(usageBar, 2);
+        Grid.SetRow(usageBar, 3);
         Grid.SetColumn(usageBar, 1);
         root.Children.Add(usageBar);
         Content = root;
         LoadProjects();
+        EnsureInitialWorkspaceTab();
 
         _workspace.SizeChanged += (_, _) =>
         {
@@ -266,19 +288,30 @@ public sealed class MainWindow : Window
                     !string.Equals(_selectedProject.Id, smokeProject.Id, StringComparison.Ordinal) ||
                     !SamePath(_selectedProject.FolderPath, projectSmokeFolder))
                     Environment.ExitCode = 9;
+                if (_selectedProject is not null) ActivateProject(_selectedProject);
                 if (_projectList.Items.Count != _projects.Count || _projectList.SelectedItem is null)
                     Environment.ExitCode = 11;
                 smokeTargetProject = _selectedProject ?? smokeProject;
             }
             else
             {
-                smokeTargetProject = _selectedProject ?? new WorkspaceProject
+                if (_selectedProject is null)
                 {
-                    Id = "smoke-project",
-                    Name = "Smoke Project",
-                    FolderPath = smokeFolder,
-                };
-                _selectedProject = smokeTargetProject;
+                    smokeTargetProject = new WorkspaceProject
+                    {
+                        Id = "smoke-project",
+                        Name = "Smoke Project",
+                        FolderPath = smokeFolder,
+                    };
+                    _projects.Add(smokeTargetProject);
+                    _selectedProject = smokeTargetProject;
+                    _lastSelectedProjectId = smokeTargetProject.Id;
+                    RefreshProjectList();
+                }
+                else
+                {
+                    smokeTargetProject = _selectedProject;
+                }
             }
             var restoreOnly = string.Equals(
                 Environment.GetEnvironmentVariable("POWERWORKSPACE_SMOKE_RESTORE_ONLY"),
@@ -339,6 +372,7 @@ public sealed class MainWindow : Window
             else
             {
                 _restoredProjects.Add(smokeTargetProject.Id);
+                ActivateProject(smokeTargetProject);
                 var paneText = Environment.GetEnvironmentVariable("POWERWORKSPACE_SMOKE_PANES");
                 var paneCount = int.TryParse(paneText, out var requested)
                     ? Math.Clamp(requested, 1, MaximumSessions)
@@ -396,6 +430,256 @@ public sealed class MainWindow : Window
                 (_maximizedSession is not null ||
                  _workspace.Children.Count != SessionsForProject(smokeTargetProject.Id).Count))
                 Environment.ExitCode = 19;
+
+            if (string.Equals(
+                    Environment.GetEnvironmentVariable("POWERWORKSPACE_SMOKE_TABS"),
+                    "1",
+                    StringComparison.Ordinal))
+            {
+                if (_workspaceTabs.Count != 1 ||
+                    _activeWorkspaceTab?.Kind != WorkspaceTabKind.Project)
+                    Environment.ExitCode = 28;
+
+                var originalProjectTab = _activeWorkspaceTab;
+                var sessionsBeforeBlankTab = SessionsForProject(smokeTargetProject.Id).ToArray();
+                var blankTab = CreateEmptyWorkspaceTab();
+                if (_workspaceTabs.Count != 2 ||
+                    !ReferenceEquals(_activeWorkspaceTab, blankTab) ||
+                    blankTab.Kind != WorkspaceTabKind.Empty ||
+                    blankTab.ProjectId is not null ||
+                    _workspace.Visibility != Visibility.Collapsed ||
+                    _emptyWorkspace.Visibility != Visibility.Visible ||
+                    _addPowerShellButton.IsEnabled ||
+                    _projectList.SelectedItem is not null ||
+                    _selectedProject is not null)
+                    Environment.ExitCode = 29;
+
+                AddPowerShellInSelectedProject();
+                if (SessionsForProject(smokeTargetProject.Id).Count != sessionsBeforeBlankTab.Length)
+                    Environment.ExitCode = 44;
+
+                if (originalProjectTab is not null) CloseWorkspaceTab(originalProjectTab);
+                var smokeProjectSidebarItem = _projectList.Items
+                    .OfType<ListBoxItem>()
+                    .FirstOrDefault(item => item.Tag is WorkspaceProject project &&
+                        string.Equals(project.Id, smokeTargetProject.Id, StringComparison.Ordinal));
+                if (smokeProjectSidebarItem is null)
+                    Environment.ExitCode = 31;
+                else
+                    _projectList.SelectedItem = smokeProjectSidebarItem;
+                if (_workspaceTabs.Count != 1 ||
+                    !ReferenceEquals(_activeWorkspaceTab, blankTab) ||
+                    blankTab.Kind != WorkspaceTabKind.Project ||
+                    !string.Equals(blankTab.ProjectId, smokeTargetProject.Id, StringComparison.Ordinal) ||
+                    !string.Equals(blankTab.Title, smokeTargetProject.Name, StringComparison.Ordinal) ||
+                    _workspace.Visibility != Visibility.Visible ||
+                    _emptyWorkspace.Visibility != Visibility.Collapsed ||
+                    !_addPowerShellButton.IsEnabled)
+                    Environment.ExitCode = 31;
+
+                var sessionsAfterBlankAssignment = SessionsForProject(smokeTargetProject.Id);
+                if (sessionsAfterBlankAssignment.Count != sessionsBeforeBlankTab.Length ||
+                    sessionsBeforeBlankTab.Any(session => !sessionsAfterBlankAssignment.Contains(session)))
+                    Environment.ExitCode = 33;
+
+                var closingBlankTab = CreateEmptyWorkspaceTab();
+                SelectWorkspaceTab(blankTab);
+                CloseWorkspaceTab(blankTab);
+                if (!ReferenceEquals(_activeWorkspaceTab, closingBlankTab) ||
+                    closingBlankTab.Kind != WorkspaceTabKind.Empty ||
+                    sessionsBeforeBlankTab.Any(session =>
+                        !SessionsForProject(smokeTargetProject.Id).Contains(session)))
+                    Environment.ExitCode = 47;
+                CloseWorkspaceTab(closingBlankTab);
+                if (_workspaceTabs.Count != 1 ||
+                    _activeWorkspaceTab?.Kind != WorkspaceTabKind.Empty ||
+                    _activeWorkspaceTab.ProjectId is not null ||
+                    _workspace.Visibility != Visibility.Collapsed)
+                    Environment.ExitCode = 43;
+                ActivateProject(smokeTargetProject);
+
+                var existingProjectTab = _activeWorkspaceTab;
+                var redundantBlankTab = CreateEmptyWorkspaceTab();
+                ActivateProject(smokeTargetProject);
+                if (!ReferenceEquals(_activeWorkspaceTab, existingProjectTab) ||
+                    _workspaceTabs.Contains(redundantBlankTab) ||
+                    _workspaceTabs.Count != 1)
+                    Environment.ExitCode = 45;
+
+                if (string.Equals(
+                        Environment.GetEnvironmentVariable("POWERWORKSPACE_SMOKE_TAB_MULTI_PROJECT"),
+                        "1",
+                        StringComparison.Ordinal))
+                {
+                    var secondProject = _projects.FirstOrDefault(project =>
+                        !string.Equals(project.Id, smokeTargetProject.Id, StringComparison.Ordinal));
+                    if (secondProject is null)
+                    {
+                        Environment.ExitCode = 39;
+                    }
+                    else
+                    {
+                        var blankForSecondProject = CreateEmptyWorkspaceTab();
+                        ActivateProject(secondProject);
+                        if (!ReferenceEquals(_activeWorkspaceTab, blankForSecondProject) ||
+                            blankForSecondProject.Kind != WorkspaceTabKind.Project ||
+                            !string.Equals(
+                                blankForSecondProject.ProjectId,
+                                secondProject.Id,
+                                StringComparison.Ordinal) ||
+                            _workspaceTabs.Count != 2)
+                            Environment.ExitCode = 46;
+                        CloseWorkspaceTab(blankForSecondProject);
+                        OpenOrSelectProjectTab(smokeTargetProject);
+                    }
+                }
+            }
+
+            if (string.Equals(
+                    Environment.GetEnvironmentVariable("POWERWORKSPACE_SMOKE_BROWSER_CONTENT"),
+                    "1",
+                    StringComparison.Ordinal))
+            {
+                if (_workspaceTabs.Count != 1 ||
+                    _activeWorkspaceTab?.Kind != WorkspaceTabKind.Project)
+                    Environment.ExitCode = 28;
+
+                var projectTabBefore = _activeWorkspaceTab;
+                var sessionsBeforeTabs = SessionsForProject(smokeTargetProject.Id).ToArray();
+                OpenBrowserTab();
+                var browserTab = _activeWorkspaceTab;
+                if (_workspaceTabs.Count != 2 ||
+                    browserTab?.Kind != WorkspaceTabKind.Browser ||
+                    browserTab.Content is not WorkspaceBrowserHost browser)
+                {
+                    Environment.ExitCode = 29;
+                }
+                else
+                {
+                    var initialization = browser.EnsureInitializedAsync();
+                    if (await Task.WhenAny(initialization, Task.Delay(10000)) != initialization ||
+                        !browser.IsBrowserInitialized)
+                    {
+                        Environment.ExitCode = 30;
+                    }
+                    else if (!await browser.WaitForFirstNavigationAsync(TimeSpan.FromSeconds(10)))
+                    {
+                        Environment.ExitCode = 34;
+                    }
+                }
+
+                if (projectTabBefore is not null) CloseWorkspaceTab(projectTabBefore);
+                var sessionsAfterProjectTabClose = SessionsForProject(smokeTargetProject.Id);
+                if (sessionsAfterProjectTabClose.Count != sessionsBeforeTabs.Length ||
+                    sessionsBeforeTabs.Any(session => !sessionsAfterProjectTabClose.Contains(session)))
+                    Environment.ExitCode = 33;
+
+                OpenOrSelectProjectTab(smokeTargetProject);
+                if (_activeWorkspaceTab?.Kind != WorkspaceTabKind.Project ||
+                    _workspace.Visibility != Visibility.Visible)
+                    Environment.ExitCode = 31;
+                if (browserTab?.Content is WorkspaceBrowserHost suspendedBrowser)
+                {
+                    var suspensionDeadline = DateTime.UtcNow.AddSeconds(5);
+                    while (!suspendedBrowser.IsBrowserSuspended &&
+                           DateTime.UtcNow < suspensionDeadline)
+                        await Task.Delay(50);
+                    if (!suspendedBrowser.IsBrowserSuspended)
+                    {
+                        Environment.ExitCode = 35;
+                    }
+                    else
+                    {
+                        SelectWorkspaceTab(browserTab);
+                        await Task.Delay(50);
+                        if (suspendedBrowser.IsBrowserSuspended) Environment.ExitCode = 36;
+                        OpenOrSelectProjectTab(smokeTargetProject);
+                    }
+                }
+                if (browserTab is not null) CloseWorkspaceTab(browserTab);
+
+                OpenProjectOutputTab(smokeTargetProject);
+                var outputTab = _activeWorkspaceTab;
+                if (outputTab?.Kind != WorkspaceTabKind.Output ||
+                    outputTab.Content is not WorkspaceBrowserHost outputBrowser)
+                {
+                    Environment.ExitCode = 32;
+                }
+                else if (Environment.GetEnvironmentVariable(
+                             "POWERWORKSPACE_SMOKE_OUTPUT_TITLE") is { Length: > 0 } expectedOutputTitle)
+                {
+                    var outputInitialization = outputBrowser.EnsureInitializedAsync();
+                    if (await Task.WhenAny(outputInitialization, Task.Delay(10000)) != outputInitialization ||
+                        !outputBrowser.IsBrowserInitialized ||
+                        !await outputBrowser.WaitForFirstNavigationAsync(TimeSpan.FromSeconds(10)))
+                    {
+                        Environment.ExitCode = 37;
+                    }
+                    else
+                    {
+                        var outputTitleDeadline = DateTime.UtcNow.AddSeconds(5);
+                        while (!string.Equals(
+                                   outputBrowser.Title,
+                                   expectedOutputTitle,
+                                   StringComparison.Ordinal) &&
+                               DateTime.UtcNow < outputTitleDeadline)
+                            await Task.Delay(50);
+                        if (!string.Equals(
+                                outputBrowser.Title,
+                                expectedOutputTitle,
+                                StringComparison.Ordinal))
+                            Environment.ExitCode = 38;
+                    }
+                }
+                OpenOrSelectProjectTab(smokeTargetProject);
+                if (outputTab is not null) CloseWorkspaceTab(outputTab);
+
+                if (string.Equals(
+                        Environment.GetEnvironmentVariable("POWERWORKSPACE_SMOKE_TAB_MULTI_PROJECT"),
+                        "1",
+                        StringComparison.Ordinal))
+                {
+                    var secondProject = _projects.FirstOrDefault(project =>
+                        !string.Equals(project.Id, smokeTargetProject.Id, StringComparison.Ordinal));
+                    if (secondProject is null)
+                    {
+                        Environment.ExitCode = 39;
+                    }
+                    else
+                    {
+                        OpenBrowserTab();
+                        var projectBrowserTab = _activeWorkspaceTab;
+                        OpenOrSelectProjectTab(secondProject);
+                        if (_activeWorkspaceTab?.ProjectId != secondProject.Id ||
+                            _selectedProject?.Id != secondProject.Id)
+                            Environment.ExitCode = 40;
+
+                        if (projectBrowserTab is not null)
+                        {
+                            SelectWorkspaceTab(projectBrowserTab);
+                            foreach (var otherTab in _workspaceTabs
+                                         .Where(tab => !ReferenceEquals(tab, projectBrowserTab))
+                                         .ToList())
+                                CloseWorkspaceTab(otherTab);
+                            CloseWorkspaceTab(projectBrowserTab);
+                        }
+
+                        if (_activeWorkspaceTab?.Kind != WorkspaceTabKind.Empty ||
+                            _activeWorkspaceTab.ProjectId is not null ||
+                            _workspace.Visibility != Visibility.Collapsed)
+                            Environment.ExitCode = 41;
+                        if (_tabContentLayer.Children.OfType<WorkspaceBrowserHost>().Any())
+                            Environment.ExitCode = 42;
+                        ActivateProject(smokeTargetProject);
+                        if (_activeWorkspaceTab?.Kind != WorkspaceTabKind.Project ||
+                            _activeWorkspaceTab.ProjectId != smokeTargetProject.Id ||
+                            _selectedProject?.Id != smokeTargetProject.Id ||
+                            _workspace.Visibility != Visibility.Visible ||
+                            _workspace.Children.Count != SessionsForProject(smokeTargetProject.Id).Count)
+                            Environment.ExitCode = 41;
+                    }
+                }
+            }
         }
         else if (_selectedProject is not null)
         {
@@ -417,14 +701,22 @@ public sealed class MainWindow : Window
                     _sessions.Select(session => session.Terminal.StartupError)));
                 Environment.ExitCode = 3;
             }
-            var visibilityDeadline = DateTime.UtcNow.AddSeconds(2);
-            while (_sessions.Any(session => !session.Terminal.IsConsoleWindowVisible) &&
-                   DateTime.UtcNow < visibilityDeadline)
-                await Task.Delay(50);
-            if (_sessions.Any(session => !session.Terminal.IsConsoleWindowVisible))
-                Environment.ExitCode = 22;
+            if (_activeWorkspaceTab?.Kind == WorkspaceTabKind.Project)
+            {
+                var visibilityDeadline = DateTime.UtcNow.AddSeconds(2);
+                while (_sessions.Any(session => !session.Terminal.IsConsoleWindowVisible) &&
+                       DateTime.UtcNow < visibilityDeadline)
+                    await Task.Delay(50);
+                if (_sessions.Any(session => !session.Terminal.IsConsoleWindowVisible))
+                    Environment.ExitCode = 22;
+            }
             if (!VerifyPaneWidthResizeForSmoke()) Environment.ExitCode = 21;
             if (!VerifyPaneWidthSnapForSmoke()) Environment.ExitCode = 23;
+            if (string.Equals(
+                    Environment.GetEnvironmentVariable("POWERWORKSPACE_SMOKE_SHOW_BLANK_TAB"),
+                    "1",
+                    StringComparison.Ordinal))
+                CreateEmptyWorkspaceTab();
             if (int.TryParse(
                     Environment.GetEnvironmentVariable("POWERWORKSPACE_SMOKE_HOLD_MS"),
                     out var smokeHoldMilliseconds) && smokeHoldMilliseconds > 0)
@@ -589,10 +881,511 @@ public sealed class MainWindow : Window
         Close();
     }
 
+    private UIElement BuildWorkspaceTabBar()
+    {
+        var addTabButton = new Button
+        {
+            Content = "＋",
+            Width = 34,
+            Height = 28,
+            Margin = new Thickness(6, 0, 10, 0),
+            Padding = new Thickness(0),
+            Background = Brushes.Transparent,
+            Foreground = TextBrush,
+            BorderBrush = PanelBorderBrush,
+            BorderThickness = new Thickness(1),
+            FontSize = 15,
+            ToolTip = "새 탭 열기",
+            Cursor = Cursors.Hand,
+            VerticalAlignment = VerticalAlignment.Center,
+        };
+        addTabButton.Click += (_, _) => CreateEmptyWorkspaceTab();
+
+        var tabScroller = new ScrollViewer
+        {
+            Content = _tabItems,
+            HorizontalScrollBarVisibility = ScrollBarVisibility.Hidden,
+            VerticalScrollBarVisibility = ScrollBarVisibility.Disabled,
+            VerticalContentAlignment = VerticalAlignment.Stretch,
+            Background = Brushes.Transparent,
+        };
+        tabScroller.PreviewMouseWheel += (_, e) =>
+        {
+            tabScroller.ScrollToHorizontalOffset(tabScroller.HorizontalOffset - e.Delta);
+            e.Handled = true;
+        };
+
+        var layout = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Background = Brushes.Transparent,
+        };
+        layout.Children.Add(tabScroller);
+        layout.Children.Add(addTabButton);
+
+        var shell = new Border
+        {
+            Background = SurfaceBrush,
+            BorderBrush = PanelBorderBrush,
+            BorderThickness = new Thickness(0, 0, 0, 1),
+            Child = layout,
+        };
+        shell.SizeChanged += (_, e) =>
+            tabScroller.MaxWidth = Math.Max(0, e.NewSize.Width - 50);
+        return shell;
+    }
+
+    private void EnsureInitialWorkspaceTab(bool activateProject = false)
+    {
+        if (_workspaceTabs.Count > 0) return;
+        if (_selectedProject is not null)
+        {
+            OpenOrSelectProjectTab(_selectedProject, activateProject);
+            return;
+        }
+
+        CreateEmptyWorkspaceTab();
+    }
+
+    private WorkspaceTab CreateEmptyWorkspaceTab()
+    {
+        var tab = new WorkspaceTab
+        {
+            Kind = WorkspaceTabKind.Empty,
+            Title = "새 탭",
+        };
+        _workspaceTabs.Add(tab);
+        SelectWorkspaceTab(tab, activateProject: false);
+        return tab;
+    }
+
+    private WorkspaceTab OpenOrSelectProjectTab(WorkspaceProject project, bool activateProject = true)
+    {
+        var activeEmptyTab = _activeWorkspaceTab?.Kind == WorkspaceTabKind.Empty
+            ? _activeWorkspaceTab
+            : null;
+        var existingTab = _workspaceTabs.FirstOrDefault(item =>
+            item.Kind == WorkspaceTabKind.Project &&
+            string.Equals(item.ProjectId, project.Id, StringComparison.Ordinal));
+        if (activeEmptyTab is not null)
+        {
+            if (existingTab is not null)
+            {
+                SelectWorkspaceTab(existingTab, activateProject);
+                CloseWorkspaceTab(activeEmptyTab);
+                return existingTab;
+            }
+
+            activeEmptyTab.Kind = WorkspaceTabKind.Project;
+            activeEmptyTab.Title = project.Name;
+            activeEmptyTab.ProjectId = project.Id;
+            SelectWorkspaceTab(activeEmptyTab, activateProject, forceRefresh: true);
+            return activeEmptyTab;
+        }
+
+        var tab = existingTab;
+        if (tab is null)
+        {
+            tab = new WorkspaceTab
+            {
+                Kind = WorkspaceTabKind.Project,
+                Title = project.Name,
+                ProjectId = project.Id,
+            };
+            _workspaceTabs.Add(tab);
+        }
+        else tab.Title = project.Name;
+
+        SelectWorkspaceTab(tab, activateProject);
+        return tab;
+    }
+
+    private void OpenBrowserTab()
+    {
+        var host = new WorkspaceBrowserHost();
+        var tab = new WorkspaceTab
+        {
+            Kind = WorkspaceTabKind.Browser,
+            Title = "브라우저",
+            ProjectId = _selectedProject?.Id,
+            Content = host,
+        };
+        host.TitleChanged += (_, _) =>
+        {
+            if (!_workspaceTabs.Contains(tab)) return;
+            tab.Title = string.IsNullOrWhiteSpace(host.Title) ? "브라우저" : host.Title;
+            RefreshWorkspaceTabStrip();
+        };
+        _workspaceTabs.Add(tab);
+        host.Visibility = Visibility.Collapsed;
+        _tabContentLayer.Children.Add(host);
+        SelectWorkspaceTab(tab);
+    }
+
+    private void OpenProjectOutputTab(WorkspaceProject project)
+    {
+        var existing = _workspaceTabs.FirstOrDefault(item =>
+            item.Kind == WorkspaceTabKind.Output &&
+            string.Equals(item.ProjectId, project.Id, StringComparison.Ordinal));
+        if (existing is not null)
+        {
+            SelectWorkspaceTab(existing);
+            return;
+        }
+
+        var output = ResolveProjectOutput(project);
+        var host = new WorkspaceBrowserHost(output.Address, output.LocalContentFolder);
+        var tab = new WorkspaceTab
+        {
+            Kind = WorkspaceTabKind.Output,
+            Title = $"출력 · {project.Name}",
+            ProjectId = project.Id,
+            Content = host,
+        };
+        _workspaceTabs.Add(tab);
+        host.Visibility = Visibility.Collapsed;
+        _tabContentLayer.Children.Add(host);
+        SelectWorkspaceTab(tab);
+    }
+
+    private static (string Address, string? LocalContentFolder) ResolveProjectOutput(
+        WorkspaceProject project)
+    {
+        if (!Directory.Exists(project.FolderPath)) return ("about:blank", null);
+        foreach (var relativePath in new[]
+                 {
+                     Path.Combine("dist", "index.html"),
+                     Path.Combine("build", "index.html"),
+                     Path.Combine("out", "index.html"),
+                 })
+        {
+            var candidate = Path.Combine(project.FolderPath, relativePath);
+            if (File.Exists(candidate))
+                return ("about:blank", Path.GetDirectoryName(candidate));
+        }
+
+        try
+        {
+            if (Directory.EnumerateFiles(project.FolderPath, "vite.config.*", SearchOption.TopDirectoryOnly).Any())
+                return ("http://localhost:5173", null);
+        }
+        catch
+        {
+        }
+        if (File.Exists(Path.Combine(project.FolderPath, "angular.json")))
+            return ("http://localhost:4200", null);
+
+        try
+        {
+            var packagePath = Path.Combine(project.FolderPath, "package.json");
+            if (File.Exists(packagePath))
+            {
+                var package = File.ReadAllText(packagePath);
+                if (package.Contains("vite", StringComparison.OrdinalIgnoreCase))
+                    return ("http://localhost:5173", null);
+            }
+        }
+        catch
+        {
+        }
+        return ("http://localhost:3000", null);
+    }
+
+    private void SelectWorkspaceTab(
+        WorkspaceTab tab,
+        bool activateProject = true,
+        bool forceRefresh = false)
+    {
+        if (!_workspaceTabs.Contains(tab)) return;
+        if (!forceRefresh && ReferenceEquals(_activeWorkspaceTab, tab))
+        {
+            var requiresProjectActivation = tab.Kind == WorkspaceTabKind.Project &&
+                                            activateProject &&
+                                            tab.ProjectId is not null &&
+                                            !string.Equals(
+                                                _selectedProject?.Id,
+                                                tab.ProjectId,
+                                                StringComparison.Ordinal);
+            if (!requiresProjectActivation)
+            {
+                RefreshWorkspaceTabStrip();
+                if (tab.Content is not null)
+                    Dispatcher.BeginInvoke(DispatcherPriority.ContextIdle, tab.Content.Focus);
+                return;
+            }
+        }
+        _activeWorkspaceTab = tab;
+        ++_terminalVisibilityRefreshVersion;
+
+        var showsWorkspace = tab.Kind == WorkspaceTabKind.Project && tab.ProjectId is not null;
+        var showsEmptyWorkspace = tab.Kind == WorkspaceTabKind.Empty;
+        _workspace.Visibility = showsWorkspace ? Visibility.Visible : Visibility.Collapsed;
+        _emptyWorkspace.Visibility = showsEmptyWorkspace ? Visibility.Visible : Visibility.Collapsed;
+        foreach (var item in _workspaceTabs)
+        {
+            if (item.Content is not null)
+            {
+                var contentActive = ReferenceEquals(item, tab);
+                item.Content.Visibility = contentActive
+                    ? Visibility.Visible
+                    : Visibility.Collapsed;
+                if (item.Content is WorkspaceBrowserHost browser)
+                    browser.SetTabActive(contentActive);
+            }
+        }
+
+        SetAddPowerShellEnabled(false);
+        if (showsEmptyWorkspace)
+        {
+            ClearActiveSessionSelection();
+            _maximizedSession = null;
+            _selectedProject = null;
+            ClearProjectInSidebar();
+            _sessionCount.Text = $"0 / {MaximumSessions}";
+            UpdateActiveProjectLabel();
+        }
+        else if (showsWorkspace && tab.ProjectId is not null)
+        {
+            var project = _projects.FirstOrDefault(item =>
+                string.Equals(item.Id, tab.ProjectId, StringComparison.Ordinal));
+            if (project is not null)
+            {
+                SetAddPowerShellEnabled(true);
+                if (activateProject)
+                {
+                    _synchronizeWorkspaceTab = true;
+                    try
+                    {
+                        ActivateProject(project);
+                    }
+                    finally
+                    {
+                        _synchronizeWorkspaceTab = false;
+                    }
+                }
+            }
+        }
+        else if (!showsWorkspace)
+        {
+            ClearActiveSessionSelection();
+            _maximizedSession = null;
+            SetAddPowerShellEnabled(false);
+            if (tab.ProjectId is not null &&
+                _projects.FirstOrDefault(item =>
+                    string.Equals(item.Id, tab.ProjectId, StringComparison.Ordinal)) is { } project)
+            {
+                _selectedProject = project;
+                _lastSelectedProjectId = project.Id;
+                UpdateActiveProjectLabel();
+                _sessionCount.Text = $"{SessionsForProject(project.Id).Count} / {MaximumSessions}";
+                SelectProjectInSidebar(project);
+                SaveProjectSelection();
+            }
+        }
+
+        RefreshWorkspaceTabStrip();
+        if (tab.Content is not null)
+            Dispatcher.BeginInvoke(DispatcherPriority.ContextIdle, tab.Content.Focus);
+    }
+
+    private void CloseWorkspaceTab(WorkspaceTab tab)
+    {
+        var index = _workspaceTabs.IndexOf(tab);
+        if (index < 0) return;
+        var wasActive = ReferenceEquals(_activeWorkspaceTab, tab);
+        _workspaceTabs.RemoveAt(index);
+        if (tab.Content is not null)
+        {
+            _tabContentLayer.Children.Remove(tab.Content);
+            if (tab.Content is IDisposable disposable) disposable.Dispose();
+        }
+
+        if (_workspaceTabs.Count == 0)
+        {
+            _activeWorkspaceTab = null;
+            CreateEmptyWorkspaceTab();
+            return;
+        }
+
+        if (wasActive)
+        {
+            SelectWorkspaceTab(_workspaceTabs[Math.Min(index, _workspaceTabs.Count - 1)]);
+        }
+        else
+        {
+            RefreshWorkspaceTabStrip();
+        }
+    }
+
+    private void RefreshWorkspaceTabStrip()
+    {
+        _tabItems.Children.Clear();
+        foreach (var tab in _workspaceTabs)
+        {
+            var active = ReferenceEquals(tab, _activeWorkspaceTab);
+            var title = Text(tab.Title, 11, active ? TextBrush : MutedBrush, FontWeights.SemiBold);
+            title.MaxWidth = 170;
+            title.TextTrimming = TextTrimming.CharacterEllipsis;
+
+            var content = new StackPanel
+            {
+                Orientation = Orientation.Horizontal,
+                VerticalAlignment = VerticalAlignment.Center,
+            };
+            content.Children.Add(Spaced(Text(TabGlyph(tab.Kind), 10, active ? TextBrush : MutedBrush), 0, 7));
+            content.Children.Add(title);
+
+            if (tab.Kind == WorkspaceTabKind.Project && tab.ProjectId is not null &&
+                _projects.FirstOrDefault(project =>
+                    string.Equals(project.Id, tab.ProjectId, StringComparison.Ordinal)) is { } project)
+            {
+                var alertCount = project.Terminals.Count(terminal => terminal.CompletionPending);
+                if (alertCount > 0)
+                {
+                    var badgeLabel = Text(alertCount.ToString(), 9, CompletionBrush, FontWeights.Bold);
+                    badgeLabel.HorizontalAlignment = HorizontalAlignment.Center;
+                    content.Children.Add(new Border
+                    {
+                        MinWidth = 18,
+                        Height = 18,
+                        Margin = new Thickness(8, 0, 0, 0),
+                        Padding = new Thickness(4, 0, 4, 0),
+                        Background = Brush("#2A2415"),
+                        BorderBrush = CompletionBrush,
+                        BorderThickness = new Thickness(1),
+                        CornerRadius = new CornerRadius(9),
+                        Child = badgeLabel,
+                    });
+                }
+            }
+
+            var close = PanelButton("×", "탭 닫기");
+            close.Width = 22;
+            close.Height = 22;
+            close.Margin = new Thickness(8, 0, 0, 0);
+            close.Click += (_, e) =>
+            {
+                e.Handled = true;
+                CloseWorkspaceTab(tab);
+            };
+            content.Children.Add(close);
+
+            var tabElement = new Border
+            {
+                MinWidth = 118,
+                MaxWidth = 250,
+                Height = 41,
+                Padding = new Thickness(12, 0, 6, 0),
+                Background = active ? HeaderBrush : SurfaceBrush,
+                BorderBrush = active ? ActiveBorderBrush : PanelBorderBrush,
+                BorderThickness = active
+                    ? new Thickness(0, 0, 0, 2)
+                    : new Thickness(0, 0, 1, 1),
+                Child = content,
+                Cursor = Cursors.Hand,
+                ToolTip = WorkspaceTabToolTip(tab),
+            };
+            tabElement.MouseLeftButtonDown += (_, _) => SelectWorkspaceTab(tab);
+            _tabItems.Children.Add(tabElement);
+            if (active)
+            {
+                Dispatcher.BeginInvoke(
+                    DispatcherPriority.Loaded,
+                    new Action(tabElement.BringIntoView));
+            }
+        }
+    }
+
+    private string WorkspaceTabToolTip(WorkspaceTab tab)
+    {
+        if (tab.Content is WorkspaceBrowserHost browser && !string.IsNullOrWhiteSpace(browser.Url))
+            return browser.Url;
+        if (tab.ProjectId is not null &&
+            _projects.FirstOrDefault(project =>
+                string.Equals(project.Id, tab.ProjectId, StringComparison.Ordinal)) is { } project)
+            return project.FolderPath;
+        return tab.Title;
+    }
+
+    private static string TabGlyph(WorkspaceTabKind kind) => kind switch
+    {
+        WorkspaceTabKind.Empty => "＋",
+        WorkspaceTabKind.Project => ">_",
+        WorkspaceTabKind.Output => "▣",
+        _ => "○",
+    };
+
+    private void SelectProjectInSidebar(WorkspaceProject project)
+    {
+        var item = _projectList.Items
+            .OfType<ListBoxItem>()
+            .FirstOrDefault(candidate => candidate.Tag is WorkspaceProject itemProject &&
+                string.Equals(itemProject.Id, project.Id, StringComparison.Ordinal));
+        if (item is null || ReferenceEquals(_projectList.SelectedItem, item)) return;
+        _suppressProjectSelection = true;
+        try
+        {
+            _projectList.SelectedItem = item;
+            _projectList.ScrollIntoView(item);
+        }
+        finally
+        {
+            _suppressProjectSelection = false;
+        }
+    }
+
+    private void ClearProjectInSidebar()
+    {
+        if (_projectList.SelectedItem is null) return;
+        _suppressProjectSelection = true;
+        try
+        {
+            _projectList.SelectedItem = null;
+        }
+        finally
+        {
+            _suppressProjectSelection = false;
+        }
+    }
+
+    private static FrameworkElement BuildEmptyWorkspaceView()
+    {
+        var copy = new StackPanel
+        {
+            HorizontalAlignment = HorizontalAlignment.Center,
+            VerticalAlignment = VerticalAlignment.Center,
+        };
+        var title = Text("프로젝트를 선택하세요", 14, TextBrush, FontWeights.SemiBold);
+        title.HorizontalAlignment = HorizontalAlignment.Center;
+        copy.Children.Add(title);
+        var description = Text(
+            "왼쪽 프로젝트 목록에서 이 탭에 연결할 프로젝트를 선택하세요.",
+            11,
+            MutedBrush);
+        description.Margin = new Thickness(0, 8, 0, 0);
+        description.HorizontalAlignment = HorizontalAlignment.Center;
+        copy.Children.Add(description);
+        return new Grid
+        {
+            Background = BackgroundBrush,
+            Children = { copy },
+        };
+    }
+
+    private void SetAddPowerShellEnabled(bool enabled)
+    {
+        _addPowerShellButton.IsEnabled = enabled;
+        _addPowerShellButton.Opacity = enabled ? 1 : 0.35;
+        _addPowerShellButton.Cursor = enabled ? Cursors.Hand : Cursors.Arrow;
+        _addPowerShellButton.ToolTip = enabled
+            ? "활성 프로젝트 탭에 PowerShell 추가"
+            : "먼저 왼쪽에서 이 탭에 연결할 프로젝트를 선택하세요.";
+    }
+
     private UIElement BuildToolbar()
     {
-        var addButton = ToolbarButton("＋  PowerShell", BlueBrush);
-        addButton.Click += (_, _) => AddPowerShellInSelectedProject();
+        SetAddPowerShellEnabled(false);
+        _addPowerShellButton.Click += (_, _) => AddPowerShellInSelectedProject();
 
         var left = new StackPanel
         {
@@ -600,7 +1393,7 @@ public sealed class MainWindow : Window
             VerticalAlignment = VerticalAlignment.Center,
             Margin = new Thickness(16, 0, 0, 0),
         };
-        left.Children.Add(Spaced(addButton, 0, 16));
+        left.Children.Add(Spaced(_addPowerShellButton, 0, 16));
         left.Children.Add(Spaced(Text("CURRENT", 9, MutedBrush, FontWeights.SemiBold), 0, 8));
         left.Children.Add(_activeProjectLabel);
 
@@ -726,6 +1519,7 @@ public sealed class MainWindow : Window
         _selectedProject = _projects.FirstOrDefault(project =>
             string.Equals(project.Id, catalog.SelectedProjectId, StringComparison.Ordinal)) ??
             _projects.FirstOrDefault();
+        _lastSelectedProjectId = _selectedProject?.Id;
         RefreshProjectList();
     }
 
@@ -777,11 +1571,15 @@ public sealed class MainWindow : Window
 
     private void ActivateProject(WorkspaceProject project)
     {
+        if (!_synchronizeWorkspaceTab)
+            OpenOrSelectProjectTab(project, activateProject: false);
         ClearActiveSessionSelection();
         _selectedProject = project;
+        _lastSelectedProjectId = project.Id;
         _maximizedSession = null;
         EnsureProjectSessionsStarted(project);
         UpdateActiveProjectLabel();
+        SelectProjectInSidebar(project);
         SaveProjectSelection();
         RebuildLayout();
         foreach (var session in SelectedProjectSessions()) UpdateSessionAppearance(session);
@@ -874,25 +1672,39 @@ public sealed class MainWindow : Window
                 item.Background = Brushes.Transparent;
                 item.BorderBrush = PanelBorderBrush;
             };
+            item.PreviewMouseLeftButtonDown += (_, _) =>
+            {
+                if (ReferenceEquals(_projectList.SelectedItem, item))
+                    OpenOrSelectProjectTab(project);
+            };
             _projectList.Items.Add(item);
             UpdateProjectAlertBadge(project);
-            if (ReferenceEquals(project, _selectedProject)) selectedItem = item;
+            if (_activeWorkspaceTab?.Kind != WorkspaceTabKind.Empty &&
+                ReferenceEquals(project, _selectedProject))
+                selectedItem = item;
         }
         _projectList.SelectedItem = selectedItem;
         _projectCountLabel.Text = _projects.Count.ToString();
         UpdateActiveProjectLabel();
         _suppressProjectSelection = false;
+        RefreshWorkspaceTabStrip();
     }
 
     private void UpdateActiveProjectLabel()
     {
-        _activeProjectLabel.Text = _selectedProject?.Name ?? "프로젝트를 선택하세요";
-        _activeProjectLabel.Foreground = _selectedProject is null ? MutedBrush : TextBrush;
-        _activeProjectLabel.ToolTip = _selectedProject?.FolderPath ?? "왼쪽에서 프로젝트를 선택하세요.";
+        var project = _activeWorkspaceTab?.Kind == WorkspaceTabKind.Empty
+            ? null
+            : _activeWorkspaceTab?.ProjectId is { } projectId
+                ? _projects.FirstOrDefault(item =>
+                    string.Equals(item.Id, projectId, StringComparison.Ordinal))
+                : _selectedProject;
+        _activeProjectLabel.Text = project?.Name ?? "프로젝트 선택";
+        _activeProjectLabel.Foreground = project is null ? MutedBrush : TextBrush;
+        _activeProjectLabel.ToolTip = project?.FolderPath ?? "왼쪽에서 프로젝트를 선택하세요.";
     }
 
     private void SaveProjectSelection() =>
-        _ = ProjectStore.Save(_projects, _selectedProject?.Id);
+        _ = ProjectStore.Save(_projects, _lastSelectedProjectId);
 
     private void UpdateProjectAlertBadge(WorkspaceProject project)
     {
@@ -902,6 +1714,7 @@ public sealed class MainWindow : Window
         label.Text = alertCount.ToString();
         badge.ToolTip = $"미확인 작업 완료 알림 {alertCount}개";
         badge.Visibility = alertCount > 0 ? Visibility.Visible : Visibility.Collapsed;
+        RefreshWorkspaceTabStrip();
     }
 
     private string UniqueProjectName(string requestedName)
@@ -919,26 +1732,33 @@ public sealed class MainWindow : Window
 
     private void AddPowerShellInSelectedProject()
     {
+        if (_activeWorkspaceTab is not { Kind: WorkspaceTabKind.Project, ProjectId: { } projectId } ||
+            _projects.FirstOrDefault(item =>
+                string.Equals(item.Id, projectId, StringComparison.Ordinal)) is not { } project)
+        {
+            TracePowerShellAdd("request ignored because the active tab has no project");
+            return;
+        }
+
+        _selectedProject = project;
+        _lastSelectedProjectId = project.Id;
         TracePowerShellAdd(
-            $"request selected={_selectedProject?.Id ?? "null"} " +
-            $"sessions={(_selectedProject is null ? -1 : SessionsForProject(_selectedProject.Id).Count)}");
-        if (_selectedProject is null && !CreateProject()) return;
-        if (_selectedProject is null) return;
-        if (!Directory.Exists(_selectedProject.FolderPath))
+            $"request selected={project.Id} sessions={SessionsForProject(project.Id).Count}");
+        if (!Directory.Exists(project.FolderPath))
         {
             MessageBox.Show(
                 this,
-                $"프로젝트 폴더를 찾을 수 없습니다.\n{_selectedProject.FolderPath}",
+                $"프로젝트 폴더를 찾을 수 없습니다.\n{project.FolderPath}",
                 "프로젝트",
                 MessageBoxButton.OK,
                 MessageBoxImage.Warning);
             return;
         }
-        EnsureProjectSessionsStarted(_selectedProject);
+        EnsureProjectSessionsStarted(project);
         TracePowerShellAdd(
-            $"after-restore project={_selectedProject.Id} " +
-            $"sessions={SessionsForProject(_selectedProject.Id).Count} saved={_selectedProject.Terminals.Count}");
-        if (SessionsForProject(_selectedProject.Id).Count >= MaximumSessions)
+            $"after-restore project={project.Id} " +
+            $"sessions={SessionsForProject(project.Id).Count} saved={project.Terminals.Count}");
+        if (SessionsForProject(project.Id).Count >= MaximumSessions)
         {
             TracePowerShellAdd("blocked maximum-sessions");
             System.Media.SystemSounds.Beep.Play();
@@ -946,18 +1766,18 @@ public sealed class MainWindow : Window
         }
 
         var terminalNumber = 1;
-        while (_selectedProject.Terminals.Any(state =>
+        while (project.Terminals.Any(state =>
                    string.Equals(state.Name, $"PowerShell {terminalNumber}", StringComparison.CurrentCultureIgnoreCase)))
             terminalNumber++;
         var state = new SavedTerminalState
         {
             Name = $"PowerShell {terminalNumber}",
-            StartDirectory = _selectedProject.FolderPath,
+            StartDirectory = project.FolderPath,
             CreatedAtUtc = DateTimeOffset.UtcNow,
         };
         _maximizedSession = null;
         TracePowerShellAdd($"creating name={state.Name}");
-        AddPowerShell(_selectedProject, state, persistState: true, resumeSavedCli: false, focus: true);
+        AddPowerShell(project, state, persistState: true, resumeSavedCli: false, focus: true);
     }
 
     private void AddPowerShell(
@@ -1598,7 +2418,7 @@ public sealed class MainWindow : Window
 
     private void ScheduleTerminalVisibilityRefresh()
     {
-        if (_selectedProject is null) return;
+        if (_selectedProject is null || _activeWorkspaceTab?.Kind != WorkspaceTabKind.Project) return;
         var projectId = _selectedProject.Id;
         var version = ++_terminalVisibilityRefreshVersion;
         _ = RefreshTerminalVisibilityAsync(projectId, version);
@@ -1611,6 +2431,7 @@ public sealed class MainWindow : Window
         {
             if (delay > 0) await Task.Delay(delay);
             if (version != _terminalVisibilityRefreshVersion ||
+                _activeWorkspaceTab?.Kind != WorkspaceTabKind.Project ||
                 _selectedProject is null ||
                 !string.Equals(_selectedProject.Id, projectId, StringComparison.Ordinal)) return;
 
@@ -2495,12 +3316,14 @@ public sealed class MainWindow : Window
             e.Handled = true;
         }
         else if (Keyboard.Modifiers == (ModifierKeys.Control | ModifierKeys.Shift) &&
-                 e.Key == Key.W && _activeSession is not null)
+                 e.Key == Key.W && _activeWorkspaceTab?.Kind == WorkspaceTabKind.Project &&
+                 _activeSession is not null)
         {
             CloseSession(_activeSession);
             e.Handled = true;
         }
-        else if (Keyboard.Modifiers == ModifierKeys.Alt && e.SystemKey == Key.Enter && _activeSession is not null)
+        else if (Keyboard.Modifiers == ModifierKeys.Alt && e.SystemKey == Key.Enter &&
+                 _activeWorkspaceTab?.Kind == WorkspaceTabKind.Project && _activeSession is not null)
         {
             ToggleMaximize(_activeSession);
             e.Handled = true;
@@ -2521,6 +3344,11 @@ public sealed class MainWindow : Window
         _usageTimer.Stop();
         _completionTimer.Stop();
         _codexCompletionWatcher.Dispose();
+
+        foreach (var browser in _workspaceTabs
+                     .Select(tab => tab.Content)
+                     .OfType<WorkspaceBrowserHost>())
+            browser.Dispose();
 
         if (_windowSource is not null) _ = ShowWindow(_windowSource.Handle, SwHide);
 
@@ -2583,10 +3411,12 @@ public sealed class MainWindow : Window
             case HotkeyAddPowerShell:
                 AddPowerShellInSelectedProject();
                 break;
-            case HotkeyClosePowerShell when _activeSession is not null:
+            case HotkeyClosePowerShell when
+                _activeWorkspaceTab?.Kind == WorkspaceTabKind.Project && _activeSession is not null:
                 CloseSession(_activeSession);
                 break;
-            case HotkeyMaximizePowerShell when _activeSession is not null:
+            case HotkeyMaximizePowerShell when
+                _activeWorkspaceTab?.Kind == WorkspaceTabKind.Project && _activeSession is not null:
                 ToggleMaximize(_activeSession);
                 break;
             default:
