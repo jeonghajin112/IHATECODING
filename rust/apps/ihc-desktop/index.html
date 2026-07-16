@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="stylesheet" href="/assets/main.css" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>IHATECODING Rust Preview</title>
+    <script type="module" src="/assets/main.js" defer></script>
+  </head>
+  <body>
+    <main id="app" class="shell">
+      <header class="toolbar">
+        <span class="brand">IHATECODING</span>
+        <span class="phase">RUST PHASE 1</span>
+        <span class="toolbar-spacer"></span>
+        <button id="start-terminal" type="button">PowerShell 시작</button>
+        <button id="stop-terminal" type="button" disabled>PowerShell 종료</button>
+        <button id="toggle-browser" type="button">브라우저 PoC</button>
+      </header>
+      <section id="terminal-surface" aria-label="Rust ConPTY PowerShell">
+        <div id="terminal"></div>
+      </section>
+      <footer class="statusbar">
+        <span class="backend">RUST · ConPTY</span>
+        <span id="status">초기화 중…</span>
+      </footer>
+    </main>
+  </body>
+</html>

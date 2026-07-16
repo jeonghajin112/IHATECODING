@@ -1,0 +1,21 @@
+{
+  "name": "ihatecoding-rust-preview",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "node scripts/build.mjs --serve",
+    "build": "tsc --noEmit && node scripts/build.mjs",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2",
+    "@xterm/addon-fit": "0.11.0",
+    "@xterm/xterm": "6.1.0-beta.290"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2",
+    "esbuild": "0.28.1",
+    "typescript": "~5.6.2"
+  }
+}
