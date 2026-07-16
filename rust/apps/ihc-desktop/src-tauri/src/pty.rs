@@ -42,6 +42,8 @@ const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
 const OUTPUT_ABORT_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 const RESIZE_COALESCE_WINDOW: Duration = Duration::from_millis(12);
 const WORKER_JOIN_TIMEOUT: Duration = Duration::from_millis(750);
+const SHUTDOWN_COMMAND_TIMEOUT: Duration = Duration::from_secs(8);
+const SHUTDOWN_EXIT_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(
@@ -115,6 +117,19 @@ impl TerminalEventSink for TauriEventSink {
     fn send(&self, event: TerminalEvent) -> Result<(), String> {
         self.0.send(event).map_err(|error| error.to_string())
     }
+}
+
+#[cfg(test)]
+trait StartOwnershipHook: Send + Sync + 'static {
+    fn spawned_before_job_assignment(&self, process_id: Option<u32>);
+}
+
+#[cfg(test)]
+struct NoopStartOwnershipHook;
+
+#[cfg(test)]
+impl StartOwnershipHook for NoopStartOwnershipHook {
+    fn spawned_before_job_assignment(&self, _process_id: Option<u32>) {}
 }
 
 #[derive(Default)]
@@ -469,23 +484,37 @@ struct GlobalOutputBudgetSnapshot {
 #[derive(Clone)]
 pub(crate) struct TerminalManager {
     state: Arc<Mutex<ManagerState>>,
+    state_changed: Arc<Condvar>,
     spawn_limiter: Arc<SpawnLimiter>,
     output_budget: Arc<GlobalOutputBudget>,
     worker_threads: Arc<AtomicUsize>,
+    #[cfg(test)]
+    start_ownership_hook: Arc<dyn StartOwnershipHook>,
 }
 
 impl Default for TerminalManager {
     fn default() -> Self {
         Self {
             state: Arc::new(Mutex::new(ManagerState::default())),
+            state_changed: Arc::new(Condvar::new()),
             spawn_limiter: Arc::new(SpawnLimiter::default()),
             output_budget: Arc::new(GlobalOutputBudget::default()),
             worker_threads: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            start_ownership_hook: Arc::new(NoopStartOwnershipHook),
         }
     }
 }
 
 impl TerminalManager {
+    #[cfg(test)]
+    fn with_start_ownership_hook(hook: Arc<dyn StartOwnershipHook>) -> Self {
+        Self {
+            start_ownership_hook: hook,
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn start(
         &self,
         cwd: Option<String>,
@@ -526,19 +555,16 @@ impl TerminalManager {
             command.cwd(directory);
         }
 
-        let mut child = pair
+        let child = pair
             .slave
             .spawn_command(command)
             .map_err(|error| format!("PowerShell launch failed: {error}"))?;
-        let process_id = child.process_id();
-        let terminator = match ProcessTerminator::from_child(child.as_ref()) {
-            Ok(terminator) => terminator,
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(error);
-            }
-        };
+        let child = SpawnedChildGuard::new(child);
+        let process_id = child.child().process_id();
+        #[cfg(test)]
+        self.start_ownership_hook
+            .spawned_before_job_assignment(process_id);
+        let terminator = ProcessTerminator::from_child(child.child())?;
         drop(pair.slave);
 
         let session = Arc::new(TerminalSession {
@@ -551,7 +577,14 @@ impl TerminalManager {
             resize: Arc::new(ResizeMailbox::default()),
             phase: AtomicU8::new(SessionPhase::Running as u8),
         });
+
+        if let Err(error) = self.ensure_start_pending(&reservation.session_id) {
+            session.abort();
+            return Err(error);
+        }
+
         drop(spawn_permit);
+        let child = child.release();
 
         let mut workers = spawn_workers(
             reservation.session_id.clone(),
@@ -559,7 +592,7 @@ impl TerminalManager {
             reader,
             Arc::clone(&session),
             Arc::clone(&sink),
-            Arc::clone(&self.state),
+            (Arc::clone(&self.state), Arc::clone(&self.state_changed)),
             Arc::clone(&self.worker_threads),
         )?;
 
@@ -629,36 +662,102 @@ impl TerminalManager {
         }
     }
 
-    pub(crate) fn stop_all(&self) {
+    #[cfg(test)]
+    fn shutdown(&self) -> Result<(), String> {
+        self.shutdown_barrier(None)
+    }
+
+    pub(crate) fn shutdown_for_command(&self) -> Result<(), String> {
+        self.shutdown_barrier(Some(Instant::now() + SHUTDOWN_COMMAND_TIMEOUT))
+    }
+
+    pub(crate) fn shutdown_for_exit(&self) -> Result<(), String> {
+        self.shutdown_barrier(Some(Instant::now() + SHUTDOWN_EXIT_TIMEOUT))
+    }
+
+    fn shutdown_barrier(&self, deadline: Option<Instant>) -> Result<(), String> {
+        {
+            let mut state = match self.state.lock() {
+                Ok(state) => state,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            state.lifecycle = ManagerLifecycle::ShuttingDown;
+        }
+
+        // Closing these gates after the lifecycle flip prevents both newly reserved and
+        // limiter-waiting starts from progressing into process creation.
         self.spawn_limiter.close();
         self.output_budget.close();
-        let sessions = match self.state.lock() {
-            Ok(mut state) => {
-                state.lifecycle = ManagerLifecycle::ShuttingDown;
-                std::mem::take(&mut state.sessions)
-                    .into_values()
-                    .filter_map(|entry| match entry {
-                        SessionEntry::Starting => None,
-                        SessionEntry::Active(session) => Some(session),
-                    })
-                    .collect::<Vec<_>>()
+
+        let sessions = {
+            let mut state = match self.state.lock() {
+                Ok(state) => state,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            while state
+                .sessions
+                .values()
+                .any(|entry| matches!(entry, SessionEntry::Starting))
+            {
+                state = self.wait_for_shutdown_progress(state, deadline)?;
             }
-            Err(poisoned) => {
-                let mut state = poisoned.into_inner();
-                state.lifecycle = ManagerLifecycle::ShuttingDown;
-                std::mem::take(&mut state.sessions)
-                    .into_values()
-                    .filter_map(|entry| match entry {
-                        SessionEntry::Starting => None,
-                        SessionEntry::Active(session) => Some(session),
-                    })
-                    .collect::<Vec<_>>()
-            }
+            state
+                .sessions
+                .values()
+                .filter_map(|entry| match entry {
+                    SessionEntry::Starting => None,
+                    SessionEntry::Active(session) => Some(Arc::clone(session)),
+                })
+                .collect::<Vec<_>>()
         };
 
+        let mut termination_error = None;
         for session in sessions {
-            let _ = session.request_stop();
+            if let Err(error) = session.request_stop()
+                && termination_error.is_none()
+            {
+                termination_error = Some(error);
+            }
         }
+
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        while !state.sessions.is_empty() {
+            state = self.wait_for_shutdown_progress(state, deadline)?;
+        }
+        drop(state);
+
+        match termination_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    fn wait_for_shutdown_progress<'a>(
+        &self,
+        state: std::sync::MutexGuard<'a, ManagerState>,
+        deadline: Option<Instant>,
+    ) -> Result<std::sync::MutexGuard<'a, ManagerState>, String> {
+        let Some(deadline) = deadline else {
+            return Ok(match self.state_changed.wait(state) {
+                Ok(state) => state,
+                Err(poisoned) => poisoned.into_inner(),
+            });
+        };
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(
+                "Terminal shutdown did not finish before its safety deadline; force close is now available."
+                    .to_owned(),
+            );
+        }
+        let (state, _) = match self.state_changed.wait_timeout(state, remaining) {
+            Ok(result) => result,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        Ok(state)
     }
 
     pub(crate) fn status(&self) -> TerminalEngineStatus {
@@ -763,9 +862,21 @@ impl TerminalManager {
         drop(state);
         Ok(StartReservation {
             state: Arc::clone(&self.state),
+            state_changed: Arc::clone(&self.state_changed),
             session_id,
             committed: false,
         })
+    }
+
+    fn ensure_start_pending(&self, session_id: &str) -> Result<(), String> {
+        let state = lock(&self.state)?;
+        if state.lifecycle == ManagerLifecycle::Running
+            && matches!(state.sessions.get(session_id), Some(SessionEntry::Starting))
+        {
+            Ok(())
+        } else {
+            Err("Terminal start was cancelled during shutdown.".to_owned())
+        }
     }
 
     fn commit_start(
@@ -813,6 +924,7 @@ impl TerminalManager {
 
 struct StartReservation {
     state: Arc<Mutex<ManagerState>>,
+    state_changed: Arc<Condvar>,
     session_id: String,
     committed: bool,
 }
@@ -830,6 +942,7 @@ impl Drop for StartReservation {
                 poisoned.into_inner().sessions.remove(&self.session_id);
             }
         }
+        self.state_changed.notify_all();
     }
 }
 
@@ -898,6 +1011,7 @@ impl Drop for WorkerThreadGuard {
 }
 
 type WorkerHandleGroup = Arc<Mutex<Option<Vec<JoinHandle<()>>>>>;
+type ManagerRegistry = (Arc<Mutex<ManagerState>>, Arc<Condvar>);
 
 #[derive(Default)]
 struct WorkerJoinSummary {
@@ -936,9 +1050,10 @@ fn spawn_workers(
     mut reader: Box<dyn Read + Send>,
     session: Arc<TerminalSession>,
     sink: Arc<dyn TerminalEventSink>,
-    manager_state: Arc<Mutex<ManagerState>>,
+    manager_registry: ManagerRegistry,
     worker_threads: Arc<AtomicUsize>,
 ) -> Result<WorkerSet, String> {
+    let (manager_state, manager_state_changed) = manager_registry;
     let (reader_start_sender, reader_start_receiver) = mpsc::sync_channel(1);
     let (output_start_sender, output_start_receiver) = mpsc::sync_channel(1);
     let (resize_start_sender, resize_start_receiver) = mpsc::sync_channel(1);
@@ -1141,7 +1256,7 @@ fn spawn_workers(
                     ),
                 });
             }
-            remove_session(&manager_state, &wait_id);
+            remove_session(&manager_state, &manager_state_changed, &wait_id);
             let _ = wait_sink.send(TerminalEvent::Exited {
                 session_id: wait_id,
                 exit_code,
@@ -1169,7 +1284,7 @@ fn spawn_workers(
     })
 }
 
-fn remove_session(state: &Mutex<ManagerState>, session_id: &str) {
+fn remove_session(state: &Mutex<ManagerState>, state_changed: &Condvar, session_id: &str) {
     match state.lock() {
         Ok(mut state) => {
             state.sessions.remove(session_id);
@@ -1178,6 +1293,7 @@ fn remove_session(state: &Mutex<ManagerState>, session_id: &str) {
             poisoned.into_inner().sessions.remove(session_id);
         }
     }
+    state_changed.notify_all();
 }
 
 enum ReaderMessage {
@@ -1741,6 +1857,37 @@ fn same_pty_size(left: PtySize, right: PtySize) -> bool {
         && left.pixel_height == right.pixel_height
 }
 
+struct SpawnedChildGuard {
+    child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
+}
+
+impl SpawnedChildGuard {
+    fn new(child: Box<dyn portable_pty::Child + Send + Sync>) -> Self {
+        Self { child: Some(child) }
+    }
+
+    fn child(&self) -> &(dyn portable_pty::Child + Send + Sync) {
+        self.child
+            .as_deref()
+            .expect("spawned child guard must own its child")
+    }
+
+    fn release(mut self) -> Box<dyn portable_pty::Child + Send + Sync> {
+        self.child
+            .take()
+            .expect("spawned child guard must own its child")
+    }
+}
+
+impl Drop for SpawnedChildGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 #[cfg(windows)]
 struct ProcessTerminator {
     job: Mutex<Option<OwnedHandle>>,
@@ -1940,6 +2087,54 @@ mod tests {
         },
     };
 
+    #[cfg(windows)]
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, WAIT_OBJECT_0},
+        Storage::FileSystem::SYNCHRONIZE,
+        System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, WaitForSingleObject},
+    };
+
+    struct BlockingStartOwnershipHook {
+        spawned: SyncSender<Option<u32>>,
+        release: Mutex<Receiver<()>>,
+    }
+
+    impl StartOwnershipHook for BlockingStartOwnershipHook {
+        fn spawned_before_job_assignment(&self, process_id: Option<u32>) {
+            let _ = self.spawned.send(process_id);
+            let release = match self.release.lock() {
+                Ok(release) => release,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let _ = release.recv();
+        }
+    }
+
+    #[cfg(windows)]
+    fn wait_for_process_exit(process_id: u32, timeout: Duration) -> Result<bool, String> {
+        let handle = unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
+                0,
+                process_id,
+            )
+        };
+        if handle.is_null() {
+            let error = std::io::Error::last_os_error();
+            return if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
+                Ok(true)
+            } else {
+                Err(format!("Could not inspect test child process: {error}"))
+            };
+        }
+        let timeout_ms = timeout.as_millis().min(u128::from(u32::MAX)) as u32;
+        let wait_result = unsafe { WaitForSingleObject(handle, timeout_ms) };
+        unsafe {
+            CloseHandle(handle);
+        }
+        Ok(wait_result == WAIT_OBJECT_0)
+    }
+
     fn test_output_flow(max_batches: usize, max_bytes: usize) -> Arc<OutputFlow> {
         Arc::new(OutputFlow::with_limits(
             max_batches,
@@ -2060,14 +2255,58 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_cancels_reservations_and_rejects_new_starts() {
+    fn shutdown_waits_for_reservations_and_rejects_new_starts() {
         let manager = TerminalManager::default();
         let reservation = manager.reserve_start().expect("reservation should succeed");
-        manager.stop_all();
+        let shutdown_manager = manager.clone();
+        let (done_sender, done_receiver) = mpsc::sync_channel(1);
+        let shutdown = thread::spawn(move || {
+            let result = shutdown_manager.shutdown();
+            let _ = done_sender.send(result);
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while manager.status().accepting_sessions && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(2));
+        }
         assert!(!manager.status().accepting_sessions);
-        assert_eq!(manager.status().active_sessions, 0);
+        assert_eq!(manager.status().starting_sessions, 1);
         assert!(manager.reserve_start().is_err());
+        assert!(
+            done_receiver
+                .recv_timeout(Duration::from_millis(50))
+                .is_err()
+        );
+
         drop(reservation);
+        done_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("shutdown should finish after the reservation drains")
+            .expect("shutdown should succeed");
+        shutdown.join().expect("shutdown thread should finish");
+        assert_eq!(manager.status().active_sessions, 0);
+    }
+
+    #[test]
+    fn bounded_shutdown_times_out_without_reopening_the_start_gate() {
+        let manager = TerminalManager::default();
+        let reservation = manager.reserve_start().expect("reservation should succeed");
+        let started = Instant::now();
+        let error = manager
+            .shutdown_barrier(Some(Instant::now() + Duration::from_millis(40)))
+            .unwrap_err();
+
+        assert!(error.contains("force close"));
+        assert!(started.elapsed() >= Duration::from_millis(30));
+        assert!(!manager.status().accepting_sessions);
+        assert!(manager.reserve_start().is_err());
+        assert_eq!(manager.status().starting_sessions, 1);
+
+        drop(reservation);
+        manager
+            .shutdown()
+            .expect("idempotent fallback shutdown should drain");
+        assert_eq!(manager.status().active_sessions, 0);
     }
 
     #[test]
@@ -2246,6 +2485,67 @@ mod tests {
         assert_eq!(manager.status().active_sessions, 0);
         assert_eq!(manager.status().spawning_sessions, 0);
         assert_eq!(manager.status().worker_threads, 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shutdown_waits_across_spawn_to_job_assignment_and_leaves_no_child() {
+        let (spawned_sender, spawned_receiver) = mpsc::sync_channel(1);
+        let (release_sender, release_receiver) = mpsc::sync_channel(1);
+        let manager =
+            TerminalManager::with_start_ownership_hook(Arc::new(BlockingStartOwnershipHook {
+                spawned: spawned_sender,
+                release: Mutex::new(release_receiver),
+            }));
+        let start_manager = manager.clone();
+        let starter = thread::spawn(move || {
+            start_manager.start_with_sink(None, 80, 24, Arc::new(RecordingSink::default()))
+        });
+
+        let observed_process = spawned_receiver.recv_timeout(Duration::from_secs(8));
+        let process_id = match observed_process {
+            Ok(process_id) => process_id,
+            Err(error) => {
+                let _ = release_sender.send(());
+                let start_result = starter.join();
+                panic!("did not reach the pre-ownership hook: {error}; start={start_result:?}");
+            }
+        };
+
+        let shutdown_manager = manager.clone();
+        let shutdown = thread::spawn(move || shutdown_manager.shutdown());
+        let lifecycle_deadline = Instant::now() + Duration::from_secs(1);
+        while manager.status().accepting_sessions && Instant::now() < lifecycle_deadline {
+            thread::sleep(Duration::from_millis(2));
+        }
+        let lifecycle_closed = !manager.status().accepting_sessions;
+        thread::sleep(Duration::from_millis(75));
+        let shutdown_returned_before_ownership = shutdown.is_finished();
+
+        release_sender
+            .send(())
+            .expect("pre-ownership hook should release");
+        let start_result = starter.join().expect("starter should not panic");
+        let shutdown_result = shutdown.join().expect("shutdown should not panic");
+
+        assert!(lifecycle_closed, "shutdown did not close the start gate");
+        assert!(
+            !shutdown_returned_before_ownership,
+            "shutdown returned while the child was still unowned"
+        );
+        assert!(start_result.is_err(), "racing start should be cancelled");
+        shutdown_result.expect("shutdown barrier should complete");
+        let process_id = process_id.expect("PowerShell should expose its process id");
+        assert!(
+            wait_for_process_exit(process_id, Duration::from_secs(5))
+                .expect("test child process status should be readable"),
+            "shutdown left PowerShell process {process_id} running"
+        );
+        let status = manager.status();
+        assert_eq!(status.active_sessions, 0);
+        assert_eq!(status.starting_sessions, 0);
+        assert_eq!(status.spawning_sessions, 0);
+        assert_eq!(status.worker_threads, 0);
     }
 
     #[cfg(windows)]
