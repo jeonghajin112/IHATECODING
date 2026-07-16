@@ -34,13 +34,31 @@ Grok sessions, or replace the C# executable.
 
 ## Phase 2 — terminal engine parity
 
-- extract the terminal manager into a testable Rust crate
+Status: core implementation and packaged 20-pane process smoke completed on
+`agent/rust-migration-phase2`; manual Windows IME, clipboard, scroll behavior,
+and performance gates remain before preview promotion.
+
+- isolate the terminal manager behind injectable sink and lifecycle boundaries;
+  move it to a dedicated crate after the Phase 2 protocol stabilizes
 - support up to 20 concurrent ConPTY sessions
 - add bounded output queues, backpressure, resize coalescing, and clean shutdown
 - reproduce copy/paste, Korean IME, scrollback selection, and clipboard-image
   behavior
 - run fault tests for rapid create/close, CLI crashes, app shutdown, and orphan
   process cleanup
+
+Implemented automated evidence:
+
+- 20 Rust tests, including the camelCase Tauri event contract, real Korean
+  ConPTY round-trip, and 20 real concurrent
+  PowerShell sessions with unique output and complete cleanup
+- 21 frontend protocol/state tests for deterministic layouts, event-contract
+  validation, start cancellation, output sequencing, cumulative ACKs, binary
+  bytes, and clipboard classification
+- release process smoke passed for 20 panes in normal and forced close modes,
+  with zero tracked descendants left after either path
+- session output capped at 1 MiB/32 batches and global unacknowledged output
+  capped at 8 MiB
 
 Exit gate: 20-pane stress test and terminal behavior parity with no orphaned
 Codex, Grok, PowerShell, or Node processes.

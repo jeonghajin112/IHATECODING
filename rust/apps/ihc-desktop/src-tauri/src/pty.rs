@@ -1,15 +1,17 @@
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use serde::Serialize;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     env,
     io::{Read, Write},
     path::PathBuf,
     sync::{
-        Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        Arc, Condvar, Mutex,
+        atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
+        mpsc::{self, Receiver, RecvTimeoutError, SyncSender},
     },
-    thread,
+    thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
 use tauri::ipc::Channel;
 use uuid::Uuid;
@@ -26,8 +28,28 @@ use windows_sys::Win32::System::JobObjects::{
 #[cfg(not(windows))]
 use portable_pty::ChildKiller;
 
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase", tag = "event", content = "data")]
+pub(crate) const MAX_TERMINAL_SESSIONS: usize = 20;
+
+const OUTPUT_READ_BUFFER_BYTES: usize = 16 * 1024;
+const OUTPUT_QUEUE_CAPACITY: usize = 32;
+const OUTPUT_BATCH_MAX_BYTES: usize = 64 * 1024;
+const OUTPUT_BATCH_WINDOW: Duration = Duration::from_millis(8);
+const OUTPUT_MAX_UNACKED_BATCHES: usize = 32;
+const OUTPUT_MAX_UNACKED_BYTES: usize = 1024 * 1024;
+const GLOBAL_OUTPUT_MAX_UNACKED_BYTES: usize = 8 * 1024 * 1024;
+const MAX_CONCURRENT_SPAWNS: usize = 2;
+const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
+const OUTPUT_ABORT_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
+const RESIZE_COALESCE_WINDOW: Duration = Duration::from_millis(12);
+const WORKER_JOIN_TIMEOUT: Duration = Duration::from_millis(750);
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "event",
+    content = "data"
+)]
 pub(crate) enum TerminalEvent {
     Started {
         session_id: String,
@@ -45,25 +67,422 @@ pub(crate) enum TerminalEvent {
     Exited {
         session_id: String,
         exit_code: Option<u32>,
+        last_sequence: Option<u64>,
     },
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct StartTerminalResponse {
     pub(crate) session_id: String,
     pub(crate) process_id: Option<u32>,
 }
 
-struct TerminalSession {
-    master: Mutex<Box<dyn MasterPty + Send>>,
-    writer: Mutex<Box<dyn Write + Send>>,
-    terminator: ProcessTerminator,
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TerminalEngineStatus {
+    pub(crate) active_sessions: usize,
+    pub(crate) starting_sessions: usize,
+    pub(crate) running_sessions: usize,
+    pub(crate) stopping_sessions: usize,
+    pub(crate) draining_sessions: usize,
+    pub(crate) pending_output_batches: usize,
+    pub(crate) pending_output_bytes: usize,
+    pub(crate) pending_resizes: usize,
+    pub(crate) resize_requests: u64,
+    pub(crate) resize_applied: u64,
+    pub(crate) resize_coalesced: u64,
+    pub(crate) spawning_sessions: usize,
+    pub(crate) peak_concurrent_spawns: usize,
+    pub(crate) worker_threads: usize,
+    pub(crate) max_sessions: usize,
+    pub(crate) max_concurrent_spawns: usize,
+    pub(crate) accepting_sessions: bool,
+    pub(crate) output_batch_max_bytes: usize,
+    pub(crate) output_max_unacked_batches: usize,
+    pub(crate) output_max_unacked_bytes: usize,
+    pub(crate) global_output_max_unacked_bytes: usize,
+    pub(crate) peak_global_output_bytes: usize,
 }
 
-#[derive(Clone, Default)]
+trait TerminalEventSink: Send + Sync + 'static {
+    fn send(&self, event: TerminalEvent) -> Result<(), String>;
+}
+
+struct TauriEventSink(Channel<TerminalEvent>);
+
+impl TerminalEventSink for TauriEventSink {
+    fn send(&self, event: TerminalEvent) -> Result<(), String> {
+        self.0.send(event).map_err(|error| error.to_string())
+    }
+}
+
+#[derive(Default)]
+struct WorkerEventGate {
+    closed: Mutex<bool>,
+}
+
+impl WorkerEventGate {
+    fn send(&self, sink: &Arc<dyn TerminalEventSink>, event: TerminalEvent) -> Result<(), String> {
+        let closed = lock(&self.closed)?;
+        if *closed {
+            return Ok(());
+        }
+        // Keep the gate locked through send so close() is a strict event barrier.
+        sink.send(event)
+    }
+
+    fn close(&self) {
+        match self.closed.lock() {
+            Ok(mut closed) => *closed = true,
+            Err(poisoned) => *poisoned.into_inner() = true,
+        }
+    }
+}
+
+struct GatedEventSink {
+    sink: Arc<dyn TerminalEventSink>,
+    gate: Arc<WorkerEventGate>,
+}
+
+impl TerminalEventSink for GatedEventSink {
+    fn send(&self, event: TerminalEvent) -> Result<(), String> {
+        self.gate.send(&self.sink, event)
+    }
+}
+
+struct TerminalIo {
+    master: Mutex<Option<Box<dyn MasterPty + Send>>>,
+    writer: Mutex<Option<Box<dyn Write + Send>>>,
+}
+
+impl TerminalIo {
+    fn write(&self, data: &[u8]) -> Result<(), String> {
+        let mut writer = lock(&self.writer)?;
+        let writer = writer
+            .as_mut()
+            .ok_or_else(|| "Terminal input is already closed.".to_owned())?;
+        write_bytes(writer.as_mut(), data)
+            .map_err(|error| format!("Terminal input failed: {error}"))
+    }
+
+    fn resize(&self, size: PtySize) -> Result<(), String> {
+        let master = lock(&self.master)?;
+        let master = master
+            .as_ref()
+            .ok_or_else(|| "Terminal is already closed.".to_owned())?;
+        master
+            .resize(size)
+            .map_err(|error| format!("Terminal resize failed: {error}"))
+    }
+
+    fn close(&self) {
+        match self.writer.lock() {
+            Ok(mut writer) => {
+                writer.take();
+            }
+            Err(poisoned) => {
+                poisoned.into_inner().take();
+            }
+        }
+        match self.master.lock() {
+            Ok(mut master) => {
+                master.take();
+            }
+            Err(poisoned) => {
+                poisoned.into_inner().take();
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+enum SessionPhase {
+    Running = 0,
+    Stopping = 1,
+    Draining = 2,
+}
+
+impl SessionPhase {
+    fn from_raw(value: u8) -> Self {
+        match value {
+            1 => Self::Stopping,
+            2 => Self::Draining,
+            _ => Self::Running,
+        }
+    }
+}
+
+struct TerminalSession {
+    io: Arc<TerminalIo>,
+    terminator: ProcessTerminator,
+    flow: Arc<OutputFlow>,
+    resize: Arc<ResizeMailbox>,
+    phase: AtomicU8,
+}
+
+impl TerminalSession {
+    fn phase(&self) -> SessionPhase {
+        SessionPhase::from_raw(self.phase.load(Ordering::Acquire))
+    }
+
+    fn ensure_running(&self) -> Result<(), String> {
+        if self.phase() == SessionPhase::Running {
+            Ok(())
+        } else {
+            Err("Terminal session is stopping.".to_owned())
+        }
+    }
+
+    fn request_stop(&self) -> Result<(), String> {
+        match self.phase.compare_exchange(
+            SessionPhase::Running as u8,
+            SessionPhase::Stopping as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                self.resize.close();
+                self.terminator.terminate()
+            }
+            Err(_) => Ok(()),
+        }
+    }
+
+    fn begin_draining(&self) {
+        self.phase
+            .store(SessionPhase::Draining as u8, Ordering::Release);
+        self.resize.close();
+        self.io.close();
+    }
+
+    fn abort(&self) {
+        self.resize.close();
+        self.flow.close();
+        let _ = self.request_stop();
+        self.io.close();
+    }
+}
+
+trait TerminalAbortSignal: Send + Sync + 'static {
+    fn abort_after_sink_failure(&self);
+}
+
+impl TerminalAbortSignal for TerminalSession {
+    fn abort_after_sink_failure(&self) {
+        self.flow.close();
+        let _ = self.request_stop();
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ManagerLifecycle {
+    Running,
+    ShuttingDown,
+}
+
+enum SessionEntry {
+    Starting,
+    Active(Arc<TerminalSession>),
+}
+
+struct ManagerState {
+    lifecycle: ManagerLifecycle,
+    sessions: HashMap<String, SessionEntry>,
+}
+
+impl Default for ManagerState {
+    fn default() -> Self {
+        Self {
+            lifecycle: ManagerLifecycle::Running,
+            sessions: HashMap::new(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct SpawnLimiterState {
+    active: usize,
+    peak: usize,
+    closed: bool,
+}
+
+#[derive(Default)]
+struct SpawnLimiter {
+    state: Mutex<SpawnLimiterState>,
+    available: Condvar,
+}
+
+impl SpawnLimiter {
+    fn acquire(self: &Arc<Self>) -> Result<SpawnPermit, String> {
+        let mut state = lock(&self.state)?;
+        while !state.closed && state.active >= MAX_CONCURRENT_SPAWNS {
+            state = self
+                .available
+                .wait(state)
+                .map_err(|_| "Terminal spawn limiter lock was poisoned.".to_owned())?;
+        }
+        if state.closed {
+            return Err("Terminal engine is shutting down.".to_owned());
+        }
+        state.active += 1;
+        state.peak = state.peak.max(state.active);
+        Ok(SpawnPermit {
+            limiter: Arc::clone(self),
+        })
+    }
+
+    fn close(&self) {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.closed = true;
+        self.available.notify_all();
+    }
+
+    fn snapshot(&self) -> SpawnLimiterSnapshot {
+        let state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        SpawnLimiterSnapshot {
+            active: state.active,
+            peak: state.peak,
+        }
+    }
+}
+
+struct SpawnPermit {
+    limiter: Arc<SpawnLimiter>,
+}
+
+impl Drop for SpawnPermit {
+    fn drop(&mut self) {
+        let mut state = match self.limiter.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.active = state.active.saturating_sub(1);
+        self.limiter.available.notify_one();
+    }
+}
+
+struct SpawnLimiterSnapshot {
+    active: usize,
+    peak: usize,
+}
+
+#[derive(Default)]
+struct GlobalOutputBudgetState {
+    bytes: usize,
+    peak: usize,
+    closed: bool,
+}
+
+struct GlobalOutputBudget {
+    state: Mutex<GlobalOutputBudgetState>,
+    available: Condvar,
+    max_bytes: usize,
+}
+
+impl Default for GlobalOutputBudget {
+    fn default() -> Self {
+        Self::with_limit(GLOBAL_OUTPUT_MAX_UNACKED_BYTES)
+    }
+}
+
+impl GlobalOutputBudget {
+    fn with_limit(max_bytes: usize) -> Self {
+        Self {
+            state: Mutex::new(GlobalOutputBudgetState::default()),
+            available: Condvar::new(),
+            max_bytes: max_bytes.max(1),
+        }
+    }
+
+    fn acquire(&self, bytes: usize, cancelled: &AtomicBool) -> bool {
+        if bytes > self.max_bytes {
+            return false;
+        }
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        while !state.closed
+            && !cancelled.load(Ordering::Acquire)
+            && state.bytes.saturating_add(bytes) > self.max_bytes
+        {
+            state = match self.available.wait(state) {
+                Ok(state) => state,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+        }
+        if state.closed || cancelled.load(Ordering::Acquire) {
+            return false;
+        }
+        state.bytes += bytes;
+        state.peak = state.peak.max(state.bytes);
+        true
+    }
+
+    fn release(&self, bytes: usize) {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.bytes = state.bytes.saturating_sub(bytes);
+        self.available.notify_all();
+    }
+
+    fn close(&self) {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.closed = true;
+        self.available.notify_all();
+    }
+
+    fn notify_all(&self) {
+        self.available.notify_all();
+    }
+
+    fn snapshot(&self) -> GlobalOutputBudgetSnapshot {
+        let state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        GlobalOutputBudgetSnapshot {
+            bytes: state.bytes,
+            peak: state.peak,
+        }
+    }
+}
+
+struct GlobalOutputBudgetSnapshot {
+    bytes: usize,
+    peak: usize,
+}
+
+#[derive(Clone)]
 pub(crate) struct TerminalManager {
-    sessions: Arc<Mutex<HashMap<String, Arc<TerminalSession>>>>,
+    state: Arc<Mutex<ManagerState>>,
+    spawn_limiter: Arc<SpawnLimiter>,
+    output_budget: Arc<GlobalOutputBudget>,
+    worker_threads: Arc<AtomicUsize>,
+}
+
+impl Default for TerminalManager {
+    fn default() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(ManagerState::default())),
+            spawn_limiter: Arc::new(SpawnLimiter::default()),
+            output_budget: Arc::new(GlobalOutputBudget::default()),
+            worker_threads: Arc::new(AtomicUsize::new(0)),
+        }
+    }
 }
 
 impl TerminalManager {
@@ -74,19 +493,32 @@ impl TerminalManager {
         rows: u16,
         on_event: Channel<TerminalEvent>,
     ) -> Result<StartTerminalResponse, String> {
+        self.start_with_sink(cwd, columns, rows, Arc::new(TauriEventSink(on_event)))
+    }
+
+    fn start_with_sink(
+        &self,
+        cwd: Option<String>,
+        columns: u16,
+        rows: u16,
+        sink: Arc<dyn TerminalEventSink>,
+    ) -> Result<StartTerminalResponse, String> {
         let cwd = validate_working_directory(cwd)?;
         let size = normalized_size(columns, rows);
+        let mut reservation = self.reserve_start()?;
+        let spawn_permit = self.spawn_limiter.acquire()?;
+
         let pair = native_pty_system()
             .openpty(size)
-            .map_err(|error| format!("ConPTY 생성 실패: {error}"))?;
-        let mut reader = pair
+            .map_err(|error| format!("ConPTY creation failed: {error}"))?;
+        let reader = pair
             .master
             .try_clone_reader()
-            .map_err(|error| format!("ConPTY 출력 연결 실패: {error}"))?;
+            .map_err(|error| format!("ConPTY output connection failed: {error}"))?;
         let writer = pair
             .master
             .take_writer()
-            .map_err(|error| format!("ConPTY 입력 연결 실패: {error}"))?;
+            .map_err(|error| format!("ConPTY input connection failed: {error}"))?;
 
         let mut command = CommandBuilder::new(resolve_powershell());
         command.args(["-NoLogo", "-NoExit"]);
@@ -97,7 +529,7 @@ impl TerminalManager {
         let mut child = pair
             .slave
             .spawn_command(command)
-            .map_err(|error| format!("PowerShell 실행 실패: {error}"))?;
+            .map_err(|error| format!("PowerShell launch failed: {error}"))?;
         let process_id = child.process_id();
         let terminator = match ProcessTerminator::from_child(child.as_ref()) {
             Ok(terminator) => terminator,
@@ -109,151 +541,46 @@ impl TerminalManager {
         };
         drop(pair.slave);
 
-        let session_id = Uuid::new_v4().simple().to_string();
         let session = Arc::new(TerminalSession {
-            master: Mutex::new(pair.master),
-            writer: Mutex::new(writer),
+            io: Arc::new(TerminalIo {
+                master: Mutex::new(Some(pair.master)),
+                writer: Mutex::new(Some(writer)),
+            }),
             terminator,
+            flow: Arc::new(OutputFlow::new(Arc::clone(&self.output_budget))),
+            resize: Arc::new(ResizeMailbox::default()),
+            phase: AtomicU8::new(SessionPhase::Running as u8),
         });
+        drop(spawn_permit);
 
-        let output_id = session_id.clone();
-        let output_channel = on_event.clone();
-        let (output_start_sender, output_start_receiver) = std::sync::mpsc::sync_channel(1);
-        let (output_done_sender, output_done_receiver) = std::sync::mpsc::sync_channel(1);
-        let output_thread = match thread::Builder::new()
-            .name(format!("ihc-pty-output-{output_id}"))
-            .spawn(move || {
-                if output_start_receiver.recv() != Ok(true) {
-                    return;
-                }
-                let mut decoder = Utf8StreamDecoder::default();
-                let sequence = AtomicU64::new(0);
-                let mut buffer = [0_u8; 16 * 1024];
+        let mut workers = spawn_workers(
+            reservation.session_id.clone(),
+            child,
+            reader,
+            Arc::clone(&session),
+            Arc::clone(&sink),
+            Arc::clone(&self.state),
+            Arc::clone(&self.worker_threads),
+        )?;
 
-                loop {
-                    match reader.read(&mut buffer) {
-                        Ok(0) => {
-                            let tail = decoder.finish();
-                            if !tail.is_empty() {
-                                send_output(&output_channel, &output_id, &sequence, tail);
-                            }
-                            break;
-                        }
-                        Ok(length) => {
-                            let text = decoder.push(&buffer[..length]);
-                            if !text.is_empty() {
-                                send_output(&output_channel, &output_id, &sequence, text);
-                            }
-                        }
-                        Err(error) => {
-                            let _ = output_channel.send(TerminalEvent::Error {
-                                session_id: output_id.clone(),
-                                message: format!("ConPTY 출력 읽기 실패: {error}"),
-                            });
-                            break;
-                        }
-                    }
-                }
-                let _ = output_done_sender.send(());
-            }) {
-            Ok(thread) => thread,
-            Err(error) => return Err(format!("출력 스레드 시작 실패: {error}")),
-        };
-
-        let wait_id = session_id.clone();
-        let wait_channel = on_event.clone();
-        let sessions = Arc::clone(&self.sessions);
-        let (wait_start_sender, wait_start_receiver) = std::sync::mpsc::sync_channel(1);
-        let wait_thread = match thread::Builder::new()
-            .name(format!("ihc-pty-wait-{wait_id}"))
-            .spawn(move || {
-                if wait_start_receiver.recv() != Ok(true) {
-                    return;
-                }
-                let result = child.wait();
-                let exit_code = result.as_ref().ok().map(|status| status.exit_code());
-                match sessions.lock() {
-                    Ok(mut sessions) => {
-                        sessions.remove(&wait_id);
-                    }
-                    Err(poisoned) => {
-                        poisoned.into_inner().remove(&wait_id);
-                    }
-                }
-                if output_done_receiver.recv().is_err() {
-                    let _ = wait_channel.send(TerminalEvent::Error {
-                        session_id: wait_id.clone(),
-                        message: "ConPTY output thread stopped before draining output".to_owned(),
-                    });
-                }
-                if let Err(error) = result {
-                    let _ = wait_channel.send(TerminalEvent::Error {
-                        session_id: wait_id.clone(),
-                        message: format!("PowerShell 종료 대기 실패: {error}"),
-                    });
-                }
-                let _ = wait_channel.send(TerminalEvent::Exited {
-                    session_id: wait_id.clone(),
-                    exit_code,
-                });
-            }) {
-            Ok(thread) => thread,
-            Err(error) => {
-                let _ = output_start_sender.send(false);
-                let _ = session.terminator.terminate();
-                drop(session);
-                let _ = output_thread.join();
-                return Err(format!("종료 감시 스레드 시작 실패: {error}"));
-            }
-        };
-
-        let registration = self.sessions.lock().map(|mut sessions| {
-            sessions.insert(session_id.clone(), Arc::clone(&session));
-        });
-        if registration.is_err() {
-            let _ = output_start_sender.send(false);
-            let _ = wait_start_sender.send(false);
-            let _ = session.terminator.terminate();
-            drop(session);
-            let _ = output_thread.join();
-            let _ = wait_thread.join();
-            return Err("터미널 상태 잠금이 손상되었습니다.".to_owned());
-        }
-
-        if let Err(error) = on_event.send(TerminalEvent::Started {
-            session_id: session_id.clone(),
+        let commit_result = self.commit_start(
+            &reservation.session_id,
+            Arc::clone(&session),
+            &sink,
             process_id,
-        }) {
-            if let Ok(mut sessions) = self.sessions.lock() {
-                sessions.remove(&session_id);
-            }
-            let _ = output_start_sender.send(false);
-            let _ = wait_start_sender.send(false);
-            let _ = session.terminator.terminate();
-            drop(session);
-            let _ = output_thread.join();
-            let _ = wait_thread.join();
-            return Err(format!("터미널 시작 이벤트 전송 실패: {error}"));
+            &mut workers,
+        );
+        if let Err(error) = commit_result {
+            session.abort();
+            workers.abort();
+            return Err(error);
         }
 
-        let output_started = output_start_sender.send(true);
-        let wait_started = wait_start_sender.send(true);
-        if output_started.is_err() || wait_started.is_err() {
-            if let Ok(mut sessions) = self.sessions.lock() {
-                sessions.remove(&session_id);
-            }
-            let _ = session.terminator.terminate();
-            drop(session);
-            let _ = output_thread.join();
-            let _ = wait_thread.join();
-            return Err("터미널 작업 스레드를 시작하지 못했습니다.".to_owned());
-        }
-
-        drop(output_thread);
-        drop(wait_thread);
+        reservation.committed = true;
+        workers.release_reaper();
 
         Ok(StartTerminalResponse {
-            session_id,
+            session_id: reservation.session_id.clone(),
             process_id,
         })
     }
@@ -263,49 +590,1160 @@ impl TerminalManager {
             return Ok(());
         }
         let session = self.session(session_id)?;
-        let mut writer = lock(&session.writer)?;
-        writer
-            .write_all(data)
-            .and_then(|_| writer.flush())
-            .map_err(|error| format!("터미널 입력 실패: {error}"))
+        session.ensure_running()?;
+        session.io.write(data)
     }
 
     pub(crate) fn resize(&self, session_id: &str, columns: u16, rows: u16) -> Result<(), String> {
         let session = self.session(session_id)?;
-        lock(&session.master)?
-            .resize(normalized_size(columns, rows))
-            .map_err(|error| format!("터미널 크기 변경 실패: {error}"))
+        session.ensure_running()?;
+        session.resize.queue(normalized_size(columns, rows))
+    }
+
+    pub(crate) fn acknowledge_output(&self, session_id: &str, sequence: u64) -> Result<(), String> {
+        let session = {
+            let state = lock(&self.state)?;
+            match state.sessions.get(session_id) {
+                Some(SessionEntry::Active(session)) => Some(Arc::clone(session)),
+                _ => None,
+            }
+        };
+        if let Some(session) = session {
+            session.flow.acknowledge(sequence);
+        }
+        // ACKs may race the final Exited event, so an unknown session is intentionally idempotent.
+        Ok(())
     }
 
     pub(crate) fn stop(&self, session_id: &str) -> Result<(), String> {
-        let session = lock(&self.sessions)?.remove(session_id);
-        let Some(session) = session else {
-            return Ok(());
+        let session = {
+            let state = lock(&self.state)?;
+            match state.sessions.get(session_id) {
+                Some(SessionEntry::Active(session)) => Some(Arc::clone(session)),
+                _ => None,
+            }
         };
-        session.terminator.terminate()
-    }
-
-    pub(crate) fn stop_all(&self) {
-        let sessions = match self.sessions.lock() {
-            Ok(mut guard) => std::mem::take(&mut *guard),
-            Err(_) => return,
-        };
-        for session in sessions.into_values() {
-            let _ = session.terminator.terminate();
+        match session {
+            Some(session) => session.request_stop(),
+            None => Ok(()),
         }
     }
 
-    fn session(&self, session_id: &str) -> Result<Arc<TerminalSession>, String> {
-        lock(&self.sessions)?
-            .get(session_id)
-            .cloned()
-            .ok_or_else(|| "터미널 세션을 찾을 수 없습니다.".to_owned())
+    pub(crate) fn stop_all(&self) {
+        self.spawn_limiter.close();
+        self.output_budget.close();
+        let sessions = match self.state.lock() {
+            Ok(mut state) => {
+                state.lifecycle = ManagerLifecycle::ShuttingDown;
+                std::mem::take(&mut state.sessions)
+                    .into_values()
+                    .filter_map(|entry| match entry {
+                        SessionEntry::Starting => None,
+                        SessionEntry::Active(session) => Some(session),
+                    })
+                    .collect::<Vec<_>>()
+            }
+            Err(poisoned) => {
+                let mut state = poisoned.into_inner();
+                state.lifecycle = ManagerLifecycle::ShuttingDown;
+                std::mem::take(&mut state.sessions)
+                    .into_values()
+                    .filter_map(|entry| match entry {
+                        SessionEntry::Starting => None,
+                        SessionEntry::Active(session) => Some(session),
+                    })
+                    .collect::<Vec<_>>()
+            }
+        };
+
+        for session in sessions {
+            let _ = session.request_stop();
+        }
     }
+
+    pub(crate) fn status(&self) -> TerminalEngineStatus {
+        let (lifecycle, entries) = match self.state.lock() {
+            Ok(state) => (
+                state.lifecycle,
+                state
+                    .sessions
+                    .values()
+                    .map(|entry| match entry {
+                        SessionEntry::Starting => None,
+                        SessionEntry::Active(session) => Some(Arc::clone(session)),
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            Err(poisoned) => {
+                let state = poisoned.into_inner();
+                (
+                    state.lifecycle,
+                    state
+                        .sessions
+                        .values()
+                        .map(|entry| match entry {
+                            SessionEntry::Starting => None,
+                            SessionEntry::Active(session) => Some(Arc::clone(session)),
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            }
+        };
+
+        let active_sessions = entries.len();
+        let starting_sessions = entries.iter().filter(|entry| entry.is_none()).count();
+        let mut running_sessions = 0;
+        let mut stopping_sessions = 0;
+        let mut draining_sessions = 0;
+        let mut pending_output_batches = 0;
+        let mut pending_resizes = 0;
+        let mut resize_requests = 0;
+        let mut resize_applied = 0;
+        let mut resize_coalesced = 0;
+
+        for session in entries.into_iter().flatten() {
+            match session.phase() {
+                SessionPhase::Running => running_sessions += 1,
+                SessionPhase::Stopping => stopping_sessions += 1,
+                SessionPhase::Draining => draining_sessions += 1,
+            }
+            let output = session.flow.snapshot();
+            pending_output_batches += output.batches;
+            let resize = session.resize.snapshot();
+            pending_resizes += usize::from(resize.pending);
+            resize_requests += resize.requested;
+            resize_applied += resize.applied;
+            resize_coalesced += resize.coalesced;
+        }
+
+        let spawn = self.spawn_limiter.snapshot();
+        let global_output = self.output_budget.snapshot();
+
+        TerminalEngineStatus {
+            active_sessions,
+            starting_sessions,
+            running_sessions,
+            stopping_sessions,
+            draining_sessions,
+            pending_output_batches,
+            pending_output_bytes: global_output.bytes,
+            pending_resizes,
+            resize_requests,
+            resize_applied,
+            resize_coalesced,
+            spawning_sessions: spawn.active,
+            peak_concurrent_spawns: spawn.peak,
+            worker_threads: self.worker_threads.load(Ordering::Acquire),
+            max_sessions: MAX_TERMINAL_SESSIONS,
+            max_concurrent_spawns: MAX_CONCURRENT_SPAWNS,
+            accepting_sessions: lifecycle == ManagerLifecycle::Running
+                && active_sessions < MAX_TERMINAL_SESSIONS,
+            output_batch_max_bytes: OUTPUT_BATCH_MAX_BYTES,
+            output_max_unacked_batches: OUTPUT_MAX_UNACKED_BATCHES,
+            output_max_unacked_bytes: OUTPUT_MAX_UNACKED_BYTES,
+            global_output_max_unacked_bytes: GLOBAL_OUTPUT_MAX_UNACKED_BYTES,
+            peak_global_output_bytes: global_output.peak,
+        }
+    }
+
+    fn reserve_start(&self) -> Result<StartReservation, String> {
+        let mut state = lock(&self.state)?;
+        if state.lifecycle != ManagerLifecycle::Running {
+            return Err("Terminal engine is shutting down.".to_owned());
+        }
+        if state.sessions.len() >= MAX_TERMINAL_SESSIONS {
+            return Err(format!(
+                "Terminal session limit reached ({MAX_TERMINAL_SESSIONS})."
+            ));
+        }
+        let session_id = Uuid::new_v4().simple().to_string();
+        state
+            .sessions
+            .insert(session_id.clone(), SessionEntry::Starting);
+        drop(state);
+        Ok(StartReservation {
+            state: Arc::clone(&self.state),
+            session_id,
+            committed: false,
+        })
+    }
+
+    fn commit_start(
+        &self,
+        session_id: &str,
+        session: Arc<TerminalSession>,
+        sink: &Arc<dyn TerminalEventSink>,
+        process_id: Option<u32>,
+        workers: &mut WorkerSet,
+    ) -> Result<(), String> {
+        let mut state = lock(&self.state)?;
+        if state.lifecycle != ManagerLifecycle::Running
+            || !matches!(state.sessions.get(session_id), Some(SessionEntry::Starting))
+        {
+            return Err("Terminal start was cancelled during shutdown.".to_owned());
+        }
+
+        state
+            .sessions
+            .insert(session_id.to_owned(), SessionEntry::Active(session));
+
+        if let Err(error) = sink.send(TerminalEvent::Started {
+            session_id: session_id.to_owned(),
+            process_id,
+        }) {
+            state.sessions.remove(session_id);
+            return Err(format!("Terminal started event failed: {error}"));
+        }
+
+        if let Err(error) = workers.signal_start() {
+            state.sessions.remove(session_id);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn session(&self, session_id: &str) -> Result<Arc<TerminalSession>, String> {
+        let state = lock(&self.state)?;
+        match state.sessions.get(session_id) {
+            Some(SessionEntry::Active(session)) => Ok(Arc::clone(session)),
+            _ => Err("Terminal session was not found.".to_owned()),
+        }
+    }
+}
+
+struct StartReservation {
+    state: Arc<Mutex<ManagerState>>,
+    session_id: String,
+    committed: bool,
+}
+
+impl Drop for StartReservation {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        match self.state.lock() {
+            Ok(mut state) => {
+                state.sessions.remove(&self.session_id);
+            }
+            Err(poisoned) => {
+                poisoned.into_inner().sessions.remove(&self.session_id);
+            }
+        }
+    }
+}
+
+struct WorkerSet {
+    reader_start: Option<SyncSender<bool>>,
+    output_start: Option<SyncSender<bool>>,
+    resize_start: Option<SyncSender<bool>>,
+    wait_start: Option<SyncSender<bool>>,
+    reaper: Option<JoinHandle<()>>,
+}
+
+impl WorkerSet {
+    fn signal_start(&mut self) -> Result<(), String> {
+        send_gate(&mut self.output_start, true, "output dispatcher")?;
+        send_gate(&mut self.resize_start, true, "resize worker")?;
+        send_gate(&mut self.reader_start, true, "PTY reader")?;
+        send_gate(&mut self.wait_start, true, "process waiter")?;
+        Ok(())
+    }
+
+    fn abort(&mut self) {
+        let _ = send_gate(&mut self.output_start, false, "output dispatcher");
+        let _ = send_gate(&mut self.resize_start, false, "resize worker");
+        let _ = send_gate(&mut self.reader_start, false, "PTY reader");
+        let _ = send_gate(&mut self.wait_start, false, "process waiter");
+        if let Some(handle) = self.reaper.take() {
+            let _ = handle.join();
+        }
+    }
+
+    fn release_reaper(mut self) {
+        // The reaper owns and joins every reader/output/resize worker. Its own handle
+        // cannot be joined from inside itself and is safe to release after commit.
+        self.reaper.take();
+    }
+}
+
+fn send_gate(
+    sender: &mut Option<SyncSender<bool>>,
+    value: bool,
+    worker: &str,
+) -> Result<(), String> {
+    let Some(sender) = sender.take() else {
+        return Ok(());
+    };
+    sender
+        .send(value)
+        .map_err(|_| format!("{worker} could not be started."))
+}
+
+struct WorkerThreadGuard {
+    counter: Arc<AtomicUsize>,
+}
+
+impl WorkerThreadGuard {
+    fn enter(counter: Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::AcqRel);
+        Self { counter }
+    }
+}
+
+impl Drop for WorkerThreadGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+type WorkerHandleGroup = Arc<Mutex<Option<Vec<JoinHandle<()>>>>>;
+
+#[derive(Default)]
+struct WorkerJoinSummary {
+    unfinished: usize,
+    panicked: usize,
+}
+
+fn join_worker_group(group: &WorkerHandleGroup, timeout: Duration) -> WorkerJoinSummary {
+    let mut handles = match group.lock() {
+        Ok(mut handles) => handles.take().unwrap_or_default(),
+        Err(poisoned) => poisoned.into_inner().take().unwrap_or_default(),
+    };
+    let deadline = Instant::now() + timeout;
+    while handles.iter().any(|handle| !handle.is_finished()) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(2));
+    }
+
+    let mut summary = WorkerJoinSummary::default();
+    for handle in handles.drain(..) {
+        if handle.is_finished() {
+            if handle.join().is_err() {
+                summary.panicked += 1;
+            }
+        } else {
+            // The event gate is closed before this path, so a tardy worker cannot emit
+            // Output/Error after Exited. Dropping avoids an unbounded app-exit wait.
+            summary.unfinished += 1;
+        }
+    }
+    summary
+}
+
+fn spawn_workers(
+    session_id: String,
+    mut child: Box<dyn portable_pty::Child + Send + Sync>,
+    mut reader: Box<dyn Read + Send>,
+    session: Arc<TerminalSession>,
+    sink: Arc<dyn TerminalEventSink>,
+    manager_state: Arc<Mutex<ManagerState>>,
+    worker_threads: Arc<AtomicUsize>,
+) -> Result<WorkerSet, String> {
+    let (reader_start_sender, reader_start_receiver) = mpsc::sync_channel(1);
+    let (output_start_sender, output_start_receiver) = mpsc::sync_channel(1);
+    let (resize_start_sender, resize_start_receiver) = mpsc::sync_channel(1);
+    let (wait_start_sender, wait_start_receiver) = mpsc::sync_channel(1);
+    let (raw_sender, raw_receiver) = mpsc::sync_channel(OUTPUT_QUEUE_CAPACITY);
+    let (output_done_sender, output_done_receiver) = mpsc::sync_channel(1);
+    let event_gate = Arc::new(WorkerEventGate::default());
+    let worker_sink: Arc<dyn TerminalEventSink> = Arc::new(GatedEventSink {
+        sink: Arc::clone(&sink),
+        gate: Arc::clone(&event_gate),
+    });
+    let mut handles = Vec::with_capacity(3);
+
+    let reader_id = session_id.clone();
+    let reader_counter = Arc::clone(&worker_threads);
+    let reader_handle = match thread::Builder::new()
+        .name(format!("ihc-pty-reader-{reader_id}"))
+        .spawn(move || {
+            let _worker = WorkerThreadGuard::enter(reader_counter);
+            if reader_start_receiver.recv() != Ok(true) {
+                return;
+            }
+            let mut buffer = [0_u8; OUTPUT_READ_BUFFER_BYTES];
+            loop {
+                match reader.read(&mut buffer) {
+                    Ok(0) => {
+                        let _ = raw_sender.send(ReaderMessage::Eof);
+                        break;
+                    }
+                    Ok(length) => {
+                        if raw_sender
+                            .send(ReaderMessage::Bytes(buffer[..length].to_vec()))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = raw_sender.send(ReaderMessage::Error(format!(
+                            "ConPTY output read failed: {error}"
+                        )));
+                        break;
+                    }
+                }
+            }
+        }) {
+        Ok(handle) => handle,
+        Err(error) => {
+            session.abort();
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("PTY reader thread failed to start: {error}"));
+        }
+    };
+    handles.push(reader_handle);
+
+    let output_id = session_id.clone();
+    let output_sink = Arc::clone(&worker_sink);
+    let output_flow = Arc::clone(&session.flow);
+    let output_abort: Arc<dyn TerminalAbortSignal> = session.clone();
+    let output_counter = Arc::clone(&worker_threads);
+    let output_handle = match thread::Builder::new()
+        .name(format!("ihc-pty-output-{output_id}"))
+        .spawn(move || {
+            let _worker = WorkerThreadGuard::enter(output_counter);
+            run_output_dispatcher(
+                output_id,
+                raw_receiver,
+                output_start_receiver,
+                output_done_sender,
+                output_sink,
+                output_flow,
+                output_abort,
+            );
+        }) {
+        Ok(handle) => handle,
+        Err(error) => {
+            let _ = reader_start_sender.send(false);
+            session.abort();
+            let _ = child.kill();
+            let _ = child.wait();
+            for handle in handles {
+                let _ = handle.join();
+            }
+            return Err(format!("Output dispatcher thread failed to start: {error}"));
+        }
+    };
+    handles.push(output_handle);
+
+    let resize_id = session_id.clone();
+    let resize_sink = Arc::clone(&worker_sink);
+    let resize_session = Arc::clone(&session);
+    let resize_mailbox = Arc::clone(&session.resize);
+    let resize_io = Arc::clone(&session.io);
+    let resize_counter = Arc::clone(&worker_threads);
+    let resize_handle = match thread::Builder::new()
+        .name(format!("ihc-pty-resize-{resize_id}"))
+        .spawn(move || {
+            let _worker = WorkerThreadGuard::enter(resize_counter);
+            if resize_start_receiver.recv() != Ok(true) {
+                return;
+            }
+            while let Some(size) = resize_mailbox.take_latest() {
+                match resize_io.resize(size) {
+                    Ok(()) => resize_mailbox.mark_applied(size),
+                    Err(message) => {
+                        if resize_sink
+                            .send(TerminalEvent::Error {
+                                session_id: resize_id.clone(),
+                                message,
+                            })
+                            .is_err()
+                        {
+                            resize_session.abort_after_sink_failure();
+                            break;
+                        }
+                    }
+                }
+            }
+        }) {
+        Ok(handle) => handle,
+        Err(error) => {
+            let _ = reader_start_sender.send(false);
+            let _ = output_start_sender.send(false);
+            session.abort();
+            let _ = child.kill();
+            let _ = child.wait();
+            for handle in handles {
+                let _ = handle.join();
+            }
+            return Err(format!("Resize worker thread failed to start: {error}"));
+        }
+    };
+    handles.push(resize_handle);
+
+    let worker_group: WorkerHandleGroup = Arc::new(Mutex::new(Some(handles)));
+    let wait_worker_group = Arc::clone(&worker_group);
+    let wait_id = session_id.clone();
+    let wait_sink = Arc::clone(&sink);
+    let wait_session = Arc::clone(&session);
+    let wait_event_gate = Arc::clone(&event_gate);
+    let wait_handle = match thread::Builder::new()
+        .name(format!("ihc-pty-wait-{wait_id}"))
+        .spawn(move || {
+            if wait_start_receiver.recv() != Ok(true) {
+                wait_event_gate.close();
+                let _ = join_worker_group(&wait_worker_group, WORKER_JOIN_TIMEOUT);
+                return;
+            }
+
+            let result = child.wait();
+            let exit_code = result.as_ref().ok().map(|status| status.exit_code());
+            wait_session.begin_draining();
+
+            let first_drain = output_done_receiver.recv_timeout(OUTPUT_DRAIN_TIMEOUT);
+            let mut drained = first_drain.is_ok();
+            let mut last_sequence = first_drain.ok().flatten();
+            if !drained {
+                wait_session.flow.close();
+                let _ = wait_sink.send(TerminalEvent::Error {
+                    session_id: wait_id.clone(),
+                    message: format!(
+                        "Terminal output drain exceeded {} ms; remaining output was discarded.",
+                        OUTPUT_DRAIN_TIMEOUT.as_millis()
+                    ),
+                });
+                if let Ok(sequence) = output_done_receiver.recv_timeout(OUTPUT_ABORT_DRAIN_TIMEOUT)
+                {
+                    drained = true;
+                    last_sequence = sequence;
+                }
+            }
+
+            last_sequence = last_sequence.or_else(|| wait_session.flow.last_sent_sequence());
+            wait_session.flow.close();
+
+            // This is the strict worker-event barrier. Once closed, a tardy resize/output
+            // worker cannot publish anything after the terminal's final Exited event.
+            wait_event_gate.close();
+            let joins = join_worker_group(&wait_worker_group, WORKER_JOIN_TIMEOUT);
+
+            if let Err(error) = result {
+                let _ = wait_sink.send(TerminalEvent::Error {
+                    session_id: wait_id.clone(),
+                    message: format!("PowerShell wait failed: {error}"),
+                });
+            }
+            if !drained {
+                let _ = wait_sink.send(TerminalEvent::Error {
+                    session_id: wait_id.clone(),
+                    message: "Terminal output worker did not stop before its deadline.".to_owned(),
+                });
+            }
+            if joins.unfinished > 0 || joins.panicked > 0 {
+                let _ = wait_sink.send(TerminalEvent::Error {
+                    session_id: wait_id.clone(),
+                    message: format!(
+                        "Terminal worker cleanup was incomplete (unfinished: {}, panicked: {}).",
+                        joins.unfinished, joins.panicked
+                    ),
+                });
+            }
+            remove_session(&manager_state, &wait_id);
+            let _ = wait_sink.send(TerminalEvent::Exited {
+                session_id: wait_id,
+                exit_code,
+                last_sequence,
+            });
+        }) {
+        Ok(handle) => handle,
+        Err(error) => {
+            let _ = reader_start_sender.send(false);
+            let _ = output_start_sender.send(false);
+            let _ = resize_start_sender.send(false);
+            event_gate.close();
+            session.abort();
+            let _ = join_worker_group(&worker_group, WORKER_JOIN_TIMEOUT);
+            return Err(format!("Process waiter thread failed to start: {error}"));
+        }
+    };
+
+    Ok(WorkerSet {
+        reader_start: Some(reader_start_sender),
+        output_start: Some(output_start_sender),
+        resize_start: Some(resize_start_sender),
+        wait_start: Some(wait_start_sender),
+        reaper: Some(wait_handle),
+    })
+}
+
+fn remove_session(state: &Mutex<ManagerState>, session_id: &str) {
+    match state.lock() {
+        Ok(mut state) => {
+            state.sessions.remove(session_id);
+        }
+        Err(poisoned) => {
+            poisoned.into_inner().sessions.remove(session_id);
+        }
+    }
+}
+
+enum ReaderMessage {
+    Bytes(Vec<u8>),
+    Error(String),
+    Eof,
+}
+
+fn run_output_dispatcher(
+    session_id: String,
+    receiver: Receiver<ReaderMessage>,
+    start: Receiver<bool>,
+    done: SyncSender<Option<u64>>,
+    sink: Arc<dyn TerminalEventSink>,
+    flow: Arc<OutputFlow>,
+    abort: Arc<dyn TerminalAbortSignal>,
+) {
+    let mut done = OutputDoneSignal::new(done);
+    if start.recv() != Ok(true) {
+        return;
+    }
+
+    let mut decoder = Utf8StreamDecoder::default();
+    let mut batcher = OutputBatcher::new(OUTPUT_BATCH_MAX_BYTES);
+    let mut deadline: Option<Instant> = None;
+    let mut sequence = 0_u64;
+    let mut sink_connected = true;
+
+    loop {
+        let message = match deadline {
+            Some(batch_deadline) => {
+                let timeout = batch_deadline.saturating_duration_since(Instant::now());
+                match receiver.recv_timeout(timeout) {
+                    Ok(message) => Some(message),
+                    Err(RecvTimeoutError::Timeout) => {
+                        if let Some(batch) = batcher.flush() {
+                            emit_output(
+                                &session_id,
+                                &sink,
+                                &flow,
+                                &abort,
+                                &mut sequence,
+                                &mut sink_connected,
+                                batch,
+                            );
+                        }
+                        deadline = None;
+                        continue;
+                    }
+                    Err(RecvTimeoutError::Disconnected) => None,
+                }
+            }
+            None => receiver.recv().ok(),
+        };
+
+        match message {
+            Some(ReaderMessage::Bytes(bytes)) => {
+                let pending_was_empty = batcher.is_empty();
+                let text = decoder.push(&bytes);
+                for batch in batcher.push(&text) {
+                    emit_output(
+                        &session_id,
+                        &sink,
+                        &flow,
+                        &abort,
+                        &mut sequence,
+                        &mut sink_connected,
+                        batch,
+                    );
+                }
+                if batcher.is_empty() {
+                    deadline = None;
+                } else if pending_was_empty || deadline.is_none() {
+                    deadline = Some(Instant::now() + OUTPUT_BATCH_WINDOW);
+                }
+            }
+            Some(ReaderMessage::Error(message)) => {
+                let tail = decoder.finish();
+                for batch in batcher.push(&tail) {
+                    emit_output(
+                        &session_id,
+                        &sink,
+                        &flow,
+                        &abort,
+                        &mut sequence,
+                        &mut sink_connected,
+                        batch,
+                    );
+                }
+                if let Some(batch) = batcher.flush() {
+                    emit_output(
+                        &session_id,
+                        &sink,
+                        &flow,
+                        &abort,
+                        &mut sequence,
+                        &mut sink_connected,
+                        batch,
+                    );
+                }
+                if sink_connected
+                    && sink
+                        .send(TerminalEvent::Error {
+                            session_id: session_id.clone(),
+                            message,
+                        })
+                        .is_err()
+                {
+                    flow.close();
+                    abort.abort_after_sink_failure();
+                }
+                break;
+            }
+            Some(ReaderMessage::Eof) | None => {
+                let tail = decoder.finish();
+                for batch in batcher.push(&tail) {
+                    emit_output(
+                        &session_id,
+                        &sink,
+                        &flow,
+                        &abort,
+                        &mut sequence,
+                        &mut sink_connected,
+                        batch,
+                    );
+                }
+                if let Some(batch) = batcher.flush() {
+                    emit_output(
+                        &session_id,
+                        &sink,
+                        &flow,
+                        &abort,
+                        &mut sequence,
+                        &mut sink_connected,
+                        batch,
+                    );
+                }
+                break;
+            }
+        }
+    }
+    done.complete(sequence.checked_sub(1));
+}
+
+fn emit_output(
+    session_id: &str,
+    sink: &Arc<dyn TerminalEventSink>,
+    flow: &OutputFlow,
+    abort: &Arc<dyn TerminalAbortSignal>,
+    sequence: &mut u64,
+    sink_connected: &mut bool,
+    data: String,
+) {
+    if data.is_empty() || !*sink_connected {
+        return;
+    }
+    let current_sequence = *sequence;
+    if !flow.reserve(current_sequence, data.len()) {
+        return;
+    }
+    if sink
+        .send(TerminalEvent::Output {
+            session_id: session_id.to_owned(),
+            sequence: current_sequence,
+            data,
+        })
+        .is_ok()
+    {
+        flow.mark_sent(current_sequence);
+        *sequence = sequence.wrapping_add(1);
+    } else {
+        *sink_connected = false;
+        flow.close();
+        abort.abort_after_sink_failure();
+    }
+}
+
+struct OutputDoneSignal {
+    sender: Option<SyncSender<Option<u64>>>,
+    last_sequence: Option<u64>,
+}
+
+impl OutputDoneSignal {
+    fn new(sender: SyncSender<Option<u64>>) -> Self {
+        Self {
+            sender: Some(sender),
+            last_sequence: None,
+        }
+    }
+
+    fn complete(&mut self, last_sequence: Option<u64>) {
+        self.last_sequence = last_sequence;
+    }
+}
+
+impl Drop for OutputDoneSignal {
+    fn drop(&mut self) {
+        if let Some(sender) = self.sender.take() {
+            let _ = sender.send(self.last_sequence);
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct OutstandingBatch {
+    sequence: u64,
+    bytes: usize,
+}
+
+struct OutputFlowState {
+    unacked: VecDeque<OutstandingBatch>,
+    bytes: usize,
+    last_sent_sequence: Option<u64>,
+    closed: bool,
+}
+
+struct OutputFlow {
+    state: Mutex<OutputFlowState>,
+    available: Condvar,
+    max_batches: usize,
+    max_bytes: usize,
+    global: Arc<GlobalOutputBudget>,
+    closed: AtomicBool,
+}
+
+impl OutputFlow {
+    fn new(global: Arc<GlobalOutputBudget>) -> Self {
+        Self::with_limits(OUTPUT_MAX_UNACKED_BATCHES, OUTPUT_MAX_UNACKED_BYTES, global)
+    }
+
+    fn with_limits(max_batches: usize, max_bytes: usize, global: Arc<GlobalOutputBudget>) -> Self {
+        Self {
+            state: Mutex::new(OutputFlowState {
+                unacked: VecDeque::new(),
+                bytes: 0,
+                last_sent_sequence: None,
+                closed: false,
+            }),
+            available: Condvar::new(),
+            max_batches: max_batches.max(1),
+            max_bytes: max_bytes.max(1),
+            global,
+            closed: AtomicBool::new(false),
+        }
+    }
+
+    fn reserve(&self, sequence: u64, bytes: usize) -> bool {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        while !state.closed
+            && (state.unacked.len() >= self.max_batches
+                || state.bytes.saturating_add(bytes) > self.max_bytes)
+        {
+            state = match self.available.wait(state) {
+                Ok(state) => state,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+        }
+        if state.closed {
+            return false;
+        }
+        drop(state);
+
+        if !self.global.acquire(bytes, &self.closed) {
+            return false;
+        }
+
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        while !state.closed
+            && (state.unacked.len() >= self.max_batches
+                || state.bytes.saturating_add(bytes) > self.max_bytes)
+        {
+            state = match self.available.wait(state) {
+                Ok(state) => state,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+        }
+        if state.closed {
+            drop(state);
+            self.global.release(bytes);
+            return false;
+        }
+        state
+            .unacked
+            .push_back(OutstandingBatch { sequence, bytes });
+        state.bytes += bytes;
+        true
+    }
+
+    fn acknowledge(&self, sequence: u64) {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let mut released = 0;
+        while state
+            .unacked
+            .front()
+            .is_some_and(|batch| batch.sequence <= sequence)
+        {
+            if let Some(batch) = state.unacked.pop_front() {
+                state.bytes = state.bytes.saturating_sub(batch.bytes);
+                released += batch.bytes;
+            }
+        }
+        self.available.notify_all();
+        drop(state);
+        if released > 0 {
+            self.global.release(released);
+        }
+    }
+
+    fn mark_sent(&self, sequence: u64) {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.last_sent_sequence = Some(sequence);
+    }
+
+    fn last_sent_sequence(&self) -> Option<u64> {
+        match self.state.lock() {
+            Ok(state) => state.last_sent_sequence,
+            Err(poisoned) => poisoned.into_inner().last_sent_sequence,
+        }
+    }
+
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.closed = true;
+        state.unacked.clear();
+        let released = state.bytes;
+        state.bytes = 0;
+        self.available.notify_all();
+        drop(state);
+        self.global.release(released);
+        self.global.notify_all();
+    }
+
+    fn snapshot(&self) -> OutputFlowSnapshot {
+        let state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        OutputFlowSnapshot {
+            batches: state.unacked.len(),
+        }
+    }
+}
+
+struct OutputFlowSnapshot {
+    batches: usize,
+}
+
+struct OutputBatcher {
+    pending: String,
+    max_bytes: usize,
+}
+
+impl OutputBatcher {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            pending: String::new(),
+            max_bytes: max_bytes.max(4),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+
+    fn push(&mut self, text: &str) -> Vec<String> {
+        self.pending.push_str(text);
+        let mut ready = Vec::new();
+        while self.pending.len() >= self.max_bytes {
+            let mut split = self.max_bytes;
+            while !self.pending.is_char_boundary(split) {
+                split -= 1;
+            }
+            let remainder = self.pending.split_off(split);
+            ready.push(std::mem::replace(&mut self.pending, remainder));
+        }
+        ready
+    }
+
+    fn flush(&mut self) -> Option<String> {
+        if self.pending.is_empty() {
+            None
+        } else {
+            Some(std::mem::take(&mut self.pending))
+        }
+    }
+}
+
+#[derive(Default)]
+struct ResizeState {
+    pending: Option<PtySize>,
+    last_applied: Option<PtySize>,
+    requested: u64,
+    applied: u64,
+    coalesced: u64,
+    closed: bool,
+}
+
+#[derive(Default)]
+struct ResizeMailbox {
+    state: Mutex<ResizeState>,
+    changed: Condvar,
+}
+
+impl ResizeMailbox {
+    fn queue(&self, size: PtySize) -> Result<(), String> {
+        let mut state = lock(&self.state)?;
+        if state.closed {
+            return Err("Terminal resize worker is closed.".to_owned());
+        }
+        state.requested = state.requested.saturating_add(1);
+        if state.pending.is_some() {
+            state.coalesced = state.coalesced.saturating_add(1);
+        }
+        state.pending = Some(size);
+        self.changed.notify_one();
+        Ok(())
+    }
+
+    fn take_latest(&self) -> Option<PtySize> {
+        loop {
+            let candidate = self.take_debounced()?;
+            let mut state = match self.state.lock() {
+                Ok(state) => state,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if state
+                .last_applied
+                .is_some_and(|applied| same_pty_size(applied, candidate))
+            {
+                state.coalesced = state.coalesced.saturating_add(1);
+                self.changed.notify_all();
+                continue;
+            }
+            return Some(candidate);
+        }
+    }
+
+    fn take_debounced(&self) -> Option<PtySize> {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        while state.pending.is_none() && !state.closed {
+            state = match self.changed.wait(state) {
+                Ok(state) => state,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+        }
+        if state.closed {
+            return None;
+        }
+
+        let deadline = Instant::now() + RESIZE_COALESCE_WINDOW;
+        loop {
+            let timeout = deadline.saturating_duration_since(Instant::now());
+            if timeout.is_zero() {
+                break;
+            }
+            let (next_state, result) = match self.changed.wait_timeout(state, timeout) {
+                Ok(result) => result,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            state = next_state;
+            if state.closed || result.timed_out() {
+                break;
+            }
+        }
+        if state.closed {
+            None
+        } else {
+            state.pending.take()
+        }
+    }
+
+    fn mark_applied(&self, size: PtySize) {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.last_applied = Some(size);
+        state.applied = state.applied.saturating_add(1);
+    }
+
+    fn snapshot(&self) -> ResizeSnapshot {
+        let state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        ResizeSnapshot {
+            pending: state.pending.is_some(),
+            requested: state.requested,
+            applied: state.applied,
+            coalesced: state.coalesced,
+        }
+    }
+
+    #[cfg(test)]
+    fn wait_for_coalesced_at_least(&self, target: u64, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        loop {
+            if state.coalesced >= target {
+                return true;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            let (next_state, result) = match self.changed.wait_timeout(state, remaining) {
+                Ok(result) => result,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            state = next_state;
+            if result.timed_out() && state.coalesced < target {
+                return false;
+            }
+        }
+    }
+
+    fn close(&self) {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.closed = true;
+        state.pending = None;
+        self.changed.notify_all();
+    }
+}
+
+struct ResizeSnapshot {
+    pending: bool,
+    requested: u64,
+    applied: u64,
+    coalesced: u64,
+}
+
+fn same_pty_size(left: PtySize, right: PtySize) -> bool {
+    left.rows == right.rows
+        && left.cols == right.cols
+        && left.pixel_width == right.pixel_width
+        && left.pixel_height == right.pixel_height
 }
 
 #[cfg(windows)]
 struct ProcessTerminator {
-    job: OwnedHandle,
+    job: Mutex<Option<OwnedHandle>>,
 }
 
 #[cfg(windows)]
@@ -348,11 +1786,20 @@ impl ProcessTerminator {
             ));
         }
 
-        Ok(Self { job })
+        Ok(Self {
+            job: Mutex::new(Some(job)),
+        })
     }
 
     fn terminate(&self) -> Result<(), String> {
-        let terminated = unsafe { TerminateJobObject(self.job.as_raw_handle(), 1) };
+        let job = lock(&self.job)?.take();
+        let Some(job) = job else {
+            return Ok(());
+        };
+        let terminated = unsafe { TerminateJobObject(job.as_raw_handle(), 1) };
+        // Dropping the last Job Object handle is a second kill path because the job was
+        // configured with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE.
+        drop(job);
         if terminated == 0 {
             Err(format!(
                 "PowerShell termination failed: {}",
@@ -387,7 +1834,12 @@ impl ProcessTerminator {
 fn lock<T>(mutex: &Mutex<T>) -> Result<std::sync::MutexGuard<'_, T>, String> {
     mutex
         .lock()
-        .map_err(|_| "터미널 상태 잠금이 손상되었습니다.".to_owned())
+        .map_err(|_| "Terminal engine state lock was poisoned.".to_owned())
+}
+
+fn write_bytes(writer: &mut dyn Write, data: &[u8]) -> std::io::Result<()> {
+    writer.write_all(data)?;
+    writer.flush()
 }
 
 fn normalized_size(columns: u16, rows: u16) -> PtySize {
@@ -405,7 +1857,7 @@ fn validate_working_directory(cwd: Option<String>) -> Result<Option<PathBuf>, St
     };
     let path = PathBuf::from(value);
     if !path.is_dir() {
-        return Err("지정한 작업 폴더를 찾을 수 없습니다.".to_owned());
+        return Err("The selected working directory was not found.".to_owned());
     }
     Ok(Some(path))
 }
@@ -422,19 +1874,6 @@ fn resolve_powershell() -> PathBuf {
         }
     }
     PathBuf::from("powershell.exe")
-}
-
-fn send_output(
-    channel: &Channel<TerminalEvent>,
-    session_id: &str,
-    sequence: &AtomicU64,
-    data: String,
-) {
-    let _ = channel.send(TerminalEvent::Output {
-        session_id: session_id.to_owned(),
-        sequence: sequence.fetch_add(1, Ordering::Relaxed),
-        data,
-    });
 }
 
 #[derive(Default)]
@@ -481,32 +1920,44 @@ impl Utf8StreamDecoder {
     }
 }
 
+pub(crate) fn phase2_initial_panes() -> u8 {
+    env::var("IHC_PHASE2_INITIAL_PANES")
+        .ok()
+        .and_then(|value| value.parse::<u8>().ok())
+        .unwrap_or(1)
+        .clamp(1, MAX_TERMINAL_SESSIONS as u8)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::Utf8StreamDecoder;
-
-    #[cfg(windows)]
-    use super::resolve_powershell;
-    #[cfg(windows)]
-    use portable_pty::{CommandBuilder, PtySize, native_pty_system};
-    #[cfg(windows)]
+    use super::*;
     use std::{
-        io::{Read, Write},
-        sync::mpsc,
-        thread,
-        time::Duration,
+        collections::HashSet,
+        sync::{
+            Barrier,
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        },
     };
+
+    fn test_output_flow(max_batches: usize, max_bytes: usize) -> Arc<OutputFlow> {
+        Arc::new(OutputFlow::with_limits(
+            max_batches,
+            max_bytes,
+            Arc::new(GlobalOutputBudget::with_limit(max_bytes * 4)),
+        ))
+    }
 
     #[test]
     fn preserves_korean_split_across_chunks() {
-        let source = "우리가 실험용 터미널을 확인합니다.".as_bytes();
+        let source = "우리가 실험용 한글 입력을 확인합니다".as_bytes();
         let mut decoder = Utf8StreamDecoder::default();
         let mut output = String::new();
         for byte in source {
             output.push_str(&decoder.push(&[*byte]));
         }
         output.push_str(&decoder.finish());
-        assert_eq!(output, "우리가 실험용 터미널을 확인합니다.");
+        assert_eq!(output, "우리가 실험용 한글 입력을 확인합니다");
     }
 
     #[test]
@@ -515,6 +1966,353 @@ mod tests {
         let mut output = decoder.push(b"left\xffright");
         output.push_str(&decoder.finish());
         assert_eq!(output, "left\u{fffd}right");
+    }
+
+    #[test]
+    fn raw_terminal_input_preserves_all_byte_values() {
+        let source = [0x00, 0x7f, 0x80, 0xff];
+        let mut destination = Vec::new();
+        write_bytes(&mut destination, &source).expect("raw bytes should be writable");
+        assert_eq!(destination, source);
+    }
+
+    #[test]
+    fn batches_without_splitting_korean_scalars() {
+        let mut batcher = OutputBatcher::new(7);
+        let mut batches = batcher.push("가나다라마바사");
+        batches.extend(batcher.flush());
+        assert_eq!(batches.concat(), "가나다라마바사");
+        assert!(batches.iter().all(|batch| batch.len() <= 7));
+    }
+
+    #[test]
+    fn output_flow_blocks_until_cumulative_ack() {
+        let flow = test_output_flow(2, 8);
+        assert!(flow.reserve(0, 4));
+        assert!(flow.reserve(1, 4));
+
+        let waiting_flow = Arc::clone(&flow);
+        let (done_sender, done_receiver) = mpsc::sync_channel(1);
+        let waiter = thread::spawn(move || {
+            let accepted = waiting_flow.reserve(2, 4);
+            let _ = done_sender.send(accepted);
+        });
+
+        assert!(
+            done_receiver
+                .recv_timeout(Duration::from_millis(50))
+                .is_err()
+        );
+        flow.acknowledge(0);
+        assert!(
+            done_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("ACK should release output backpressure")
+        );
+        flow.acknowledge(2);
+        assert_eq!(flow.snapshot().batches, 0);
+        waiter.join().expect("flow waiter should finish");
+    }
+
+    #[test]
+    fn output_flow_close_releases_waiters() {
+        let flow = test_output_flow(1, 4);
+        assert!(flow.reserve(0, 4));
+        let waiting_flow = Arc::clone(&flow);
+        let waiter = thread::spawn(move || waiting_flow.reserve(1, 4));
+        thread::sleep(Duration::from_millis(20));
+        flow.close();
+        assert!(!waiter.join().expect("closed flow waiter should finish"));
+    }
+
+    #[test]
+    fn enforces_twenty_reservations_under_concurrency() {
+        let manager = TerminalManager::default();
+        let barrier = Arc::new(Barrier::new(65));
+        let (sender, receiver) = mpsc::channel();
+        let mut threads = Vec::new();
+
+        for _ in 0..64 {
+            let manager = manager.clone();
+            let barrier = Arc::clone(&barrier);
+            let sender = sender.clone();
+            threads.push(thread::spawn(move || {
+                barrier.wait();
+                sender
+                    .send(manager.reserve_start())
+                    .expect("reservation result should send");
+            }));
+        }
+        barrier.wait();
+        drop(sender);
+        let reservations = receiver.into_iter().collect::<Vec<_>>();
+        for worker in threads {
+            worker.join().expect("reservation worker should finish");
+        }
+
+        assert_eq!(
+            reservations.iter().filter(|result| result.is_ok()).count(),
+            MAX_TERMINAL_SESSIONS
+        );
+        assert_eq!(manager.status().starting_sessions, MAX_TERMINAL_SESSIONS);
+        drop(reservations);
+        assert_eq!(manager.status().active_sessions, 0);
+    }
+
+    #[test]
+    fn shutdown_cancels_reservations_and_rejects_new_starts() {
+        let manager = TerminalManager::default();
+        let reservation = manager.reserve_start().expect("reservation should succeed");
+        manager.stop_all();
+        assert!(!manager.status().accepting_sessions);
+        assert_eq!(manager.status().active_sessions, 0);
+        assert!(manager.reserve_start().is_err());
+        drop(reservation);
+    }
+
+    #[test]
+    fn resize_mailbox_keeps_only_latest_size() {
+        let mailbox = Arc::new(ResizeMailbox::default());
+        for index in 0..5_000 {
+            mailbox
+                .queue(normalized_size(80 + (index % 200) as u16, 20))
+                .unwrap();
+        }
+        mailbox.queue(normalized_size(140, 40)).unwrap();
+        let size = mailbox.take_latest().expect("latest resize should exist");
+        assert_eq!(size.cols, 140);
+        assert_eq!(size.rows, 40);
+        mailbox.mark_applied(size);
+        let snapshot = mailbox.snapshot();
+        assert_eq!(snapshot.requested, 5_001);
+        assert_eq!(snapshot.applied, 1);
+        assert!(snapshot.coalesced >= 5_000);
+        assert!(!mailbox.snapshot().pending);
+        mailbox.close();
+        assert!(mailbox.take_latest().is_none());
+    }
+
+    #[test]
+    fn resize_mailbox_suppresses_an_already_applied_size() {
+        let mailbox = Arc::new(ResizeMailbox::default());
+        let size = normalized_size(120, 30);
+        mailbox.queue(size).unwrap();
+        let first = mailbox.take_latest().unwrap();
+        mailbox.mark_applied(first);
+
+        mailbox.queue(size).unwrap();
+        let waiting_mailbox = Arc::clone(&mailbox);
+        let worker = thread::spawn(move || waiting_mailbox.take_latest());
+        assert!(
+            mailbox.wait_for_coalesced_at_least(1, Duration::from_secs(1)),
+            "resize worker did not observe and suppress the applied duplicate"
+        );
+        mailbox.close();
+        assert!(worker.join().unwrap().is_none());
+        let snapshot = mailbox.snapshot();
+        assert_eq!(snapshot.applied, 1);
+        assert!(snapshot.coalesced >= 1);
+    }
+
+    #[test]
+    fn spawn_limiter_never_exceeds_two_concurrent_spawns() {
+        let limiter = Arc::new(SpawnLimiter::default());
+        let barrier = Arc::new(Barrier::new(17));
+        let mut workers = Vec::new();
+        for _ in 0..16 {
+            let limiter = Arc::clone(&limiter);
+            let barrier = Arc::clone(&barrier);
+            workers.push(thread::spawn(move || {
+                barrier.wait();
+                let _permit = limiter.acquire().expect("spawn permit should be available");
+                thread::sleep(Duration::from_millis(15));
+            }));
+        }
+        barrier.wait();
+        for worker in workers {
+            worker.join().expect("spawn limiter worker should finish");
+        }
+        let snapshot = limiter.snapshot();
+        assert_eq!(snapshot.active, 0);
+        assert_eq!(snapshot.peak, MAX_CONCURRENT_SPAWNS);
+    }
+
+    #[test]
+    fn global_output_budget_never_exceeds_its_limit() {
+        let budget = Arc::new(GlobalOutputBudget::with_limit(8));
+        let first = Arc::new(OutputFlow::with_limits(8, 8, Arc::clone(&budget)));
+        let second = Arc::new(OutputFlow::with_limits(8, 8, Arc::clone(&budget)));
+        assert!(first.reserve(0, 8));
+
+        let waiting = Arc::clone(&second);
+        let (done_sender, done_receiver) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            let _ = done_sender.send(waiting.reserve(0, 1));
+        });
+        assert!(
+            done_receiver
+                .recv_timeout(Duration::from_millis(50))
+                .is_err()
+        );
+        let saturated = budget.snapshot();
+        assert_eq!(saturated.bytes, 8);
+        assert!(saturated.peak <= 8);
+
+        first.acknowledge(0);
+        assert!(
+            done_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("global ACK should release shared budget")
+        );
+        second.acknowledge(0);
+        worker.join().expect("global budget worker should finish");
+        let finished = budget.snapshot();
+        assert_eq!(finished.bytes, 0);
+        assert!(finished.peak <= 8);
+    }
+
+    struct FailingSink;
+
+    impl TerminalEventSink for FailingSink {
+        fn send(&self, _event: TerminalEvent) -> Result<(), String> {
+            Err("channel closed".to_owned())
+        }
+    }
+
+    #[derive(Default)]
+    struct DropAfterStartedSink {
+        started: AtomicBool,
+    }
+
+    impl TerminalEventSink for DropAfterStartedSink {
+        fn send(&self, event: TerminalEvent) -> Result<(), String> {
+            if matches!(event, TerminalEvent::Started { .. }) {
+                self.started.store(true, Ordering::Release);
+                Ok(())
+            } else {
+                Err("simulated WebView channel drop".to_owned())
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingAbort(AtomicBool);
+
+    impl TerminalAbortSignal for RecordingAbort {
+        fn abort_after_sink_failure(&self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    #[test]
+    fn output_sink_failure_requests_session_abort() {
+        let (raw_sender, raw_receiver) = mpsc::sync_channel(2);
+        let (start_sender, start_receiver) = mpsc::sync_channel(1);
+        let (done_sender, done_receiver) = mpsc::sync_channel(1);
+        let budget = Arc::new(GlobalOutputBudget::with_limit(1024));
+        let flow = Arc::new(OutputFlow::with_limits(4, 1024, budget));
+        let abort = Arc::new(RecordingAbort::default());
+        let abort_signal: Arc<dyn TerminalAbortSignal> = abort.clone();
+
+        let worker = thread::spawn(move || {
+            run_output_dispatcher(
+                "sink-failure".to_owned(),
+                raw_receiver,
+                start_receiver,
+                done_sender,
+                Arc::new(FailingSink),
+                flow,
+                abort_signal,
+            );
+        });
+        start_sender.send(true).unwrap();
+        raw_sender
+            .send(ReaderMessage::Bytes(b"trigger".to_vec()))
+            .unwrap();
+        raw_sender.send(ReaderMessage::Eof).unwrap();
+        done_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("dispatcher should stop after EOF");
+        worker.join().expect("dispatcher should finish");
+        assert!(abort.0.load(Ordering::Acquire));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn failed_started_event_rolls_back_the_entire_session() {
+        let manager = TerminalManager::default();
+        let result = manager.start_with_sink(None, 80, 24, Arc::new(FailingSink));
+        assert!(result.is_err());
+        assert_eq!(manager.status().active_sessions, 0);
+        assert_eq!(manager.status().spawning_sessions, 0);
+        assert_eq!(manager.status().worker_threads, 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn dropped_webview_channel_terminates_a_real_session() {
+        let manager = TerminalManager::default();
+        let sink = Arc::new(DropAfterStartedSink::default());
+        let response = manager
+            .start_with_sink(None, 80, 24, sink.clone())
+            .expect("Started event should be accepted");
+        assert!(sink.started.load(Ordering::Acquire));
+
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while manager.status().active_sessions != 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            manager.status().active_sessions,
+            0,
+            "dropped channel orphaned session {}",
+            response.session_id
+        );
+        assert_eq!(manager.status().worker_threads, 0);
+    }
+
+    #[derive(Default)]
+    struct RecordingSink {
+        events: Mutex<Vec<TerminalEvent>>,
+        changed: Condvar,
+    }
+
+    impl TerminalEventSink for RecordingSink {
+        fn send(&self, event: TerminalEvent) -> Result<(), String> {
+            let mut events = self.events.lock().unwrap();
+            events.push(event);
+            self.changed.notify_all();
+            Ok(())
+        }
+    }
+
+    impl RecordingSink {
+        fn wait_for(
+            &self,
+            timeout: Duration,
+            predicate: impl Fn(&[TerminalEvent]) -> bool,
+        ) -> bool {
+            let deadline = Instant::now() + timeout;
+            let mut events = self.events.lock().unwrap();
+            loop {
+                if predicate(&events) {
+                    return true;
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return false;
+                }
+                let (next_events, result) = self.changed.wait_timeout(events, remaining).unwrap();
+                events = next_events;
+                if result.timed_out() && !predicate(&events) {
+                    return false;
+                }
+            }
+        }
+
+        fn snapshot(&self) -> Vec<TerminalEvent> {
+            self.events.lock().unwrap().clone()
+        }
     }
 
     #[cfg(windows)]
@@ -583,12 +2381,7 @@ mod tests {
                 .expect("ConPTY should request terminal status"),
             "status-query"
         );
-        writer
-            .write_all(b"\x1b[1;1R")
-            .expect("terminal status response should be writable");
-        writer
-            .flush()
-            .expect("terminal status response should flush");
+        write_bytes(&mut writer, b"\x1b[1;1R").expect("status response should write");
         assert_eq!(
             terminal_event_receiver
                 .recv_timeout(Duration::from_secs(5))
@@ -596,21 +2389,197 @@ mod tests {
             "ready"
         );
         for byte in source.as_bytes() {
-            writer
-                .write_all(&[*byte])
-                .expect("split UTF-8 input should be writable");
+            write_bytes(&mut writer, &[*byte]).expect("split UTF-8 should write");
         }
-        writer.write_all(b"\r\n").expect("line ending should write");
-        writer.flush().expect("ConPTY input should flush");
+        write_bytes(&mut writer, b"\r\n").expect("line ending should write");
 
         child.wait().expect("PowerShell should exit normally");
         drop(writer);
         drop(pair.master);
-        let bytes = reader_thread.join().expect("reader thread should finish");
+        let bytes = reader_thread.join().expect("reader should finish");
         let output = String::from_utf8_lossy(&bytes);
         assert!(
             output.contains(&format!("__IHC__{source}")),
             "ConPTY did not preserve Korean input: {output:?}"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn starts_marks_and_stops_twenty_real_sessions_without_leaks() {
+        let manager = TerminalManager::default();
+        let sink = Arc::new(RecordingSink::default());
+        let barrier = Arc::new(Barrier::new(MAX_TERMINAL_SESSIONS + 1));
+        let mut starters = Vec::new();
+
+        for _ in 0..MAX_TERMINAL_SESSIONS {
+            let manager = manager.clone();
+            let sink: Arc<dyn TerminalEventSink> = sink.clone();
+            let barrier = Arc::clone(&barrier);
+            starters.push(thread::spawn(move || {
+                barrier.wait();
+                manager.start_with_sink(None, 100, 24, sink)
+            }));
+        }
+        barrier.wait();
+
+        let mut responses = Vec::new();
+        for starter in starters {
+            responses.push(
+                starter
+                    .join()
+                    .expect("terminal starter should not panic")
+                    .expect("all twenty sessions should start"),
+            );
+        }
+
+        let ids = responses
+            .iter()
+            .map(|response| response.session_id.clone())
+            .collect::<HashSet<_>>();
+        assert_eq!(ids.len(), MAX_TERMINAL_SESSIONS);
+        let status = manager.status();
+        assert_eq!(status.active_sessions, MAX_TERMINAL_SESSIONS);
+        assert!(status.peak_concurrent_spawns <= MAX_CONCURRENT_SPAWNS);
+        assert_eq!(status.peak_concurrent_spawns, MAX_CONCURRENT_SPAWNS);
+
+        for response in &responses {
+            let session_id = &response.session_id;
+            let saw_query = sink.wait_for(Duration::from_secs(5), |events| {
+                events.iter().any(|event| {
+                    matches!(
+                        event,
+                        TerminalEvent::Output { session_id: id, data, .. }
+                            if id == session_id && data.contains("\u{1b}[6n")
+                    )
+                })
+            });
+            assert!(saw_query, "session {session_id} did not initialize");
+            manager.write(session_id, b"\x1b[1;1R").unwrap();
+            let marker = format!("__IHC_STRESS_{}__", &session_id[..8]);
+            manager
+                .write(
+                    session_id,
+                    format!("Write-Output '{marker}'\r\n").as_bytes(),
+                )
+                .unwrap();
+            assert!(
+                sink.wait_for(Duration::from_secs(5), |events| {
+                    events.iter().any(|event| {
+                        matches!(
+                            event,
+                            TerminalEvent::Output { session_id: id, data, .. }
+                                if id == session_id && data.contains(&marker)
+                        )
+                    })
+                }),
+                "session {session_id} did not emit its marker"
+            );
+        }
+
+        for session_id in &ids {
+            manager.stop(session_id).unwrap();
+        }
+        assert!(
+            sink.wait_for(Duration::from_secs(15), |events| {
+                events
+                    .iter()
+                    .filter_map(|event| match event {
+                        TerminalEvent::Exited { session_id, .. } => Some(session_id),
+                        _ => None,
+                    })
+                    .collect::<HashSet<_>>()
+                    .len()
+                    == MAX_TERMINAL_SESSIONS
+            }),
+            "all sessions should emit exactly one terminal exit path"
+        );
+
+        let events = sink.snapshot();
+        for session_id in &ids {
+            let exit_positions = events
+                .iter()
+                .enumerate()
+                .filter_map(|(index, event)| match event {
+                    TerminalEvent::Exited { session_id: id, .. } if id == session_id => Some(index),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(exit_positions.len(), 1, "one Exited event per session");
+            let exit_position = exit_positions[0];
+            assert!(events[exit_position + 1..].iter().all(|event| {
+                !matches!(
+                    event,
+                    TerminalEvent::Output { session_id: id, .. }
+                        | TerminalEvent::Error { session_id: id, .. }
+                        if id == session_id
+                )
+            }));
+
+            let sequences = events[..exit_position]
+                .iter()
+                .filter_map(|event| match event {
+                    TerminalEvent::Output {
+                        session_id: id,
+                        sequence,
+                        ..
+                    } if id == session_id => Some(*sequence),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                sequences
+                    .iter()
+                    .enumerate()
+                    .all(|(expected, actual)| *actual == expected as u64),
+                "output sequence must be contiguous for {session_id}: {sequences:?}"
+            );
+            let reported_last = match &events[exit_position] {
+                TerminalEvent::Exited { last_sequence, .. } => *last_sequence,
+                _ => unreachable!(),
+            };
+            assert_eq!(reported_last, sequences.last().copied());
+        }
+
+        let final_status = manager.status();
+        assert_eq!(final_status.active_sessions, 0);
+        assert_eq!(final_status.pending_output_bytes, 0);
+        assert_eq!(final_status.worker_threads, 0);
+    }
+
+    #[test]
+    fn status_reports_starts_as_active() {
+        let manager = TerminalManager::default();
+        let reservations = (0..3)
+            .map(|_| manager.reserve_start().unwrap())
+            .collect::<Vec<_>>();
+        let status = manager.status();
+        assert_eq!(status.active_sessions, 3);
+        assert_eq!(status.starting_sessions, 3);
+        assert_eq!(status.max_sessions, 20);
+        drop(reservations);
+    }
+
+    #[test]
+    fn preview_pane_count_defaults_within_public_limit() {
+        assert!((1..=MAX_TERMINAL_SESSIONS as u8).contains(&phase2_initial_panes()));
+    }
+
+    #[test]
+    fn terminal_event_json_uses_the_frontend_camel_case_contract() {
+        let value = serde_json::to_value(TerminalEvent::Exited {
+            session_id: "session-1".to_owned(),
+            exit_code: Some(0),
+            last_sequence: Some(7),
+        })
+        .expect("terminal event should serialize");
+
+        assert_eq!(value["event"], "exited");
+        assert_eq!(value["data"]["sessionId"], "session-1");
+        assert_eq!(value["data"]["exitCode"], 0);
+        assert_eq!(value["data"]["lastSequence"], 7);
+        assert!(value["data"].get("session_id").is_none());
+        assert!(value["data"].get("exit_code").is_none());
+        assert!(value["data"].get("last_sequence").is_none());
     }
 }

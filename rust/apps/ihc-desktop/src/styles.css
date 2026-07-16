@@ -27,13 +27,14 @@ body {
 
 .shell {
   display: grid;
-  grid-template-rows: 48px 1fr 30px;
+  grid-template-rows: 48px minmax(0, 1fr) 30px;
   width: 100%;
   height: 100%;
   background: #050505;
 }
 
 .toolbar {
+  z-index: 10;
   display: flex;
   align-items: center;
   gap: 8px;
@@ -55,6 +56,7 @@ body {
   color: #85858c;
   font-size: 11px;
   font-weight: 600;
+  white-space: nowrap;
 }
 
 .toolbar-spacer {
@@ -62,14 +64,11 @@ body {
 }
 
 button {
-  height: 30px;
-  padding: 0 12px;
   border: 1px solid #3f3f46;
   border-radius: 4px;
   color: #f4f4f5;
   background: #1a1a1c;
   font: inherit;
-  font-size: 12px;
   cursor: pointer;
 }
 
@@ -78,25 +77,253 @@ button:hover:not(:disabled) {
   background: #242427;
 }
 
+button:focus-visible {
+  outline: 1px solid #f4f4f5;
+  outline-offset: 1px;
+}
+
 button:disabled {
   cursor: default;
   opacity: 0.38;
 }
 
-#terminal-surface {
+.toolbar-action {
+  height: 30px;
+  padding: 0 12px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.toolbar-action-primary {
+  border-color: #f4f4f5;
+  color: #050505;
+  background: #f4f4f5;
+  font-weight: 650;
+}
+
+.toolbar-action-primary:hover:not(:disabled) {
+  border-color: #d4d4d8;
+  background: #d4d4d8;
+}
+
+.workspace-stage {
+  position: relative;
+  display: grid;
   min-width: 0;
   min-height: 0;
-  padding: 8px 4px 4px 10px;
+  overflow: hidden;
   background: #050505;
 }
 
-#terminal {
+.terminal-grid,
+.browser-surface {
+  grid-area: 1 / 1;
+  min-width: 0;
+  min-height: 0;
+}
+
+.terminal-grid {
+  --grid-columns: 1;
+  --grid-rows: 1;
+  position: relative;
+  display: grid;
+  grid-template-columns: repeat(var(--grid-columns), minmax(0, 1fr));
+  grid-template-rows: repeat(var(--grid-rows), minmax(0, 1fr));
+  gap: 6px;
+  padding: 6px;
+  overflow: hidden;
+  visibility: visible;
+  background: #050505;
+}
+
+.shell[data-workspace-view="browser"] .terminal-grid {
+  visibility: hidden;
+  pointer-events: none;
+}
+
+.empty-workspace {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  color: #85858c;
+  font-size: 12px;
+  text-align: center;
+}
+
+.empty-workspace strong {
+  color: #f4f4f5;
+  font-size: 14px;
+}
+
+.empty-glyph {
+  margin-bottom: 5px;
+  color: #f4f4f5;
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 26px;
+  font-weight: 700;
+}
+
+.terminal-grid[data-empty="false"] .empty-workspace {
+  display: none;
+}
+
+.terminal-pane {
+  position: relative;
+  display: grid;
+  grid-template-rows: 34px minmax(0, 1fr);
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  border: 1px solid #29292c;
+  border-radius: 4px;
+  background: #050505;
+  contain: layout paint;
+}
+
+.terminal-pane[data-active="true"] {
+  border-color: #f4f4f5;
+}
+
+.terminal-pane[data-state="error"] {
+  border-color: #b85c5c;
+}
+
+.terminal-header {
+  display: grid;
+  grid-template-columns: 12px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 0 5px 0 10px;
+  border-bottom: 1px solid #29292c;
+  background: #111112;
+}
+
+.terminal-state-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #71717a;
+}
+
+.terminal-pane[data-state="starting"] .terminal-state-dot,
+.terminal-pane[data-state="queued"] .terminal-state-dot,
+.terminal-pane[data-state="stopping"] .terminal-state-dot {
+  background: #f4c95d;
+}
+
+.terminal-pane[data-state="running"] .terminal-state-dot {
+  background: #86efac;
+}
+
+.terminal-pane[data-state="exited"] .terminal-state-dot {
+  background: #71717a;
+}
+
+.terminal-pane[data-state="error"] .terminal-state-dot {
+  background: #f87171;
+}
+
+.terminal-heading {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.terminal-title {
+  overflow: hidden;
+  color: #f4f4f5;
+  font-size: 11px;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.terminal-state-label {
+  overflow: hidden;
+  color: #85858c;
+  font-size: 9px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.terminal-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.terminal-close {
+  display: grid;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  place-items: center;
+  border-color: transparent;
+  color: #a1a1aa;
+  background: transparent;
+  font-family: "Segoe UI Symbol", sans-serif;
+  font-size: 13px;
+}
+
+.terminal-close:hover:not(:disabled) {
+  border-color: #3f3f46;
+  color: #f4f4f5;
+  background: #242427;
+}
+
+.terminal-viewport {
+  min-width: 0;
+  min-height: 0;
+  padding: 4px 2px 3px 6px;
+  overflow: hidden;
+  user-select: text;
+  background: #050505;
+}
+
+.terminal-viewport > .xterm {
   width: 100%;
   height: 100%;
-  user-select: text;
+}
+
+.browser-surface {
+  position: relative;
+  overflow: hidden;
+  visibility: hidden;
+  pointer-events: none;
+  background: #080808;
+}
+
+.shell[data-workspace-view="browser"] .browser-surface {
+  visibility: visible;
+  pointer-events: auto;
+}
+
+.browser-placeholder {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  color: #85858c;
+  font-size: 12px;
+}
+
+.browser-placeholder strong {
+  color: #f4f4f5;
+  font-size: 14px;
 }
 
 .statusbar {
+  z-index: 10;
   display: flex;
   align-items: center;
   gap: 10px;
@@ -114,6 +341,18 @@ button:disabled {
   white-space: nowrap;
 }
 
+.session-count {
+  color: #d4d4d8;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.status-separator {
+  width: 1px;
+  height: 12px;
+  background: #29292c;
+}
+
 #status {
   overflow: hidden;
   text-overflow: ellipsis;
@@ -127,4 +366,32 @@ button:disabled {
 .xterm .xterm-viewport {
   scrollbar-color: #747474 transparent;
   scrollbar-width: thin;
+}
+
+.xterm .xterm-viewport::-webkit-scrollbar {
+  width: 6px;
+}
+
+.xterm .xterm-viewport::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.xterm .xterm-viewport::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  background: #747474;
+}
+
+@media (max-width: 980px) {
+  .phase,
+  #close-active-terminal {
+    display: none;
+  }
+
+  .toolbar {
+    padding-inline: 8px;
+  }
+
+  .toolbar-action {
+    padding-inline: 9px;
+  }
 }

@@ -2,27 +2,56 @@
 <html lang="ko">
   <head>
     <meta charset="UTF-8" />
-    <link rel="stylesheet" href="/assets/main.css" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="stylesheet" href="/assets/main.css" />
     <title>IHATECODING Rust Preview</title>
     <script type="module" src="/assets/main.js" defer></script>
   </head>
   <body>
-    <main id="app" class="shell">
+    <main id="app" class="shell" data-workspace-view="terminals">
       <header class="toolbar">
         <span class="brand">IHATECODING</span>
-        <span class="phase">RUST PHASE 1</span>
+        <span class="phase">RUST PHASE 2</span>
         <span class="toolbar-spacer"></span>
-        <button id="start-terminal" type="button">PowerShell 시작</button>
-        <button id="stop-terminal" type="button" disabled>PowerShell 종료</button>
-        <button id="toggle-browser" type="button">브라우저 PoC</button>
+        <button id="add-terminal" class="toolbar-action toolbar-action-primary" type="button">
+          ＋ PowerShell
+        </button>
+        <button id="close-active-terminal" class="toolbar-action" type="button" disabled>
+          현재 창 닫기
+        </button>
+        <button id="toggle-browser" class="toolbar-action" type="button">
+          브라우저 PoC
+        </button>
       </header>
-      <section id="terminal-surface" aria-label="Rust ConPTY PowerShell">
-        <div id="terminal"></div>
+
+      <section id="workspace-stage" class="workspace-stage">
+        <section
+          id="terminal-surface"
+          class="terminal-grid"
+          aria-label="Rust ConPTY PowerShell 작업 공간"
+        >
+          <div id="empty-workspace" class="empty-workspace">
+            <span class="empty-glyph">&gt;_</span>
+            <strong>열려 있는 PowerShell이 없습니다</strong>
+            <span>상단의 ＋ PowerShell을 눌러 새 터미널을 여세요.</span>
+          </div>
+        </section>
+
+        <section id="browser-surface" class="browser-surface" aria-label="브라우저 PoC">
+          <div class="browser-placeholder">
+            <strong>격리된 브라우저 WebView</strong>
+            <span>터미널은 뒤에서 계속 실행됩니다.</span>
+          </div>
+        </section>
       </section>
+
       <footer class="statusbar">
         <span class="backend">RUST · ConPTY</span>
-        <span id="status">초기화 중…</span>
+        <span id="session-count" class="session-count">0 / 20</span>
+        <span class="status-separator" aria-hidden="true"></span>
+        <span id="status" role="status" aria-live="polite" aria-atomic="true">
+          PowerShell을 준비하는 중…
+        </span>
       </footer>
     </main>
   </body>
