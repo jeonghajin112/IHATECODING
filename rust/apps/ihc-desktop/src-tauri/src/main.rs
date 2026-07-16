@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    ihatecoding_rust_preview_lib::run()
+    ihatecoding_lib::run()
 }

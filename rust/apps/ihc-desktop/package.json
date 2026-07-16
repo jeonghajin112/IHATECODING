@@ -1,12 +1,12 @@
 {
-  "name": "ihatecoding-rust-preview",
+  "name": "ihatecoding",
   "private": true,
-  "version": "0.1.0",
+  "version": "1.0.0",
   "type": "module",
   "scripts": {
     "dev": "node scripts/build.mjs --serve",
     "build": "tsc --noEmit && node scripts/build.mjs",
-    "test": "node --test scripts/phase2-core.test.mjs scripts/phase3-core.test.mjs scripts/phase3b-core.test.mjs scripts/phase4-core.test.mjs scripts/phase4-integration.test.mjs",
+    "test": "node --test scripts/phase2-core.test.mjs scripts/phase3-core.test.mjs scripts/phase3b-core.test.mjs scripts/phase4-core.test.mjs scripts/phase4-integration.test.mjs scripts/phase5-core.test.mjs scripts/phase5-integration.test.mjs",
     "tauri": "tauri"
   },
   "dependencies": {

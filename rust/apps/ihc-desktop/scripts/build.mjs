@@ -42,7 +42,7 @@ if (!serve) {
     port: 1420,
     servedir: serveDirectory,
   });
-  console.log(`IHATECODING preview UI: http://${server.host}:${server.port}`);
+  console.log(`IHATECODING UI: http://${server.host}:${server.port}`);
 
   const shutdown = async () => {
     await context.dispose();

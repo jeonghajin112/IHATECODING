@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter()]
-    [string] $Executable = (Join-Path $PSScriptRoot '..\src-tauri\target\release\ihatecoding-rust-preview.exe'),
+    [string] $Executable = (Join-Path $PSScriptRoot '..\src-tauri\target\release\ihatecoding.exe'),
 
     [Parameter()]
     [ValidateRange(1, 20)]

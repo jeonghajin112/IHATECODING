@@ -142,11 +142,12 @@ button:disabled {
 }
 
 .project-item {
+  position: relative;
   display: grid;
   width: 100%;
   min-width: 0;
   gap: 3px;
-  padding: 8px 7px;
+  padding: 8px 34px 8px 7px;
   border-color: transparent;
   border-radius: 3px;
   color: #a1a1aa;
@@ -167,6 +168,10 @@ button:disabled {
   border-color: #52525b;
   color: #f4f4f5;
   background: #1a1a1c;
+}
+
+.project-item[data-has-completion="true"] {
+  border-color: #65552f;
 }
 
 .project-item strong,
@@ -287,7 +292,7 @@ button:disabled {
 .workspace-tab {
   position: relative;
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
   align-items: center;
   min-width: 116px;
   max-width: 210px;
@@ -342,6 +347,27 @@ button:disabled {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.completion-badge {
+  display: inline-grid;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  place-items: center;
+  border: 1px solid #8b743d;
+  border-radius: 999px;
+  color: #f4d57a;
+  background: #211c10;
+  font-size: 9px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
+
+.project-completion-badge {
+  position: absolute;
+  top: 8px;
+  right: 7px;
 }
 
 .workspace-tab-close {
@@ -570,6 +596,16 @@ button:disabled {
   border-color: #f4f4f5;
 }
 
+.terminal-pane[data-completion-pending="true"],
+.terminal-pane[data-completion-pending="true"][data-active="true"] {
+  border-color: #c7a34e;
+  box-shadow: inset 0 0 0 1px rgb(199 163 78 / 18%);
+}
+
+.terminal-pane[data-completion-pending="true"] .terminal-state-dot {
+  background: #e7c15f;
+}
+
 .terminal-pane[data-state="error"] {
   border-color: #b85c5c;
 }
@@ -782,9 +818,59 @@ body[data-pane-resizing="true"] .terminal-resize-handle::after {
 }
 
 #status {
+  flex: 1 1 auto;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.provider-usage {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 7px;
+  margin-left: auto;
+}
+
+.provider-usage-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  height: 20px;
+  padding: 0 6px;
+  border: 1px solid #29292c;
+  border-radius: 3px;
+  color: #a1a1aa;
+  background: #111112;
+  white-space: nowrap;
+}
+
+.provider-icon {
+  width: 12px;
+  height: 12px;
+  fill: currentColor;
+}
+
+.provider-name {
+  color: #d4d4d8;
+  font-size: 8px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+}
+
+.usage-value {
+  min-width: 24px;
+  color: #f4f4f5;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.provider-usage-item[data-stale="true"] .usage-value {
+  color: #71717a;
+}
+
+.usage-divider {
+  color: #52525b;
 }
 
 #status[data-tone="error"] {

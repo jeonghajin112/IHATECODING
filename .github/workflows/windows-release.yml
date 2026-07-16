@@ -1,0 +1,215 @@
+name: Windows verification artifacts
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-verification-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DESKTOP_DIR: rust/apps/ihc-desktop
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify-and-build-unsigned:
+    name: Test and build unsigned QA bundle
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: rust/apps/ihc-desktop/package-lock.json
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust/apps/ihc-desktop/src-tauri
+
+      - name: Install frontend dependencies
+        working-directory: ${{ env.DESKTOP_DIR }}
+        run: npm ci
+
+      - name: Test frontend contracts
+        working-directory: ${{ env.DESKTOP_DIR }}
+        run: npm test
+
+      - name: Build frontend
+        working-directory: ${{ env.DESKTOP_DIR }}
+        run: npm run build
+
+      - name: Check Rust formatting
+        run: cargo fmt --manifest-path "${{ env.DESKTOP_DIR }}/src-tauri/Cargo.toml" -- --check
+
+      - name: Test Rust targets
+        run: cargo test --manifest-path "${{ env.DESKTOP_DIR }}/src-tauri/Cargo.toml" --all-targets
+
+      - name: Lint Rust targets
+        run: cargo clippy --manifest-path "${{ env.DESKTOP_DIR }}/src-tauri/Cargo.toml" --all-targets --all-features -- -D warnings
+
+      - name: Build unsigned Windows QA bundle
+        working-directory: ${{ env.DESKTOP_DIR }}
+        run: npm run tauri build
+
+      - name: Upload unsigned QA bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: ihatecoding-windows-unsigned-${{ github.sha }}
+          if-no-files-found: error
+          retention-days: 7
+          path: |
+            rust/apps/ihc-desktop/src-tauri/target/release/ihatecoding.exe
+            rust/apps/ihc-desktop/src-tauri/target/release/bundle/**
+
+  build-signed-candidate:
+    name: Build manually requested signed candidate
+    if: github.event_name == 'workflow_dispatch'
+    needs: verify-and-build-unsigned
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Detect protected signing secrets
+        id: signing
+        shell: pwsh
+        env:
+          CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          $enabled = -not [string]::IsNullOrWhiteSpace($env:CERTIFICATE_BASE64) -and
+            -not [string]::IsNullOrWhiteSpace($env:CERTIFICATE_PASSWORD)
+          "enabled=$($enabled.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          if (-not $enabled) {
+            'Signing secrets are not configured; no signed candidate will be built.' >> $env:GITHUB_STEP_SUMMARY
+          }
+
+      - name: Check out repository
+        if: steps.signing.outputs.enabled == 'true'
+        uses: actions/checkout@v4
+
+      - name: Install Node.js
+        if: steps.signing.outputs.enabled == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: rust/apps/ihc-desktop/package-lock.json
+
+      - name: Install Rust
+        if: steps.signing.outputs.enabled == 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        if: steps.signing.outputs.enabled == 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust/apps/ihc-desktop/src-tauri
+
+      - name: Install frontend dependencies
+        if: steps.signing.outputs.enabled == 'true'
+        working-directory: ${{ env.DESKTOP_DIR }}
+        run: npm ci
+
+      - name: Import temporary signing certificate
+        if: steps.signing.outputs.enabled == 'true'
+        id: certificate
+        shell: pwsh
+        env:
+          CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          $pfxPath = Join-Path $env:RUNNER_TEMP 'ihatecoding-signing.pfx'
+          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:CERTIFICATE_BASE64))
+          $password = ConvertTo-SecureString $env:CERTIFICATE_PASSWORD -AsPlainText -Force
+          $certificate = Import-PfxCertificate `
+            -FilePath $pfxPath `
+            -CertStoreLocation Cert:\CurrentUser\My `
+            -Password $password `
+            -Exportable:$false
+          if ($null -eq $certificate -or -not $certificate.HasPrivateKey) {
+            throw 'The configured signing certificate has no usable private key.'
+          }
+          "thumbprint=$($certificate.Thumbprint)" >> $env:GITHUB_OUTPUT
+
+      - name: Build timestamped signed candidate
+        if: steps.signing.outputs.enabled == 'true'
+        shell: pwsh
+        working-directory: ${{ env.DESKTOP_DIR }}
+        env:
+          CERTIFICATE_THUMBPRINT: ${{ steps.certificate.outputs.thumbprint }}
+        run: |
+          $overridePath = Join-Path $env:RUNNER_TEMP 'tauri-signing.json'
+          @{
+            bundle = @{
+              windows = @{
+                certificateThumbprint = $env:CERTIFICATE_THUMBPRINT
+                digestAlgorithm = 'sha256'
+                timestampUrl = 'http://timestamp.digicert.com'
+              }
+            }
+          } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $overridePath -Encoding utf8
+          npm run tauri build -- --config $overridePath
+
+      - name: Verify Authenticode and timestamp
+        if: steps.signing.outputs.enabled == 'true'
+        shell: pwsh
+        run: |
+          $release = 'rust/apps/ihc-desktop/src-tauri/target/release'
+          $candidates = @(
+            Get-Item -LiteralPath "$release/ihatecoding.exe"
+            Get-ChildItem -LiteralPath "$release/bundle" -Recurse -File |
+              Where-Object { $_.Extension -in @('.exe', '.msi') }
+          )
+          if ($candidates.Count -eq 0) { throw 'No signable Windows artifact was produced.' }
+          foreach ($candidate in $candidates) {
+            $signature = Get-AuthenticodeSignature -LiteralPath $candidate.FullName
+            if ($signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid) {
+              throw "Invalid Authenticode signature: $($candidate.Name) ($($signature.Status))"
+            }
+            if ($null -eq $signature.SignerCertificate -or
+                $null -eq $signature.TimeStamperCertificate) {
+              throw "Missing signer or timestamp certificate: $($candidate.Name)"
+            }
+          }
+
+      - name: Upload signed candidate artifact
+        if: steps.signing.outputs.enabled == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ihatecoding-windows-signed-candidate-${{ github.sha }}
+          if-no-files-found: error
+          retention-days: 7
+          path: |
+            rust/apps/ihc-desktop/src-tauri/target/release/ihatecoding.exe
+            rust/apps/ihc-desktop/src-tauri/target/release/bundle/**
+
+      - name: Remove temporary certificate material
+        if: always() && steps.signing.outputs.enabled == 'true'
+        shell: pwsh
+        env:
+          CERTIFICATE_THUMBPRINT: ${{ steps.certificate.outputs.thumbprint }}
+        run: |
+          if (-not [string]::IsNullOrWhiteSpace($env:CERTIFICATE_THUMBPRINT)) {
+            $certificatePath = "Cert:\CurrentUser\My\$($env:CERTIFICATE_THUMBPRINT)"
+            if (Test-Path -LiteralPath $certificatePath) {
+              Remove-Item -LiteralPath $certificatePath -Force
+            }
+          }
+          Remove-Item -LiteralPath (Join-Path $env:RUNNER_TEMP 'ihatecoding-signing.pfx') -Force -ErrorAction SilentlyContinue
+          Remove-Item -LiteralPath (Join-Path $env:RUNNER_TEMP 'tauri-signing.json') -Force -ErrorAction SilentlyContinue

@@ -1,51 +1,17 @@
 # Rust migration
 
-The Rust application is developed beside the tested C# baseline. Until the
-cutover, it uses preview-only state and must not write the production project
-catalog or resume the same agent session as the C# application.
+The staged C# to Rust migration is implemented through Phase 6. The production desktop lives in `apps/ihc-desktop` and uses Tauri 2, TypeScript, xterm.js, portable-pty/ConPTY, and one shared WebView2 renderer.
 
-## Phase 4 preview
+Implemented production slices include:
 
-`apps/ihc-desktop` now contains the Phase 1 Windows integration proof plus the
-Phase 2 multi-terminal engine:
+1. Up to 20 PowerShell panes with bounded two-at-a-time startup and Job Object cleanup.
+2. Canonical `workspace-v1` state with compare-and-swap saves, writer ownership, verified backups, recovery, and unknown-field preservation.
+3. Project and workspace tabs, drag reorder, horizontal resize, and alignment snapping.
+4. Codex and Grok session ownership, safe resume, exact provider completion events, durable unread alerts, and usage summaries.
+5. Korean IME input, text/image clipboard routing, scrollback selection, and output backpressure.
+6. Read-only automatic staging and atomic migration of the old C# project catalog when canonical state is absent.
+7. Isolated 1/8/20-pane comparison, package verification, unsigned QA artifacts, and optional protected CI signing.
 
-1. Tauri 2 and the Windows MSVC toolchain.
-2. One lightweight WebView2 hosting as many as 20 independent xterm.js panes.
-3. PowerShell input, bounded output, coalesced resize, and shutdown through
-   Rust ConPTY.
-4. Korean input without synthetic key processing and raw binary input parity.
-5. ACK-based output backpressure, deterministic output completion, and Windows
-   Job Object cleanup.
-6. A bounded backend shutdown barrier that closes the start gate, waits across
-   the spawn-to-Job-assignment boundary, and drains every active process tree.
-7. A separately isolated child WebView for the future browser tab.
-8. An isolated PascalCase project catalog compatible with the frozen C# shape,
-   with atomic saves, verified backups, corruption quarantine/recovery, and
-   backend preservation of unknown fields.
-9. A lightweight project sidebar plus persisted blank, project, browser, and
-   output workspace tabs. Selecting a project restores its saved PowerShell
-   pane names, order, start folders, and horizontal row ratios without resuming
-   Codex or Grok.
-10. An isolated canonical `workspace-v1` store with revision CAS, a
-    process-lifetime writer lock, verified backup recovery, and exact-byte
-    quarantine for corrupt state.
-11. A two-phase, read-only inspector for an explicitly selected detached C#
-    catalog copy. Successful import snapshots the exact source bytes and writes
-    only the canonical Rust preview store.
-12. A small sidebar status/import/recovery UI coordinated with the live runtime
-    so stale state cannot be saved over an import or recovery.
-13. Header drag/reorder with a stable insertion preview, plus horizontal-only
-    internal-edge resizing and sibling-edge snapping.
-14. An explicit SHA-bound one-time upgrade from the isolated Phase 3A preview
-    into canonical state; the source file is left unchanged.
+The internal Tauri identifier remains `com.ihatecoding.preview` solely to preserve the app-local state created during the staged migration. Product name, window title, package version, executable, and installer are production `IHATECODING` artifacts.
 
-The Phase 3A catalog under `%LOCALAPPDATA%\IHATECODING\RustPreview` is now only
-an isolated rollback/upgrade source. The running Phase 4 UI uses canonical
-state under Tauri's app-local directory for
-`com.ihatecoding.preview/state`. Both remain separate from
-`%LOCALAPPDATA%\PowerWorkspace`. Manual Phase 4 interaction and performance
-gates remain; see `PHASE4_ACCEPTANCE.md`.
-
-The compatibility contracts, including the Phase 2 Tauri terminal protocol,
-and sanitized fixtures live in `contracts` and `fixtures`. The full gated
-rollout is documented in `MIGRATION_PLAN.md`.
+The frozen C# rollback tag is `csharp-final-2026-07-16`. Migration contracts and historical phase evidence remain under `contracts`, `fixtures`, and the `PHASE*_ACCEPTANCE.md` files.

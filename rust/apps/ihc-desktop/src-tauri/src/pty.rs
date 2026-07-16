@@ -1,3 +1,6 @@
+use crate::agent_runtime::{
+    AgentResumeBinding, AgentRuntime, StableTerminalKey, TerminalLaunchPlan,
+};
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use serde::Serialize;
 use std::{
@@ -488,6 +491,7 @@ pub(crate) struct TerminalManager {
     spawn_limiter: Arc<SpawnLimiter>,
     output_budget: Arc<GlobalOutputBudget>,
     worker_threads: Arc<AtomicUsize>,
+    agent_runtime: AgentRuntime,
     #[cfg(test)]
     start_ownership_hook: Arc<dyn StartOwnershipHook>,
 }
@@ -500,6 +504,7 @@ impl Default for TerminalManager {
             spawn_limiter: Arc::new(SpawnLimiter::default()),
             output_budget: Arc::new(GlobalOutputBudget::default()),
             worker_threads: Arc::new(AtomicUsize::new(0)),
+            agent_runtime: AgentRuntime::default(),
             #[cfg(test)]
             start_ownership_hook: Arc::new(NoopStartOwnershipHook),
         }
@@ -507,6 +512,13 @@ impl Default for TerminalManager {
 }
 
 impl TerminalManager {
+    pub(crate) fn with_agent_runtime(agent_runtime: AgentRuntime) -> Self {
+        Self {
+            agent_runtime,
+            ..Self::default()
+        }
+    }
+
     #[cfg(test)]
     fn with_start_ownership_hook(hook: Arc<dyn StartOwnershipHook>) -> Self {
         Self {
@@ -520,11 +532,21 @@ impl TerminalManager {
         cwd: Option<String>,
         columns: u16,
         rows: u16,
+        terminal_key: Option<StableTerminalKey>,
+        resume: Option<AgentResumeBinding>,
         on_event: Channel<TerminalEvent>,
     ) -> Result<StartTerminalResponse, String> {
-        self.start_with_sink(cwd, columns, rows, Arc::new(TauriEventSink(on_event)))
+        self.start_with_sink_request(
+            cwd,
+            columns,
+            rows,
+            terminal_key,
+            resume,
+            Arc::new(TauriEventSink(on_event)),
+        )
     }
 
+    #[cfg(test)]
     fn start_with_sink(
         &self,
         cwd: Option<String>,
@@ -532,9 +554,29 @@ impl TerminalManager {
         rows: u16,
         sink: Arc<dyn TerminalEventSink>,
     ) -> Result<StartTerminalResponse, String> {
+        self.start_with_sink_request(cwd, columns, rows, None, None, sink)
+    }
+
+    fn start_with_sink_request(
+        &self,
+        cwd: Option<String>,
+        columns: u16,
+        rows: u16,
+        terminal_key: Option<StableTerminalKey>,
+        resume: Option<AgentResumeBinding>,
+        sink: Arc<dyn TerminalEventSink>,
+    ) -> Result<StartTerminalResponse, String> {
         let cwd = validate_working_directory(cwd)?;
+        let launch_plan = TerminalLaunchPlan::from_request(terminal_key, resume)?;
         let size = normalized_size(columns, rows);
         let mut reservation = self.reserve_start()?;
+        let binding_lease = launch_plan
+            .ownership()
+            .map(|(terminal_key, binding)| {
+                self.agent_runtime
+                    .claim_for_start(&reservation.session_id, terminal_key, binding)
+            })
+            .transpose()?;
         let spawn_permit = self.spawn_limiter.acquire()?;
 
         let pair = native_pty_system()
@@ -550,7 +592,7 @@ impl TerminalManager {
             .map_err(|error| format!("ConPTY input connection failed: {error}"))?;
 
         let mut command = CommandBuilder::new(resolve_powershell());
-        command.args(["-NoLogo", "-NoExit"]);
+        command.args(launch_plan.arguments());
         if let Some(directory) = &cwd {
             command.cwd(directory);
         }
@@ -592,7 +634,11 @@ impl TerminalManager {
             reader,
             Arc::clone(&session),
             Arc::clone(&sink),
-            (Arc::clone(&self.state), Arc::clone(&self.state_changed)),
+            ManagerRegistry {
+                state: Arc::clone(&self.state),
+                state_changed: Arc::clone(&self.state_changed),
+                agent_runtime: self.agent_runtime.clone(),
+            },
             Arc::clone(&self.worker_threads),
         )?;
 
@@ -610,6 +656,9 @@ impl TerminalManager {
         }
 
         reservation.committed = true;
+        if let Some(binding_lease) = binding_lease {
+            binding_lease.commit();
+        }
         workers.release_reaper();
 
         Ok(StartTerminalResponse {
@@ -660,6 +709,17 @@ impl TerminalManager {
             Some(session) => session.request_stop(),
             None => Ok(()),
         }
+    }
+
+    pub(crate) fn has_active_session(&self, session_id: &str) -> bool {
+        let state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        matches!(
+            state.sessions.get(session_id),
+            Some(SessionEntry::Active(_))
+        )
     }
 
     #[cfg(test)]
@@ -1011,7 +1071,11 @@ impl Drop for WorkerThreadGuard {
 }
 
 type WorkerHandleGroup = Arc<Mutex<Option<Vec<JoinHandle<()>>>>>;
-type ManagerRegistry = (Arc<Mutex<ManagerState>>, Arc<Condvar>);
+struct ManagerRegistry {
+    state: Arc<Mutex<ManagerState>>,
+    state_changed: Arc<Condvar>,
+    agent_runtime: AgentRuntime,
+}
 
 #[derive(Default)]
 struct WorkerJoinSummary {
@@ -1053,7 +1117,11 @@ fn spawn_workers(
     manager_registry: ManagerRegistry,
     worker_threads: Arc<AtomicUsize>,
 ) -> Result<WorkerSet, String> {
-    let (manager_state, manager_state_changed) = manager_registry;
+    let ManagerRegistry {
+        state: manager_state,
+        state_changed: manager_state_changed,
+        agent_runtime,
+    } = manager_registry;
     let (reader_start_sender, reader_start_receiver) = mpsc::sync_channel(1);
     let (output_start_sender, output_start_receiver) = mpsc::sync_channel(1);
     let (resize_start_sender, resize_start_receiver) = mpsc::sync_channel(1);
@@ -1257,6 +1325,7 @@ fn spawn_workers(
                 });
             }
             remove_session(&manager_state, &manager_state_changed, &wait_id);
+            agent_runtime.unbind(&wait_id);
             let _ = wait_sink.send(TerminalEvent::Exited {
                 session_id: wait_id,
                 exit_code,

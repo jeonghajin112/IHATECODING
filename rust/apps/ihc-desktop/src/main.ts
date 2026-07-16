@@ -39,6 +39,12 @@ import {
   type Phase4WorkspaceController,
 } from "./phase4-controller";
 import { createPhase3BMigrationUI } from "./phase3b-ui";
+import {
+  normalizeProviderUsageResponse,
+  selectClipboardImageSequence,
+  type AgentProvider,
+  type SafeResumePlan,
+} from "./phase5-core";
 
 type StartTerminalResponse = {
   sessionId: string;
@@ -62,6 +68,7 @@ type TerminalInput =
   | { kind: "binary"; data: number[] };
 
 const OUTPUT_SETTLED_DELAY_MS = 120;
+const COMPLETION_OUTPUT_QUIET_MS = 1_000;
 const EXIT_GAP_TIMEOUT_MS = 2_000;
 const UNBOUND_OUTPUT_MAX_BATCHES = 64;
 const UNBOUND_OUTPUT_MAX_BYTES = 1_048_576;
@@ -81,6 +88,7 @@ class TerminalPane {
   readonly terminalId: string;
   readonly projectId: string;
   readonly startDirectory: string;
+  readonly savedAgentProvider: AgentProvider | null;
   title: string;
   readonly element: HTMLElement;
 
@@ -131,6 +139,12 @@ class TerminalPane {
   private renderQueue: Promise<void> = Promise.resolve();
   private clipboardQueue: Promise<void> = Promise.resolve();
   private startCompletion: Promise<void> = Promise.resolve();
+  private completionPending = false;
+  private completionAckPending = false;
+  private completionBarrierTimer = 0;
+  private pendingCompletionKey: string | null = null;
+  private lastRenderedOutputAt = performance.now();
+  private readonly observedCompletionKeys = new Set<string>();
 
   private readonly onWindowMouseUp = (event: MouseEvent) => {
     if (event.button !== 0 || !this.selectionGestureActive) return;
@@ -152,12 +166,16 @@ class TerminalPane {
     private readonly scheduler: StartScheduler,
     projectId: string,
     savedState: WorkspaceTerminal,
+    private readonly resumePlan: SafeResumePlan,
   ) {
     this.terminalId = savedState.id;
     this.id = paneRuntimeId(projectId, savedState.id);
     this.projectId = projectId;
     this.title = savedState.name;
     this.startDirectory = savedState.startDirectory;
+    this.savedAgentProvider =
+      resumePlan.action === "resume" ? resumePlan.provider : null;
+    this.completionPending = savedState.completionPending;
 
     this.element = document.createElement("article");
     this.element.className = "terminal-pane";
@@ -165,6 +183,7 @@ class TerminalPane {
     this.element.dataset.projectId = this.projectId;
     this.element.dataset.state = this.paneState;
     this.element.dataset.active = "false";
+    this.element.dataset.completionPending = String(this.completionPending);
     this.element.setAttribute("aria-label", this.title);
 
     const header = document.createElement("header");
@@ -287,6 +306,7 @@ class TerminalPane {
     });
     this.element.addEventListener("pointerdown", () => {
       this.workspace.activatePane(this.id, false);
+      this.workspace.acknowledgePaneCompletion(this.id);
     });
     header.addEventListener("pointerdown", (event) => {
       this.workspace.beginPaneDrag(event, this.id, header);
@@ -312,6 +332,14 @@ class TerminalPane {
 
   get status() {
     return { message: this.statusMessage, tone: this.statusTone } as const;
+  }
+
+  get hasCompletionPending() {
+    return this.completionPending;
+  }
+
+  ownsRuntimeSession(sessionId: string) {
+    return this.sessionId === sessionId;
   }
 
   startAfter(barrier: Promise<void>) {
@@ -352,6 +380,19 @@ class TerminalPane {
           cwd: this.startDirectory,
           columns: Math.max(2, this.terminal.cols),
           rows: Math.max(1, this.terminal.rows),
+          terminalKey: {
+            projectId: this.projectId,
+            terminalId: this.terminalId,
+          },
+          resume:
+            this.resumePlan.action === "resume" &&
+            this.resumePlan.provider &&
+            this.resumePlan.conversationId
+              ? {
+                  provider: this.resumePlan.provider,
+                  conversationId: this.resumePlan.conversationId,
+                }
+              : null,
           onEvent,
         });
 
@@ -405,6 +446,39 @@ class TerminalPane {
     this.resizeHandle.setAttribute("aria-label", `${title} 너비 조절`);
   }
 
+  setCompletionPending(completionPending: boolean) {
+    this.completionPending = completionPending;
+    if (!completionPending) this.completionAckPending = false;
+    this.element.dataset.completionPending = String(completionPending);
+    if (!completionPending) {
+      this.pendingCompletionKey = null;
+      window.clearTimeout(this.completionBarrierTimer);
+    }
+  }
+
+  beginCompletionAcknowledgement() {
+    if (!this.completionPending || this.completionAckPending) return false;
+    this.completionAckPending = true;
+    return true;
+  }
+
+  finishCompletionAcknowledgement() {
+    this.completionAckPending = false;
+  }
+
+  queueAgentCompletion(turnKey: string) {
+    if (
+      this.disposed ||
+      this.completionPending ||
+      this.observedCompletionKeys.has(turnKey)
+    ) {
+      return;
+    }
+    this.observedCompletionKeys.add(turnKey);
+    this.pendingCompletionKey = turnKey;
+    this.armCompletionBarrier();
+  }
+
   setResizeHandleEnabled(enabled: boolean) {
     this.resizeHandle.hidden = !enabled;
     this.resizeHandle.tabIndex = enabled ? 0 : -1;
@@ -439,6 +513,7 @@ class TerminalPane {
     window.clearTimeout(this.outputSettledTimer);
     window.clearTimeout(this.exitGapTimer);
     window.clearTimeout(this.unboundOutputTimer);
+    window.clearTimeout(this.completionBarrierTimer);
     this.resizeObserver.disconnect();
     window.removeEventListener("mouseup", this.onWindowMouseUp, true);
     window.removeEventListener("blur", this.onWindowBlur);
@@ -505,9 +580,11 @@ class TerminalPane {
 
     this.terminalDisposables.push(
       this.terminal.onData((data) => {
+        this.workspace.acknowledgePaneCompletion(this.id);
         this.queueInput({ kind: "text", data });
       }),
       this.terminal.onBinary((data) => {
+        this.workspace.acknowledgePaneCompletion(this.id);
         const bytes = binaryStringToRawBytes(data);
         this.queueInput({ kind: "binary", data: bytes });
       }),
@@ -757,6 +834,8 @@ class TerminalPane {
         ) {
           this.terminal.scrollToBottom();
         }
+        this.lastRenderedOutputAt = performance.now();
+        if (this.pendingCompletionKey) this.armCompletionBarrier();
         resolve();
       });
     });
@@ -963,6 +1042,7 @@ class TerminalPane {
   }
 
   private pasteClipboard() {
+    this.workspace.acknowledgePaneCompletion(this.id);
     this.resumeAutoFollowForUserIntent();
     const commit = this.reserveInputSlot();
     if (!commit) return;
@@ -981,6 +1061,43 @@ class TerminalPane {
       });
   }
 
+  private armCompletionBarrier() {
+    window.clearTimeout(this.completionBarrierTimer);
+    const key = this.pendingCompletionKey;
+    if (!key || this.disposed || this.completionPending) return;
+    const quietFor = performance.now() - this.lastRenderedOutputAt;
+    const delayMs = Math.max(0, COMPLETION_OUTPUT_QUIET_MS - quietFor);
+    this.completionBarrierTimer = window.setTimeout(() => {
+      if (
+        this.disposed ||
+        this.completionPending ||
+        this.pendingCompletionKey !== key
+      ) {
+        return;
+      }
+      if (performance.now() - this.lastRenderedOutputAt < COMPLETION_OUTPUT_QUIET_MS) {
+        this.armCompletionBarrier();
+        return;
+      }
+      this.renderQueue
+        .then(() => nextAnimationFrame())
+        .then(() => {
+          if (
+            !this.disposed &&
+            !this.completionPending &&
+            this.pendingCompletionKey === key
+          ) {
+            return this.workspace.commitPaneCompletion(this.id);
+          }
+          return false;
+        })
+        .then((saved) => {
+          if (saved) this.pendingCompletionKey = null;
+        })
+        .catch(() => undefined);
+    }, delayMs);
+  }
+
   private async readClipboardInput(): Promise<TerminalInput | null> {
     let imageDetected = false;
     if (typeof navigator.clipboard.read === "function") {
@@ -993,9 +1110,8 @@ class TerminalPane {
     }
 
     if (imageDetected) {
-      // Codex consumes Ctrl+V as its image-paste action. Grok needs ESC v, but
-      // process-aware Codex/Grok routing is intentionally deferred to Phase 5.
-      return { kind: "text", data: "\u0016" };
+      const sequence = selectClipboardImageSequence(this.savedAgentProvider);
+      return sequence ? { kind: "text", data: sequence } : null;
     }
 
     const text = await navigator.clipboard.readText();
@@ -1173,6 +1289,7 @@ class TerminalWorkspace {
   private readonly restoredProjects = new Set<string>();
   private readonly projectOrders = new Map<string, string[]>();
   private readonly projectRatios = new Map<string, Record<string, number[]>>();
+  private readonly resumePlans = new Map<string, SafeResumePlan>();
   private readonly activeRows = new Map<string, ActiveTerminalRow>();
   private readonly rowsHost = document.createElement("div");
   private readonly inactivePaneBin = document.createElement("div");
@@ -1257,6 +1374,14 @@ class TerminalWorkspace {
       layoutKey: string,
       ratios: number[],
     ) => void,
+    private readonly onPaneCompletionCallback: (
+      projectId: string,
+      terminalId: string,
+    ) => Promise<boolean>,
+    private readonly onPaneCompletionAcknowledgedCallback: (
+      projectId: string,
+      terminalId: string,
+    ) => Promise<boolean>,
   ) {
     this.rowsHost.className = "terminal-rows";
     this.inactivePaneBin.className = "inactive-pane-bin";
@@ -1307,7 +1432,17 @@ class TerminalWorkspace {
       return null;
     }
 
-    const pane = new TerminalPane(this, this.scheduler, projectId, savedState);
+    const plan = this.resumePlans.get(paneRuntimeId(projectId, savedState.id)) ?? {
+      projectId,
+      terminalId: savedState.id,
+      action: "shell",
+      provider: null,
+      conversationId: null,
+      candidates: [],
+      blockingReasons: [],
+      duplicateOwners: [],
+    };
+    const pane = new TerminalPane(this, this.scheduler, projectId, savedState, plan);
     pane.setCatalogWritable(this.catalogWritable);
     this.panes.set(pane.id, pane);
     const order = this.projectOrders.get(projectId) ?? [];
@@ -1365,9 +1500,22 @@ class TerminalWorkspace {
     if (this.restoredProjects.has(project.id)) {
       for (const terminal of project.terminals) {
         const existing = this.panes.get(paneRuntimeId(project.id, terminal.id));
-        if (existing) existing.setTitle(terminal.name);
+        if (existing) {
+          existing.setTitle(terminal.name);
+          existing.setCompletionPending(terminal.completionPending);
+        }
         else this.addPane(project.id, terminal, false);
       }
+    }
+  }
+
+  setResumePlans(plans: SafeResumePlan[]) {
+    this.resumePlans.clear();
+    for (const plan of plans) {
+      this.resumePlans.set(
+        paneRuntimeId(plan.projectId, plan.terminalId),
+        plan,
+      );
     }
   }
 
@@ -1560,6 +1708,47 @@ class TerminalWorkspace {
   releaseSession(sessionId: string, paneId: string) {
     if (this.sessionOwners.get(sessionId) === paneId) {
       this.sessionOwners.delete(sessionId);
+    }
+  }
+
+  queueAgentCompletion(
+    projectId: string,
+    terminalId: string,
+    runtimeSessionId: string,
+    turnKey: string,
+  ) {
+    const pane = this.panes.get(paneRuntimeId(projectId, terminalId));
+    if (pane?.ownsRuntimeSession(runtimeSessionId)) {
+      pane.queueAgentCompletion(turnKey);
+    }
+  }
+
+  commitPaneCompletion(paneId: string): Promise<boolean> {
+    const pane = this.panes.get(paneId);
+    if (!pane) return Promise.resolve(false);
+    return this.onPaneCompletionCallback(pane.projectId, pane.terminalId);
+  }
+
+  acknowledgePaneCompletion(paneId: string) {
+    const pane = this.panes.get(paneId);
+    if (!pane?.beginCompletionAcknowledgement()) return;
+    void this.onPaneCompletionAcknowledgedCallback(
+      pane.projectId,
+      pane.terminalId,
+    ).finally(() => pane.finishCompletionAcknowledgement());
+  }
+
+  setTerminalCompletionPending(
+    projectId: string,
+    terminalId: string,
+    completionPending: boolean,
+    playSound = false,
+  ) {
+    this.panes
+      .get(paneRuntimeId(projectId, terminalId))
+      ?.setCompletionPending(completionPending);
+    if (completionPending && playSound) {
+      void invoke("play_completion_sound").catch(() => undefined);
     }
   }
 
@@ -2277,6 +2466,127 @@ class BrowserController {
   }
 }
 
+class ProviderUsageController {
+  private timer = 0;
+  private requestRunning = false;
+  private disposed = false;
+
+  constructor(
+    private readonly codexFiveHour: HTMLElement,
+    private readonly codexWeekly: HTMLElement,
+    private readonly grokRemaining: HTMLElement,
+  ) {}
+
+  start() {
+    void this.refresh();
+    this.timer = window.setInterval(() => void this.refresh(), 15_000);
+  }
+
+  dispose() {
+    this.disposed = true;
+    window.clearInterval(this.timer);
+  }
+
+  private async refresh() {
+    if (this.disposed || this.requestRunning) return;
+    this.requestRunning = true;
+    try {
+      const usage = normalizeProviderUsageResponse(
+        await invoke<unknown>("read_provider_usage"),
+      );
+      if (this.disposed) return;
+      this.renderLimit(this.codexFiveHour, usage.codex.fiveHour, "5시간");
+      this.renderLimit(this.codexWeekly, usage.codex.weekly, "주간");
+      this.renderLimit(this.grokRemaining, usage.grok.weekly, "크레딧");
+      for (const item of document.querySelectorAll<HTMLElement>(".provider-usage-item")) {
+        item.dataset.stale = "false";
+      }
+    } catch {
+      if (this.disposed) return;
+      for (const item of document.querySelectorAll<HTMLElement>(".provider-usage-item")) {
+        item.dataset.stale = "true";
+      }
+    } finally {
+      this.requestRunning = false;
+    }
+  }
+
+  private renderLimit(
+    element: HTMLElement,
+    limit: { remainingPercent: number; resetsAt: string } | null,
+    label: string,
+  ) {
+    if (!limit) {
+      element.textContent = "--";
+      element.title = `${label} 남은 한도를 찾지 못했습니다.`;
+      return;
+    }
+    const rounded = Math.round(limit.remainingPercent * 10) / 10;
+    element.textContent = `${rounded}%`;
+    const reset = new Date(limit.resetsAt);
+    element.title = `${label} 남은 한도 ${rounded}% · ${reset.toLocaleString()} 초기화`;
+  }
+}
+
+class AgentEventController {
+  private readonly channel = new Channel<unknown>();
+  private disposed = false;
+
+  constructor(
+    private readonly workspace: TerminalWorkspace,
+    private readonly reportError: (message: string) => void,
+  ) {
+    this.channel.onmessage = (value) => this.onMessage(value);
+  }
+
+  async start() {
+    try {
+      await invoke("subscribe_agent_events", { onEvent: this.channel });
+    } catch (error) {
+      if (!this.disposed) {
+        this.reportError(`완료 알림 연결 실패: ${errorMessage(error)}`);
+      }
+    }
+  }
+
+  dispose() {
+    this.disposed = true;
+    this.channel.onmessage = () => undefined;
+  }
+
+  private onMessage(value: unknown) {
+    if (this.disposed || !isRecord(value)) return;
+    const event = value.event;
+    const data = isRecord(value.data) ? value.data : null;
+    if (event !== "turnComplete" || !data) return;
+    const terminalKey = isRecord(data.terminalKey) ? data.terminalKey : null;
+    const provider = data.provider;
+    if (
+      !terminalKey ||
+      (provider !== "codex" && provider !== "grok") ||
+      typeof data.runtimeSessionId !== "string" ||
+      typeof data.conversationId !== "string" ||
+      typeof terminalKey.projectId !== "string" ||
+      typeof terminalKey.terminalId !== "string" ||
+      typeof data.observedAtUnixMs !== "number" ||
+      !Number.isSafeInteger(data.observedAtUnixMs)
+    ) {
+      return;
+    }
+    const turnKey = [
+      provider,
+      data.conversationId.toLowerCase(),
+      data.observedAtUnixMs,
+    ].join(":");
+    this.workspace.queueAgentCompletion(
+      terminalKey.projectId,
+      terminalKey.terminalId,
+      data.runtimeSessionId,
+      turnKey,
+    );
+  }
+}
+
 async function stopBackendSession(sessionId: string) {
   await invoke("stop_terminal", { sessionId }).catch(() => undefined);
 }
@@ -2342,6 +2652,10 @@ function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error);
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 function requireElement(id: string): HTMLElement {
   const element = document.getElementById(id);
   if (!element) throw new Error(`Missing #${id}`);
@@ -2402,6 +2716,9 @@ const upgradeSourceSha = requireElement("phase3-upgrade-source-sha");
 const commitUpgradeButton = requireButton("commit-phase3-upgrade");
 const closeUpgradeButton = requireButton("close-phase3-upgrade");
 const upgradeError = requireElement("phase3-upgrade-error");
+const codexFiveHourRemaining = requireElement("codex-five-hour-remaining");
+const codexWeeklyRemaining = requireElement("codex-weekly-remaining");
+const grokRemaining = requireElement("grok-remaining");
 
 let controller: Phase4WorkspaceController | null = null;
 const workspace = new TerminalWorkspace(
@@ -2419,8 +2736,23 @@ const workspace = new TerminalWorkspace(
     controller?.onPaneReordered(projectId, paneId, target),
   (projectId, layoutKey, ratios) =>
     controller?.onPaneRatiosChanged(projectId, layoutKey, ratios),
+  (projectId, terminalId) =>
+    controller?.onAgentTurnCompleted(projectId, terminalId) ?? Promise.resolve(false),
+  (projectId, terminalId) =>
+    controller?.acknowledgeTerminalCompletion(projectId, terminalId) ??
+    Promise.resolve(false),
 );
 const browser = new BrowserController(workspace, browserSurface, browserButton);
+const agentEvents = new AgentEventController(workspace, (message) =>
+  workspace.setFooterStatus(message, "error"),
+);
+void agentEvents.start();
+const providerUsage = new ProviderUsageController(
+  codexFiveHourRemaining,
+  codexWeeklyRemaining,
+  grokRemaining,
+);
+providerUsage.start();
 controller = createPhase4WorkspaceController(workspace, {
   projectList,
   projectCount,
@@ -2454,7 +2786,20 @@ const migrationUi = createPhase3BMigrationUI({
   },
 });
 
-const initializationPromise = controller.initialize();
+let productionMigrationError: string | null = null;
+const productionMigrationPromise = invoke("import_discovered_production_catalog").catch(
+  (error) => {
+    productionMigrationError = `기존 IHATECODING 프로젝트 자동 가져오기를 건너뛰었습니다. ${errorMessage(error)}`;
+  },
+);
+const initializationPromise = productionMigrationPromise
+  .then(() => controller?.initialize())
+  .then((result) => {
+    if (productionMigrationError) {
+      workspace.setFooterStatus(productionMigrationError, "error");
+    }
+    return result;
+  });
 const migrationInitializationPromise = initializationPromise.then(() =>
   migrationUi.initialize(),
 );
@@ -2470,6 +2815,8 @@ void currentAppWindow.onCloseRequested(async (event) => {
     // the guaranteed escape hatch; Job Object ownership cleans descendants as
     // the application process exits.
     migrationUi.dispose();
+    agentEvents.dispose();
+    providerUsage.dispose();
     controller?.dispose();
     void browser.dispose();
     void workspace.dispose();
@@ -2484,6 +2831,8 @@ void currentAppWindow.onCloseRequested(async (event) => {
     await Promise.all([initializationPromise, migrationInitializationPromise]);
     await controller?.flushSaves();
     migrationUi.dispose();
+    agentEvents.dispose();
+    providerUsage.dispose();
     controller?.dispose();
     await browser.dispose();
     // Use one backend-owned barrier instead of twenty pane-local stop IPCs. It
@@ -2502,6 +2851,8 @@ void currentAppWindow.onCloseRequested(async (event) => {
 window.addEventListener("beforeunload", () => {
   if (closeBarrierRunning) return;
   migrationUi.dispose();
+  agentEvents.dispose();
+  providerUsage.dispose();
   controller?.dispose();
   void browser.dispose();
   void workspace.dispose();

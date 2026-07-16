@@ -229,7 +229,7 @@ export class Phase3BMigrationUI {
       this.renderInspection(inspection);
       this.result.textContent =
         inspection.blockingErrors.length === 0
-          ? "검사가 끝났습니다. 아래 교체 버튼을 눌러야만 Rust Preview 저장소가 변경됩니다."
+          ? "검사가 끝났습니다. 아래 가져오기 버튼을 눌러야만 Rust 저장소가 변경됩니다."
           : "차단 항목을 해결한 새 복사본을 다시 검사하세요.";
     } catch (value) {
       if (!this.isCurrent(generation)) return;
@@ -257,7 +257,7 @@ export class Phase3BMigrationUI {
     const generation = ++this.operationGeneration;
     this.setBusy(true);
     this.error.textContent = "";
-    this.result.textContent = "검사한 복사본을 Rust Preview 저장소에 반영하고 있습니다…";
+    this.result.textContent = "검사한 복사본을 Rust 저장소에 반영하고 있습니다…";
 
     try {
       const value = await this.performReplacement(generation, () =>
@@ -273,7 +273,7 @@ export class Phase3BMigrationUI {
       const projects = preview.draft?.projects ?? [];
       const terminals = projects.reduce((sum, project) => sum + project.terminals.length, 0);
       this.result.textContent =
-        `Rust Preview 교체 완료 · 프로젝트 ${projects.length}개 · PowerShell ${terminals}개 ` +
+        `Rust 저장소 가져오기 완료 · 프로젝트 ${projects.length}개 · PowerShell ${terminals}개 ` +
         "(canonical 상태로 반영했으며 Codex/Grok 세션은 자동 재개하지 않았습니다.)";
       this.inspection = null;
       this.inspectedPath = "";

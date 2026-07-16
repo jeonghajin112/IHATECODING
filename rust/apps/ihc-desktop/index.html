@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <link rel="stylesheet" href="/assets/main.css" />
-    <title>IHATECODING Rust Preview · Phase 4</title>
+    <title>IHATECODING · Rust</title>
     <script type="module" src="/assets/main.js" defer></script>
   </head>
   <body>
@@ -14,7 +14,7 @@
           <span class="brand-mark" aria-hidden="true">I</span>
           <span>
             <strong>IHATECODING</strong>
-            <small>RUST PREVIEW · PHASE 4</small>
+            <small>RUST · NATIVE</small>
           </span>
         </div>
 
@@ -25,7 +25,7 @@
         <nav id="project-list" class="project-list" aria-label="저장된 프로젝트"></nav>
         <div class="sidebar-footer">
           <button id="create-project" class="create-project" type="button" disabled>＋ 새 프로젝트</button>
-          <section class="storage-panel" aria-label="Rust Preview 저장소">
+          <section class="storage-panel" aria-label="Rust 저장소">
             <div class="storage-panel-status">
               <span id="storage-mode-dot" class="storage-mode-dot" aria-hidden="true"></span>
               <span id="storage-mode-badge" class="storage-mode-badge" role="status">저장소 확인 중</span>
@@ -117,6 +117,24 @@
           <span id="status" role="status" aria-live="polite" aria-atomic="true">
             프로젝트를 불러오는 중…
           </span>
+          <section class="provider-usage" aria-label="AI 남은 사용량">
+            <div class="provider-usage-item" data-provider="codex" title="Codex 남은 한도">
+              <svg class="provider-icon" viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M12 3.2 16 5.5l4.1-.1v4.7l2 3.5-4.1 2.3-2 3.6-4-2.4-4 2.4-2-3.6-4.1-2.3 2-3.5V5.4l4.1.1L12 3.2Zm0 4.1-4 2.3v4.8l4 2.3 4-2.3V9.6l-4-2.3Z" />
+              </svg>
+              <span class="provider-name">CODEX</span>
+              <span id="codex-five-hour-remaining" class="usage-value">--</span>
+              <span class="usage-divider">·</span>
+              <span id="codex-weekly-remaining" class="usage-value">--</span>
+            </div>
+            <div class="provider-usage-item" data-provider="grok" title="Grok 남은 한도">
+              <svg class="provider-icon" viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M4 4h4.1l3.9 5.1L15.9 4H20l-6 7.8L20.3 20h-4.2L12 14.5 7.9 20H3.7l6.2-8.2L4 4Z" />
+              </svg>
+              <span class="provider-name">GROK</span>
+              <span id="grok-remaining" class="usage-value">--</span>
+            </div>
+          </section>
         </footer>
       </section>
 
@@ -244,7 +262,7 @@
             <button id="close-legacy-import" type="button">닫기</button>
             <button id="inspect-legacy-copy" type="submit">검사</button>
             <button id="commit-legacy-import" class="dialog-submit" type="button" disabled>
-              Rust Preview 교체
+              Rust 저장소로 가져오기
             </button>
           </div>
         </form>

@@ -1,68 +1,224 @@
+[CmdletBinding()]
+param(
+    [Parameter()]
+    [switch] $NoInstaller,
+
+    [Parameter()]
+    [switch] $SkipTests,
+
+    [Parameter()]
+    [switch] $Cutover,
+
+    [Parameter()]
+    [switch] $AllowUnsignedLocalCutover,
+
+    [Parameter()]
+    [string] $CandidatePath,
+
+    [Parameter()]
+    [string] $ApprovedPublisherThumbprint
+)
+
 $ErrorActionPreference = 'Stop'
-$project = Join-Path $PSScriptRoot 'PowerWorkspace\PowerWorkspace.csproj'
-$webTerminal = Join-Path $PSScriptRoot 'PowerWorkspace\WebTerminal'
-$publish = Join-Path $PSScriptRoot 'publish'
+$desktop = Join-Path $PSScriptRoot 'rust\apps\ihc-desktop'
+$cargoBin = Join-Path $env:USERPROFILE '.cargo\bin'
+$defaultReleaseExecutable = Join-Path $desktop 'src-tauri\target\release\ihatecoding.exe'
+$releaseExecutable = $defaultReleaseExecutable
 $target = Join-Path $PSScriptRoot 'IHATECODING.exe'
 
-function Get-AvailablePreviousBuildPath {
+if ($CandidatePath) {
+    if (-not $Cutover) {
+        throw '-CandidatePath is accepted only with -Cutover.'
+    }
+    $releaseExecutable = [System.IO.Path]::GetFullPath($CandidatePath)
+}
+else {
+    if (-not (Test-Path -LiteralPath (Join-Path $cargoBin 'cargo.exe') -PathType Leaf)) {
+        throw 'Rust stable is required. Install it from https://rustup.rs and run this script again.'
+    }
+    if ($null -eq (Get-Command npm -ErrorAction SilentlyContinue)) {
+        throw 'Node.js 22 or newer is required.'
+    }
+}
+
+function Get-AvailableRollbackPath {
     $index = 0
     do {
         $suffix = if ($index -eq 0) { '' } else { ".$index" }
-        $candidate = Join-Path $PSScriptRoot "IHATECODING.previous$suffix.exe"
+        $candidate = Join-Path $PSScriptRoot "IHATECODING.csharp-rollback$suffix.exe"
         $index++
     } while (Test-Path -LiteralPath $candidate)
     return $candidate
 }
 
-Write-Host 'Building IHATECODING...' -ForegroundColor Cyan
-$xtermBundle = Join-Path $webTerminal 'node_modules\@xterm\xterm\lib\xterm.js'
-$nodePtyBundle = Join-Path $webTerminal 'node_modules\node-pty\prebuilds\win32-x64\conpty.node'
-if (-not (Test-Path -LiteralPath $xtermBundle) -or
-    -not (Test-Path -LiteralPath $nodePtyBundle)) {
-    Write-Host 'Restoring terminal assets...' -ForegroundColor Cyan
-    npm ci --prefix $webTerminal --no-audit --no-fund
-    if ($LASTEXITCODE -ne 0) { throw 'Terminal asset restore failed.' }
+function Get-AvailablePreviousBuildPath {
+    $index = 0
+    do {
+        $suffix = if ($index -eq 0) { '' } else { ".$index" }
+        $candidate = Join-Path $PSScriptRoot "IHATECODING.previous-build$suffix.exe"
+        $index++
+    } while (Test-Path -LiteralPath $candidate)
+    return $candidate
 }
-if (Test-Path -LiteralPath $publish) {
-    $workspaceRoot = [IO.Path]::GetFullPath($PSScriptRoot).TrimEnd([IO.Path]::DirectorySeparatorChar)
-    $publishPath = [IO.Path]::GetFullPath($publish)
-    if (-not $publishPath.StartsWith($workspaceRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
-        throw "Refusing to clean a publish folder outside the workspace: $publishPath"
+
+function Test-LegacyCSharpExecutable {
+    param([Parameter(Mandatory)] [string] $Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+    $version = (Get-Item -LiteralPath $Path).VersionInfo
+    return $version.FileDescription -eq 'IHATECODING' -and
+        $version.ProductName -eq 'IHATECODING' -and
+        $version.OriginalFilename -eq 'IHATECODING.dll'
+}
+
+function Test-IHATECODINGRustCandidate {
+    param([Parameter(Mandatory)] [string] $Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+    $version = (Get-Item -LiteralPath $Path).VersionInfo
+    if ($version.FileDescription -ne 'IHATECODING' -or
+        $version.ProductName -ne 'IHATECODING' -or
+        $version.CompanyName -ne 'ihatecoding' -or
+        -not [string]::IsNullOrEmpty($version.OriginalFilename)) {
+        return $false
     }
-    Remove-Item -LiteralPath $publishPath -Recurse -Force
+    $bytes = [System.IO.File]::ReadAllBytes($Path)
+    $ascii = [System.Text.Encoding]::ASCII.GetString($bytes)
+    return $ascii.Contains('IHATECODING_PHASE6_STATE_ROOT')
 }
-dotnet publish $project -c Release -r win-x64 --self-contained false -o $publish --nologo
-if ($LASTEXITCODE -ne 0) { throw 'IHATECODING build failed.' }
 
-# Native dependencies can include debug symbols that users do not need.
-Get-ChildItem -LiteralPath $publish -Filter '*.pdb' -File -Recurse | Remove-Item -Force
+function Preserve-InitialRollback {
+    if (-not (Test-Path -LiteralPath $target -PathType Leaf)) { return $null }
+    $existing = @(Get-ChildItem -LiteralPath $PSScriptRoot -Filter 'IHATECODING.csharp-rollback*.exe' -File)
 
-$publishedExecutable = Join-Path $publish 'IHATECODING.exe'
+    if (-not (Test-LegacyCSharpExecutable $target)) {
+        $verified = @($existing | Where-Object { Test-LegacyCSharpExecutable $_.FullName })
+        if ($verified.Count -eq 0) {
+            throw 'Cutover is blocked because no verified C# rollback executable is available.'
+        }
+        return $verified[0].FullName
+    }
+
+    $sourceHash = (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash
+    foreach ($candidate in $existing) {
+        if ((Test-LegacyCSharpExecutable $candidate.FullName) -and
+            [System.StringComparer]::OrdinalIgnoreCase.Equals(
+                $sourceHash,
+                (Get-FileHash -LiteralPath $candidate.FullName -Algorithm SHA256).Hash
+            )) {
+            return $candidate.FullName
+        }
+    }
+
+    $rollback = Get-AvailableRollbackPath
+    Copy-Item -LiteralPath $target -Destination $rollback
+    $rollbackHash = (Get-FileHash -LiteralPath $rollback -Algorithm SHA256).Hash
+    if (-not (Test-LegacyCSharpExecutable $rollback) -or
+        -not [System.StringComparer]::OrdinalIgnoreCase.Equals($sourceHash, $rollbackHash)) {
+        Remove-Item -LiteralPath $rollback -Force -ErrorAction SilentlyContinue
+        throw 'The C# rollback copy did not match the current executable.'
+    }
+    return $rollback
+}
+
+if (-not $CandidatePath) {
+    $env:Path = "$cargoBin;$env:Path"
+    Push-Location $desktop
+    try {
+        Write-Host 'Restoring frontend dependencies...' -ForegroundColor Cyan
+        npm ci --no-audit --no-fund
+        if ($LASTEXITCODE -ne 0) { throw 'Frontend dependency restore failed.' }
+
+        if (-not $SkipTests) {
+            Write-Host 'Running frontend and Rust verification...' -ForegroundColor Cyan
+            npm test
+            if ($LASTEXITCODE -ne 0) { throw 'Frontend tests failed.' }
+            cargo test --manifest-path .\src-tauri\Cargo.toml --all-targets
+            if ($LASTEXITCODE -ne 0) { throw 'Rust tests failed.' }
+            cargo clippy --manifest-path .\src-tauri\Cargo.toml --all-targets --all-features -- -D warnings
+            if ($LASTEXITCODE -ne 0) { throw 'Rust lint failed.' }
+        }
+
+        Write-Host 'Building IHATECODING Rust production application...' -ForegroundColor Cyan
+        if ($NoInstaller) {
+            npx tauri build --no-bundle --ci
+        }
+        else {
+            npx tauri build --bundles nsis --no-sign --ci
+        }
+        if ($LASTEXITCODE -ne 0) { throw 'IHATECODING Rust build failed.' }
+    }
+    finally {
+        Pop-Location
+    }
+}
+
+if (-not (Test-Path -LiteralPath $releaseExecutable -PathType Leaf)) {
+    throw "The production build did not create $releaseExecutable"
+}
+
+if ($CandidatePath) {
+    Write-Host "Selected candidate: $releaseExecutable" -ForegroundColor Green
+}
+else {
+    Write-Host "Built candidate: $releaseExecutable" -ForegroundColor Green
+}
+if (-not $NoInstaller -and -not $CandidatePath) {
+    Write-Host (Join-Path $desktop 'src-tauri\target\release\bundle\nsis') -ForegroundColor Green
+}
+
+if (-not $Cutover) {
+    Write-Host 'The current default executable was not changed. Use -Cutover only after the Phase 6 release gates pass.' -ForegroundColor Yellow
+    return
+}
+
+if (-not (Test-IHATECODINGRustCandidate $releaseExecutable)) {
+    throw 'Cutover rejected a candidate that is not the expected IHATECODING Rust application.'
+}
+
+$signature = Get-AuthenticodeSignature -LiteralPath $releaseExecutable
+if ($signature.Status -eq [System.Management.Automation.SignatureStatus]::NotSigned) {
+    if (-not $AllowUnsignedLocalCutover) {
+        throw 'Cutover requires a valid Authenticode signature. Use -AllowUnsignedLocalCutover only for an explicitly accepted local development build.'
+    }
+}
+elseif ($signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid) {
+    throw "Cutover rejected an invalid Authenticode signature: $($signature.Status)"
+}
+else {
+    $approved = ($ApprovedPublisherThumbprint -replace '[^0-9A-Fa-f]', '').ToUpperInvariant()
+    $actual = if ($null -eq $signature.SignerCertificate) {
+        ''
+    }
+    else {
+        ($signature.SignerCertificate.Thumbprint -replace '[^0-9A-Fa-f]', '').ToUpperInvariant()
+    }
+    if ($approved.Length -lt 40 -or
+        -not [System.StringComparer]::OrdinalIgnoreCase.Equals($approved, $actual)) {
+        throw 'Cutover rejected a candidate whose publisher thumbprint was not explicitly approved.'
+    }
+    if ($null -eq $signature.TimeStamperCertificate) {
+        throw 'Cutover rejected a signed candidate without a timestamp certificate.'
+    }
+}
+
+$rollback = Preserve-InitialRollback
+if ($rollback) {
+    Write-Host "Rollback preserved: $rollback" -ForegroundColor Yellow
+}
+
 try {
-    Copy-Item -LiteralPath $publishedExecutable -Destination $target -Force
+    Copy-Item -LiteralPath $releaseExecutable -Destination $target -Force
 }
 catch [System.IO.IOException] {
-    # Windows allows a running executable to be renamed, so keep the open build alive
-    # and place the new build at the normal launch path without stopping user sessions.
     $previous = Get-AvailablePreviousBuildPath
     Move-Item -LiteralPath $target -Destination $previous
-    Copy-Item -LiteralPath $publishedExecutable -Destination $target -Force
+    Copy-Item -LiteralPath $releaseExecutable -Destination $target -Force
+    Write-Host "The running previous build remains active and was preserved as: $previous" -ForegroundColor Yellow
+}
+catch [System.UnauthorizedAccessException] {
+    $previous = Get-AvailablePreviousBuildPath
+    Move-Item -LiteralPath $target -Destination $previous
+    Copy-Item -LiteralPath $releaseExecutable -Destination $target -Force
+    Write-Host "The running previous build remains active and was preserved as: $previous" -ForegroundColor Yellow
 }
 
-$legacyTargets = @(
-    (Join-Path $PSScriptRoot 'XXCODING.exe'),
-    (Join-Path $PSScriptRoot 'PowerWorkspace.exe')
-)
-foreach ($legacyTarget in $legacyTargets) {
-    if (Test-Path -LiteralPath $legacyTarget) {
-        try {
-            Remove-Item -LiteralPath $legacyTarget -Force
-        }
-        catch {
-            # A still-running legacy build can be renamed without closing its window.
-            $previous = Get-AvailablePreviousBuildPath
-            Move-Item -LiteralPath $legacyTarget -Destination $previous
-        }
-    }
-}
-Write-Host "Built: $target" -ForegroundColor Green
+Write-Host "Cut over: $target" -ForegroundColor Green

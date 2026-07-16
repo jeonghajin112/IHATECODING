@@ -1,12 +1,22 @@
+mod agent_runtime;
 mod legacy_import;
+mod production_import;
 mod project_store;
+mod provider_usage;
 mod pty;
 mod workspace_store;
 
+use agent_runtime::{
+    AgentBindingSnapshot, AgentEvent, AgentResumeBinding, AgentRuntime, StableTerminalKey,
+};
 use legacy_import::{
     CommitLegacyCatalogRequest, InspectLegacyCatalogRequest, LegacyImportError,
     LegacyImportErrorCode, LegacyImportMode, LegacyImportPolicy, LegacyImportService,
     LegacyInspection, LegacyTabKind, LegacyWorkspaceDraft, PHASE3_PREVIEW_SOURCE_FORMAT,
+};
+use production_import::{
+    ProductionImportError, ProductionImportErrorCode, ProductionImportPolicy,
+    ProductionImportService,
 };
 use project_store::{
     InspectProjectCatalogCopyRequest, LoadProjectCatalogResponse, PROJECT_CATALOG_SCHEMA_VERSION,
@@ -15,7 +25,12 @@ use project_store::{
 use pty::{StartTerminalResponse, TerminalEngineStatus, TerminalEvent, TerminalManager};
 use serde::Serialize;
 use serde_json::Value;
-use std::{collections::BTreeMap, env, path::PathBuf, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    env, io,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 use tauri::{Manager, State, Webview, ipc::Channel};
 use workspace_store::{
     ImportProvenanceV1, RecoveryCandidateSummary, RecoveryPreview, SaveWorkspaceRequest,
@@ -27,6 +42,25 @@ use workspace_store::{
 const MAIN_WEBVIEW_LABEL: &str = "main";
 const JS_MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 const ABSENT_WRITTEN_AT_UTC: &str = "1970-01-01T00:00:00Z";
+const PHASE6_STATE_ROOT_ENV: &str = "IHATECODING_PHASE6_STATE_ROOT";
+const PHASE6_SMOKE_PREFIX: &str = "ihatecoding-phase6-";
+const PHASE6_SMOKE_MARKER: &str = ".ihatecoding-phase6-root";
+
+#[tauri::command]
+fn read_provider_usage() -> provider_usage::ProviderUsageResponse {
+    provider_usage::read_provider_usage()
+}
+
+#[tauri::command]
+fn play_completion_sound() {
+    #[cfg(windows)]
+    // SAFETY: MessageBeep takes a value-only message style and retains no Rust data.
+    unsafe {
+        let _ = windows_sys::Win32::System::Diagnostics::Debug::MessageBeep(
+            windows_sys::Win32::UI::WindowsAndMessaging::MB_OK,
+        );
+    }
+}
 
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
@@ -56,6 +90,27 @@ impl From<LegacyImportError> for Phase3bCommandError {
             message: error.message,
             retryable: error.retryable,
             json_pointer: error.json_pointer,
+        })
+    }
+}
+
+impl From<ProductionImportError> for Phase3bCommandError {
+    fn from(error: ProductionImportError) -> Self {
+        let code = match error.code {
+            ProductionImportErrorCode::MissingSource | ProductionImportErrorCode::InvalidSource => {
+                StorageErrorCode::InvalidSource
+            }
+            ProductionImportErrorCode::TooLarge => StorageErrorCode::TooLarge,
+            ProductionImportErrorCode::SourceChanged => StorageErrorCode::SourceChanged,
+            ProductionImportErrorCode::PathDenied => StorageErrorCode::PathDenied,
+            ProductionImportErrorCode::CorruptStaging => StorageErrorCode::InvalidSource,
+            ProductionImportErrorCode::Io => StorageErrorCode::Io,
+        };
+        Self::Storage(StorageError {
+            code,
+            message: error.message,
+            retryable: error.retryable,
+            json_pointer: None,
         })
     }
 }
@@ -103,12 +158,52 @@ async fn start_terminal(
     cwd: Option<String>,
     columns: u16,
     rows: u16,
+    terminal_key: Option<StableTerminalKey>,
+    resume: Option<AgentResumeBinding>,
     on_event: Channel<TerminalEvent>,
 ) -> Result<StartTerminalResponse, String> {
     let manager = manager.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || manager.start(cwd, columns, rows, on_event))
-        .await
-        .map_err(|error| format!("Terminal start worker failed: {error}"))?
+    tauri::async_runtime::spawn_blocking(move || {
+        manager.start(cwd, columns, rows, terminal_key, resume, on_event)
+    })
+    .await
+    .map_err(|error| format!("Terminal start worker failed: {error}"))?
+}
+
+#[tauri::command]
+fn subscribe_agent_events(
+    webview: Webview,
+    runtime: State<'_, AgentRuntime>,
+    on_event: Channel<AgentEvent>,
+) -> Result<(), String> {
+    ensure_agent_main_webview(&webview)?;
+    runtime.subscribe(on_event)
+}
+
+#[tauri::command]
+fn bind_agent_session(
+    webview: Webview,
+    manager: State<'_, TerminalManager>,
+    runtime: State<'_, AgentRuntime>,
+    session_id: String,
+    terminal_key: StableTerminalKey,
+    resume: AgentResumeBinding,
+) -> Result<AgentBindingSnapshot, String> {
+    ensure_agent_main_webview(&webview)?;
+    if !manager.has_active_session(&session_id) {
+        return Err("The terminal session is not active.".to_owned());
+    }
+    runtime.bind(&session_id, terminal_key, resume)
+}
+
+#[tauri::command]
+fn unbind_agent_session(
+    webview: Webview,
+    runtime: State<'_, AgentRuntime>,
+    session_id: String,
+) -> Result<Option<AgentBindingSnapshot>, String> {
+    ensure_agent_main_webview(&webview)?;
+    Ok(runtime.unbind(&session_id))
 }
 
 #[tauri::command]
@@ -343,6 +438,75 @@ async fn recover_workspace_state(
 }
 
 #[tauri::command]
+async fn import_discovered_production_catalog(
+    webview: Webview,
+    store: State<'_, WorkspaceStore>,
+    production_importer: State<'_, Arc<ProductionImportService>>,
+    importer: State<'_, Arc<LegacyImportService>>,
+) -> Result<Option<CanonicalWorkspaceSnapshot>, Phase3bCommandError> {
+    ensure_main_webview(&webview)?;
+    drop(webview);
+    let store = store.inner().clone();
+    let production_importer = Arc::clone(production_importer.inner());
+    let importer = Arc::clone(importer.inner());
+    phase3b_blocking(move || {
+        let current = store.load()?;
+        if current.mode != StorageMode::Absent {
+            return Ok(None);
+        }
+        if !store.is_writable() {
+            return Err(StorageError {
+                code: StorageErrorCode::ReadOnly,
+                message: "Another application instance owns the workspace writer lock.".to_owned(),
+                retryable: true,
+                json_pointer: None,
+            }
+            .into());
+        }
+
+        let descriptor = match production_importer.stage_discovered_catalog() {
+            Ok(descriptor) => descriptor,
+            Err(error) if error.code == ProductionImportErrorCode::MissingSource => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let inspection = importer.inspect_detached_copy(InspectLegacyCatalogRequest {
+            source_path: descriptor.path.clone(),
+            source_is_detached_copy: true,
+        })?;
+        if inspection.source_sha256 != descriptor.sha256
+            || inspection.byte_length != descriptor.byte_length
+        {
+            return Err(StorageError {
+                code: StorageErrorCode::SourceChanged,
+                message: "The staged production catalog changed before inspection.".to_owned(),
+                retryable: true,
+                json_pointer: None,
+            }
+            .into());
+        }
+
+        let prepared = importer.commit_detached_copy(CommitLegacyCatalogRequest {
+            inspect_token: inspection.inspect_token,
+            source_path: descriptor.path,
+            source_sha256: descriptor.sha256,
+            mode: LegacyImportMode::ReplacePreview,
+        })?;
+        let provenance = ImportProvenanceV1::from_import(
+            prepared.source_format,
+            prepared.source_sha256,
+            prepared.snapshot_file,
+        )?;
+        let state = workspace_state_from_legacy(prepared.draft);
+        Ok(Some(flatten_snapshot(
+            store.replace_from_import(state, provenance)?,
+        )?))
+    })
+    .await
+}
+
+#[tauri::command]
 async fn inspect_legacy_catalog(
     webview: Webview,
     importer: State<'_, Arc<LegacyImportService>>,
@@ -474,6 +638,14 @@ fn ensure_main_webview(webview: &Webview) -> Result<(), Phase3bCommandError> {
         json_pointer: None,
     }
     .into())
+}
+
+fn ensure_agent_main_webview(webview: &Webview) -> Result<(), String> {
+    if webview.label() == MAIN_WEBVIEW_LABEL {
+        Ok(())
+    } else {
+        Err("This agent command is available only to the local main view.".to_owned())
+    }
 }
 
 async fn phase3b_blocking<F, T>(task: F) -> Result<T, Phase3bCommandError>
@@ -666,28 +838,125 @@ fn configured_production_catalog() -> Option<PathBuf> {
         .map(|current| current.join(configured))
 }
 
+fn workspace_app_local_data_dir(default_dir: PathBuf) -> io::Result<PathBuf> {
+    let Some(configured) = env::var_os(PHASE6_STATE_ROOT_ENV) else {
+        return Ok(default_dir);
+    };
+
+    validate_phase6_state_root(&PathBuf::from(configured), &env::temp_dir())
+}
+
+fn validate_phase6_state_root(configured: &Path, temp_dir: &Path) -> io::Result<PathBuf> {
+    fn denied(message: &'static str) -> io::Error {
+        io::Error::new(io::ErrorKind::PermissionDenied, message)
+    }
+
+    if !configured.is_absolute() {
+        return Err(denied("The Phase 6 state root must be an absolute path."));
+    }
+
+    let resolved_temp = std::fs::canonicalize(temp_dir)
+        .map_err(|_| denied("The system temporary directory could not be verified."))?;
+    let resolved = std::fs::canonicalize(configured)
+        .map_err(|_| denied("The Phase 6 state root must already exist."))?;
+    let relative = resolved.strip_prefix(&resolved_temp).map_err(|_| {
+        denied("The Phase 6 state root must stay inside the system temporary directory.")
+    })?;
+
+    let mut components = relative.components();
+    let smoke_component = components
+        .next()
+        .and_then(|component| match component {
+            std::path::Component::Normal(value) => value.to_str(),
+            _ => None,
+        })
+        .ok_or_else(|| denied("The Phase 6 state root is missing its owned smoke directory."))?;
+    if components.next().is_none() {
+        return Err(denied(
+            "The Phase 6 state root cannot be the smoke directory itself.",
+        ));
+    }
+
+    let Some(token) = smoke_component.strip_prefix(PHASE6_SMOKE_PREFIX) else {
+        return Err(denied("The Phase 6 smoke directory name is invalid."));
+    };
+    if token.len() != 32 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(denied("The Phase 6 smoke directory token is invalid."));
+    }
+
+    let smoke_root = resolved_temp.join(smoke_component);
+    let marker = smoke_root.join(PHASE6_SMOKE_MARKER);
+    let marker_metadata = std::fs::symlink_metadata(&marker)
+        .map_err(|_| denied("The Phase 6 ownership marker is missing."))?;
+    if !marker_metadata.is_file() || marker_metadata.file_type().is_symlink() {
+        return Err(denied(
+            "The Phase 6 ownership marker is not a regular file.",
+        ));
+    }
+    let marker_token = std::fs::read_to_string(marker)
+        .map_err(|_| denied("The Phase 6 ownership marker could not be read."))?;
+    if marker_token != token {
+        return Err(denied(
+            "The Phase 6 ownership marker does not match its directory.",
+        ));
+    }
+
+    Ok(resolved)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let terminal_manager = TerminalManager::default();
+    let agent_runtime = AgentRuntime::default();
+    let terminal_manager = TerminalManager::with_agent_runtime(agent_runtime.clone());
     let shutdown_manager = terminal_manager.clone();
+    let shutdown_agent_runtime = agent_runtime.clone();
     let project_store = ProjectStore::preview_default()
-        .expect("the isolated IHATECODING Rust preview project store path is invalid");
+        .expect("the isolated IHATECODING migration store path is invalid");
 
     tauri::Builder::default()
         .manage(terminal_manager)
+        .manage(agent_runtime)
         .manage(project_store)
         .setup(|app| {
-            let app_local_data_dir = app.path().app_local_data_dir()?;
+            let app_local_data_dir =
+                workspace_app_local_data_dir(app.path().app_local_data_dir()?)?;
             let workspace_store = WorkspaceStore::open(&app_local_data_dir)?;
             let import_policy = legacy_import_policy(workspace_store.state_root().to_path_buf())?;
             debug_assert_eq!(import_policy.preview_root(), workspace_store.state_root());
             let legacy_import_service = LegacyImportService::new(import_policy)?;
+            let production_import_policy = ProductionImportPolicy::new(
+                app_local_data_dir.join("production-import-staging"),
+                vec![workspace_store.state_root().to_path_buf()],
+            )?;
+            let production_import_service = ProductionImportService::new(production_import_policy)?;
             app.manage(workspace_store);
             app.manage(Arc::new(legacy_import_service));
+            app.manage(Arc::new(production_import_service));
+
+            let main_config = app
+                .config()
+                .app
+                .windows
+                .iter()
+                .find(|config| config.label == MAIN_WEBVIEW_LABEL)
+                .ok_or_else(|| io::Error::other("The main window configuration is missing."))?;
+            let mut main_window =
+                tauri::WebviewWindowBuilder::from_config(app.handle(), main_config)?;
+            if env::var_os(PHASE6_STATE_ROOT_ENV).is_some() {
+                let webview_data_dir = app_local_data_dir.join("webview-data");
+                std::fs::create_dir_all(&webview_data_dir)?;
+                main_window = main_window.data_directory(webview_data_dir);
+            }
+            main_window.build()?;
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            read_provider_usage,
+            play_completion_sound,
             start_terminal,
+            subscribe_agent_events,
+            bind_agent_session,
+            unbind_agent_session,
             write_terminal,
             write_terminal_bytes,
             shutdown_terminal_engine,
@@ -707,18 +976,71 @@ pub fn run() {
             save_workspace_state,
             list_recovery_candidates,
             recover_workspace_state,
+            import_discovered_production_catalog,
             inspect_legacy_catalog,
             import_legacy_catalog,
             inspect_phase3_preview_upgrade,
             commit_phase3_preview_upgrade
         ])
         .build(tauri::generate_context!())
-        .expect("error while building IHATECODING Rust Preview")
+        .expect("error while building IHATECODING")
         .run(move |_app, event| {
             if matches!(event, tauri::RunEvent::Exit) {
                 let _ = shutdown_manager.shutdown_for_exit();
+                shutdown_agent_runtime.shutdown();
             }
         });
+}
+
+#[cfg(test)]
+mod phase6_state_root_tests {
+    use super::*;
+
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef";
+
+    fn owned_root(temp: &Path) -> PathBuf {
+        let smoke = temp.join(format!("{PHASE6_SMOKE_PREFIX}{TOKEN}"));
+        let state = smoke.join("rust-20").join("state-root");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(smoke.join(PHASE6_SMOKE_MARKER), TOKEN).unwrap();
+        state
+    }
+
+    #[test]
+    fn phase6_state_root_accepts_only_a_marked_temp_descendant() {
+        let temp = tempfile::tempdir().unwrap();
+        let configured = owned_root(temp.path());
+        let resolved = validate_phase6_state_root(&configured, temp.path()).unwrap();
+        assert_eq!(resolved, std::fs::canonicalize(configured).unwrap());
+    }
+
+    #[test]
+    fn phase6_state_root_rejects_an_unowned_or_changed_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let configured = owned_root(temp.path());
+        std::fs::write(
+            temp.path()
+                .join(format!("{PHASE6_SMOKE_PREFIX}{TOKEN}"))
+                .join(PHASE6_SMOKE_MARKER),
+            "different-token",
+        )
+        .unwrap();
+        assert_eq!(
+            validate_phase6_state_root(&configured, temp.path())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+
+        let outside = temp.path().join("ordinary").join("state-root");
+        std::fs::create_dir_all(&outside).unwrap();
+        assert_eq!(
+            validate_phase6_state_root(&outside, temp.path())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
 }
 
 #[cfg(test)]

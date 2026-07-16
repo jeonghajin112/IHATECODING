@@ -4,8 +4,10 @@ import {
   beginWorkspaceSave,
   createWorkspaceSession,
   normalizeWorkspaceLoadResponse,
+  projectUnreadCount,
   replaceWorkspaceDraft,
   setProjectPaneWidthRatios,
+  setTerminalCompletionPending,
   type WorkspaceProject,
   type WorkspaceSession,
   type WorkspaceState,
@@ -33,6 +35,7 @@ import {
   type PaneInsertionTarget,
   type RestoreCapacityDecision,
 } from "./phase4-core";
+import { deriveSafeResumePlans, type SafeResumePlan } from "./phase5-core";
 
 type StatusTone = "normal" | "error";
 
@@ -59,6 +62,13 @@ export type Phase4RuntimePort = {
   unloadAllProjects(): Promise<void>;
   addPane(projectId: string, terminal: WorkspaceTerminal, focus?: boolean): unknown;
   syncProject(project: WorkspaceProject): void;
+  setResumePlans(plans: SafeResumePlan[]): void;
+  setTerminalCompletionPending(
+    projectId: string,
+    terminalId: string,
+    completionPending: boolean,
+    playSound?: boolean,
+  ): void;
   setCatalogWritable(writable: boolean): void;
   setFooterStatus(message: string, tone?: StatusTone): void;
 };
@@ -97,6 +107,8 @@ export class Phase4WorkspaceController {
   private storageFaulted = false;
   private upgradeInspection: Phase3PreviewInspection | null = null;
   private activeOperation: Promise<unknown> = Promise.resolve();
+  private operationTail: Promise<void> = Promise.resolve();
+  private pendingOperationCount = 0;
   private externalReplacementBarrier: Promise<void> | null = null;
   private resolveExternalReplacement: (() => void) | null = null;
   private readonly listeners = new AbortController();
@@ -269,6 +281,22 @@ export class Phase4WorkspaceController {
     }
   }
 
+  /**
+   * Durable provider completion. Runtime decoration and sound are deliberately
+   * applied only after the canonical compare-and-swap has committed.
+   */
+  async onAgentTurnCompleted(projectId: string, terminalId: string): Promise<boolean> {
+    return this.persistRuntimeCompletion(projectId, terminalId, true, true);
+  }
+
+  /** Explicit pane interaction is the only acknowledgement path. */
+  async acknowledgeTerminalCompletion(
+    projectId: string,
+    terminalId: string,
+  ): Promise<boolean> {
+    return this.persistRuntimeCompletion(projectId, terminalId, false, false);
+  }
+
   async onPaneRenamed(
     projectId: string,
     paneId: string,
@@ -404,6 +432,7 @@ export class Phase4WorkspaceController {
       this.runtime.showEmptyView();
       return;
     }
+    this.runtime.setResumePlans(deriveSafeResumePlans(state));
     const tab = state.tabs.find((item) => item.id === state.activeTabId) ?? null;
     if (tab?.kind === "project" && tab.projectId) {
       const project = state.projects.find((item) => item.id === tab.projectId);
@@ -445,6 +474,18 @@ export class Phase4WorkspaceController {
       const title = document.createElement("span");
       title.className = "workspace-tab-title";
       title.textContent = tab.title;
+      let unreadBadge: HTMLSpanElement | null = null;
+      if (tab.projectId) {
+        const unread = projectUnreadCount(state, tab.projectId);
+        if (unread > 0) {
+          const badge = document.createElement("span");
+          badge.className = "completion-badge";
+          badge.textContent = String(unread);
+          badge.title = `확인하지 않은 완료 알림 ${unread}개`;
+          badge.setAttribute("aria-label", `확인하지 않은 완료 알림 ${unread}개`);
+          unreadBadge = badge;
+        }
+      }
       const close = document.createElement("button");
       close.className = "workspace-tab-close";
       close.type = "button";
@@ -459,7 +500,9 @@ export class Phase4WorkspaceController {
       const activate = () => void this.activateTab(tab.id);
       element.addEventListener("click", activate);
       element.addEventListener("keydown", (event) => this.onTabKeyDown(event, tab.id));
-      element.append(kind, title, close);
+      element.append(kind, title);
+      if (unreadBadge) element.append(unreadBadge);
+      element.append(close);
       this.elements.tabList.append(element);
     }
   }
@@ -481,7 +524,17 @@ export class Phase4WorkspaceController {
       name.textContent = project.name;
       const folder = document.createElement("small");
       folder.textContent = project.folderPath;
+      const unread = projectUnreadCount(state, project.id);
+      button.dataset.hasCompletion = String(unread > 0);
       button.append(name, folder);
+      if (unread > 0) {
+        const badge = document.createElement("span");
+        badge.className = "completion-badge project-completion-badge";
+        badge.textContent = String(unread);
+        badge.title = `확인하지 않은 완료 알림 ${unread}개`;
+        badge.setAttribute("aria-label", `확인하지 않은 완료 알림 ${unread}개`);
+        button.append(badge);
+      }
       button.addEventListener("click", () => void this.openProject(project.id));
       this.elements.projectList.append(button);
     }
@@ -640,31 +693,94 @@ export class Phase4WorkspaceController {
 
   private async persist(next: WorkspaceState, context: string): Promise<boolean> {
     if (!this.canMutate()) return false;
-    this.mutationPending = true;
-    this.refreshControls();
-    const operation = this.persistNow(next, context);
-    this.activeOperation = operation;
-    try {
-      return await operation;
-    } finally {
-      if (this.activeOperation === operation) this.activeOperation = Promise.resolve();
-      this.mutationPending = false;
-      this.refreshControls();
-    }
+    return this.enqueueOperation(() => this.persistNow(next, context));
   }
 
   private async trackRuntimeTransition(operation: () => Promise<void>): Promise<void> {
+    await this.enqueueOperation(operation);
+  }
+
+  private enqueueOperation<T>(operation: () => Promise<T>): Promise<T> {
+    this.pendingOperationCount += 1;
     this.mutationPending = true;
     this.refreshControls();
-    const pending = Promise.resolve().then(operation);
-    this.activeOperation = pending;
-    try {
-      await pending;
-    } finally {
-      if (this.activeOperation === pending) this.activeOperation = Promise.resolve();
-      this.mutationPending = false;
+
+    const result = this.operationTail.then(operation, operation);
+    const settled = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.operationTail = settled;
+    this.activeOperation = settled;
+    return result.finally(() => {
+      this.pendingOperationCount = Math.max(0, this.pendingOperationCount - 1);
+      this.mutationPending = this.pendingOperationCount > 0;
+      if (!this.mutationPending && this.activeOperation === settled) {
+        this.activeOperation = Promise.resolve();
+      }
       this.refreshControls();
+    });
+  }
+
+  private persistRuntimeCompletion(
+    projectId: string,
+    terminalId: string,
+    completionPending: boolean,
+    playSound: boolean,
+  ): Promise<boolean> {
+    if (
+      !this.initialized ||
+      !this.storageWritable ||
+      this.session?.access !== "ready" ||
+      this.shuttingDown ||
+      this.externalReplacementPending ||
+      this.storageFaulted ||
+      this.upgradeInspection !== null
+    ) {
+      return Promise.resolve(false);
     }
+
+    return this.enqueueOperation(async () => {
+      const state = this.currentState();
+      const terminal = state?.projects
+        .find((project) => project.id === projectId)
+        ?.terminals.find((item) => item.id === terminalId);
+      if (!state || !terminal) return false;
+      if (terminal.completionPending === completionPending) {
+        this.runtime.setTerminalCompletionPending(
+          projectId,
+          terminalId,
+          completionPending,
+          false,
+        );
+        this.renderTabs();
+        this.renderSidebar();
+        return true;
+      }
+
+      const next = setTerminalCompletionPending(
+        state,
+        projectId,
+        terminalId,
+        completionPending,
+      );
+      const saved = await this.persistNow(
+        next,
+        completionPending
+          ? "완료 알림을 저장하지 못했습니다"
+          : "완료 알림 확인 상태를 저장하지 못했습니다",
+      );
+      if (!saved) return false;
+      this.runtime.setTerminalCompletionPending(
+        projectId,
+        terminalId,
+        completionPending,
+        completionPending && playSound,
+      );
+      this.renderTabs();
+      this.renderSidebar();
+      return true;
+    });
   }
 
   private async persistNow(next: WorkspaceState, context: string): Promise<boolean> {
