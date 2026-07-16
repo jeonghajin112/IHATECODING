@@ -65,6 +65,10 @@ Codex, Grok, PowerShell, or Node processes.
 
 ## Phase 3 — projects and persistence
 
+Status: Phase 3A preview foundation implemented on
+`agent/rust-migration-phase3`; reversible import and multi-process revision
+gates remain before Phase 3 exit.
+
 - implement Rust models for `projects-v1.schema.json`
 - first ship a read-only importer against copied state
 - preserve unknown or future fields during migration
@@ -76,6 +80,10 @@ Exit gate: fixture comparison plus a reversible import of a copied production
 catalog. The C# catalog remains untouched.
 
 ## Phase 4 — workspace and tab UI
+
+Status: first shell slice implemented with the project sidebar, blank/project
+tabs, and project-specific fresh PowerShell restore. Drag, resize, snap, and
+full layout parity remain.
 
 - rebuild the left project sidebar and top workspace tabs
 - support blank tabs that can later host terminals, browser views, project

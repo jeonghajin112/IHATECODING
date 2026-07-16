@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "node scripts/build.mjs --serve",
     "build": "tsc --noEmit && node scripts/build.mjs",
-    "test": "node --test scripts/phase2-core.test.mjs",
+    "test": "node --test scripts/phase2-core.test.mjs scripts/phase3-core.test.mjs",
     "tauri": "tauri"
   },
   "dependencies": {

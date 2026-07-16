@@ -5,6 +5,7 @@
   "webviews": ["main"],
   "permissions": [
     "core:default",
+    "core:window:allow-destroy",
     "core:webview:allow-create-webview",
     "core:webview:allow-set-webview-position",
     "core:webview:allow-set-webview-size",
