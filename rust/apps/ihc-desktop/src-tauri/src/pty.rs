@@ -2709,7 +2709,7 @@ mod tests {
             "-NoLogo",
             "-NoProfile",
             "-Command",
-            "$line = [Console]::In.ReadLine(); [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false); [Console]::WriteLine('__IHC__' + $line)",
+            "$utf8 = New-Object System.Text.UTF8Encoding($false); [Console]::InputEncoding = $utf8; [Console]::OutputEncoding = $utf8; $line = [Console]::In.ReadLine(); [Console]::WriteLine('__IHC__' + $line)",
         ]);
         let mut child = pair
             .slave
