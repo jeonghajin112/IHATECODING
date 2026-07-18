@@ -1,0 +1,23 @@
+{
+  "name": "ihatecoding",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "node scripts/build.mjs --serve",
+    "build": "tsc --noEmit && node scripts/build.mjs",
+    "test": "node --test scripts/phase2-core.test.mjs scripts/phase3-core.test.mjs scripts/phase3b-core.test.mjs scripts/phase4-core.test.mjs scripts/phase4-integration.test.mjs scripts/phase5-core.test.mjs scripts/phase5-integration.test.mjs",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2",
+    "@tauri-apps/plugin-dialog": "^2",
+    "@xterm/addon-fit": "0.11.0",
+    "@xterm/xterm": "6.1.0-beta.290"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2",
+    "esbuild": "0.28.1",
+    "typescript": "~5.6.2"
+  }
+}

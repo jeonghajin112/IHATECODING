@@ -1,0 +1,30 @@
+artifacts/
+IHATECODING.exe
+IHATECODING.previous.exe
+IHATECODING.previous.*.exe
+IHATECODING.previous-build*.exe
+IHATECODING.running-build*.exe
+*.log
+
+# Machine-local settings and credentials
+.env
+.env.*
+!.env.example
+*.local
+*.user
+*.suo
+.vs/
+.vscode/
+.idea/
+
+# Runtime project, session, and conversation data
+projects.json
+*.jsonl
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+.codex/
+.grok/
+**/.codex/
+**/.grok/

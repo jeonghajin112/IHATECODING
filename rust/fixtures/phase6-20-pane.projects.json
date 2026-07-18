@@ -1,0 +1,222 @@
+{
+  "Projects": [
+    {
+      "Id": "phase6-project-20",
+      "Name": "Phase 6 20-pane fixture",
+      "FolderPath": "C:\\__IHATECODING_PHASE6_PROJECT__",
+      "Terminals": [
+        {
+          "Id": "phase6-pane-01",
+          "Name": "PANE 01",
+          "StartDirectory": "C:\\__IHATECODING_PHASE6_PROJECT__",
+          "CodexThreadId": null,
+          "GrokSessionId": null,
+          "CreatedAtUtc": "2026-01-01T00:00:00Z",
+          "CompletionPending": false
+        },
+        {
+          "Id": "phase6-pane-02",
+          "Name": "PANE 02",
+          "StartDirectory": "C:\\__IHATECODING_PHASE6_PROJECT__",
+          "CodexThreadId": null,
+          "GrokSessionId": null,
+          "CreatedAtUtc": "2026-01-01T00:00:00Z",
+          "CompletionPending": false
+        },
+        {
+          "Id": "phase6-pane-03",
+          "Name": "PANE 03",
+          "StartDirectory": "C:\\__IHATECODING_PHASE6_PROJECT__",
+          "CodexThreadId": null,
+          "GrokSessionId": null,
+          "CreatedAtUtc": "2026-01-01T00:00:00Z",
+          "CompletionPending": false
+        },
+        {
+          "Id": "phase6-pane-04",
+          "Name": "PANE 04",
+          "StartDirectory": "C:\\__IHATECODING_PHASE6_PROJECT__",
+          "CodexThreadId": null,
+          "GrokSessionId": null,
+          "CreatedAtUtc": "2026-01-01T00:00:00Z",
+          "CompletionPending": false
+        },
+        {
+          "Id": "phase6-pane-05",
+          "Name": "PANE 05",
+          "StartDirectory": "C:\\__IHATECODING_PHASE6_PROJECT__",
+          "CodexThreadId": null,
+          "GrokSessionId": null,
+          "CreatedAtUtc": "2026-01-01T00:00:00Z",
+          "CompletionPending": false
+        },
+        {
+          "Id": "phase6-pane-06",
+          "Name": "PANE 06",
+          "StartDirectory": "C:\\__IHATECODING_PHASE6_PROJECT__",
+          "CodexThreadId": null,
+          "GrokSessionId": null,
+          "CreatedAtUtc": "2026-01-01T00:00:00Z",
+          "CompletionPending": false
+        },
+        {
+          "Id": "phase6-pane-07",
+          "Name": "PANE 07",
+          "StartDirectory": "C:\\__IHATECODING_PHASE6_PROJECT__",
+          "CodexThreadId": null,
+          "GrokSessionId": null,
+          "CreatedAtUtc": "2026-01-01T00:00:00Z",
+          "CompletionPending": false
+        },
+        {
+          "Id": "phase6-pane-08",
+          "Name": "PANE 08",
+          "StartDirectory": "C:\\__IHATECODING_PHASE6_PROJECT__",
+          "CodexThreadId": null,
+          "GrokSessionId": null,
+          "CreatedAtUtc": "2026-01-01T00:00:00Z",
+          "CompletionPending": false
+        },
+        {
+          "Id": "phase6-pane-09",
+          "Name": "PANE 09",
+          "StartDirectory": "C:\\__IHATECODING_PHASE6_PROJECT__",
+          "CodexThreadId": null,
+          "GrokSessionId": null,
+          "CreatedAtUtc": "2026-01-01T00:00:00Z",
+          "CompletionPending": false
+        },
+        {
+          "Id": "phase6-pane-10",
+          "Name": "PANE 10",
+          "StartDirectory": "C:\\__IHATECODING_PHASE6_PROJECT__",
+          "CodexThreadId": null,
+          "GrokSessionId": null,
+          "CreatedAtUtc": "2026-01-01T00:00:00Z",
+          "CompletionPending": false
+        },
+        {
+          "Id": "phase6-pane-11",
+          "Name": "PANE 11",
+          "StartDirectory": "C:\\__IHATECODING_PHASE6_PROJECT__",
+          "CodexThreadId": null,
+          "GrokSessionId": null,
+          "CreatedAtUtc": "2026-01-01T00:00:00Z",
+          "CompletionPending": false
+        },
+        {
+          "Id": "phase6-pane-12",
+          "Name": "PANE 12",
+          "StartDirectory": "C:\\__IHATECODING_PHASE6_PROJECT__",
+          "CodexThreadId": null,
+          "GrokSessionId": null,
+          "CreatedAtUtc": "2026-01-01T00:00:00Z",
+          "CompletionPending": false
+        },
+        {
+          "Id": "phase6-pane-13",
+          "Name": "PANE 13",
+          "StartDirectory": "C:\\__IHATECODING_PHASE6_PROJECT__",
+          "CodexThreadId": null,
+          "GrokSessionId": null,
+          "CreatedAtUtc": "2026-01-01T00:00:00Z",
+          "CompletionPending": false
+        },
+        {
+          "Id": "phase6-pane-14",
+          "Name": "PANE 14",
+          "StartDirectory": "C:\\__IHATECODING_PHASE6_PROJECT__",
+          "CodexThreadId": null,
+          "GrokSessionId": null,
+          "CreatedAtUtc": "2026-01-01T00:00:00Z",
+          "CompletionPending": false
+        },
+        {
+          "Id": "phase6-pane-15",
+          "Name": "PANE 15",
+          "StartDirectory": "C:\\__IHATECODING_PHASE6_PROJECT__",
+          "CodexThreadId": null,
+          "GrokSessionId": null,
+          "CreatedAtUtc": "2026-01-01T00:00:00Z",
+          "CompletionPending": false
+        },
+        {
+          "Id": "phase6-pane-16",
+          "Name": "PANE 16",
+          "StartDirectory": "C:\\__IHATECODING_PHASE6_PROJECT__",
+          "CodexThreadId": null,
+          "GrokSessionId": null,
+          "CreatedAtUtc": "2026-01-01T00:00:00Z",
+          "CompletionPending": false
+        },
+        {
+          "Id": "phase6-pane-17",
+          "Name": "PANE 17",
+          "StartDirectory": "C:\\__IHATECODING_PHASE6_PROJECT__",
+          "CodexThreadId": null,
+          "GrokSessionId": null,
+          "CreatedAtUtc": "2026-01-01T00:00:00Z",
+          "CompletionPending": false
+        },
+        {
+          "Id": "phase6-pane-18",
+          "Name": "PANE 18",
+          "StartDirectory": "C:\\__IHATECODING_PHASE6_PROJECT__",
+          "CodexThreadId": null,
+          "GrokSessionId": null,
+          "CreatedAtUtc": "2026-01-01T00:00:00Z",
+          "CompletionPending": false
+        },
+        {
+          "Id": "phase6-pane-19",
+          "Name": "PANE 19",
+          "StartDirectory": "C:\\__IHATECODING_PHASE6_PROJECT__",
+          "CodexThreadId": null,
+          "GrokSessionId": null,
+          "CreatedAtUtc": "2026-01-01T00:00:00Z",
+          "CompletionPending": false
+        },
+        {
+          "Id": "phase6-pane-20",
+          "Name": "PANE 20",
+          "StartDirectory": "C:\\__IHATECODING_PHASE6_PROJECT__",
+          "CodexThreadId": null,
+          "GrokSessionId": null,
+          "CreatedAtUtc": "2026-01-01T00:00:00Z",
+          "CompletionPending": false
+        }
+      ],
+      "PaneWidthRatios": {
+        "5x4:row-0": [
+          0.2,
+          0.2,
+          0.2,
+          0.2,
+          0.2
+        ],
+        "5x4:row-1": [
+          0.2,
+          0.2,
+          0.2,
+          0.2,
+          0.2
+        ],
+        "5x4:row-2": [
+          0.2,
+          0.2,
+          0.2,
+          0.2,
+          0.2
+        ],
+        "5x4:row-3": [
+          0.2,
+          0.2,
+          0.2,
+          0.2,
+          0.2
+        ]
+      }
+    }
+  ],
+  "SelectedProjectId": "phase6-project-20"
+}
