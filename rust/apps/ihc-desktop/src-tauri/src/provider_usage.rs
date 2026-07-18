@@ -1,5 +1,10 @@
-use serde::Serialize;
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use serde::{
+    Deserialize, Deserializer, Serialize,
+    de::{DeserializeOwned, Visitor},
+};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
@@ -9,6 +14,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const CODEX_TAIL_BYTES: usize = 512 * 1024;
 const GROK_TAIL_BYTES: usize = 8 * 1024 * 1024;
+const AUTH_FILE_MAX_BYTES: usize = 128 * 1024;
+const JWT_PAYLOAD_MAX_BYTES: usize = 64 * 1024;
+const ACCOUNT_LABEL_MAX_CHARS: usize = 254;
+const ACCOUNT_META_MAX_CHARS: usize = 64;
 const MAX_CODEX_CANDIDATES: usize = 12;
 const MAX_CODEX_SCAN_ENTRIES: usize = 8_192;
 const MAX_CODEX_SCAN_DEPTH: usize = 32;
@@ -35,6 +44,14 @@ pub(crate) struct ProviderUsage {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct ProviderAccountSummary {
+    pub(crate) display_label: String,
+    pub(crate) plan: Option<String>,
+    pub(crate) auth_mode: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct ProviderLimitUsage {
     pub(crate) used_percent: f64,
     pub(crate) window_minutes: i64,
@@ -45,7 +62,9 @@ pub(crate) struct ProviderLimitUsage {
 #[derive(Debug, Clone)]
 struct UsagePaths {
     codex_sessions: Option<PathBuf>,
+    codex_auth: Option<PathBuf>,
     grok_log: Option<PathBuf>,
+    grok_auth: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -62,16 +81,142 @@ struct LimitRecord {
     updated_at_millis: i64,
 }
 
+#[derive(Debug, Default)]
+struct SecretPresence(bool);
+
+impl<'de> Deserialize<'de> for SecretPresence {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct PresenceVisitor;
+
+        impl<'de> Visitor<'de> for PresenceVisitor {
+            type Value = SecretPresence;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a secret string or null")
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E> {
+                Ok(SecretPresence(false))
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(SecretPresence(false))
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+                Ok(SecretPresence(!value.trim().is_empty()))
+            }
+
+            fn visit_borrowed_str<E>(self, value: &'de str) -> Result<Self::Value, E> {
+                Ok(SecretPresence(!value.trim().is_empty()))
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+                Ok(SecretPresence(!value.trim().is_empty()))
+            }
+
+            fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                deserializer.deserialize_any(self)
+            }
+        }
+
+        deserializer.deserialize_option(PresenceVisitor)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexAuthFile {
+    #[serde(rename = "OPENAI_API_KEY", default)]
+    api_key: SecretPresence,
+    #[serde(default)]
+    tokens: Option<CodexAuthTokens>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexAuthTokens {
+    #[serde(default)]
+    id_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexIdTokenClaims {
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(rename = "https://api.openai.com/auth", default)]
+    openai_auth: Option<CodexOpenAiAuthClaims>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexOpenAiAuthClaims {
+    #[serde(default)]
+    chatgpt_plan_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GrokAuthCredential {
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
+    first_name: Option<String>,
+    #[serde(default)]
+    last_name: Option<String>,
+}
+
 pub(crate) fn read_provider_usage() -> ProviderUsageResponse {
     let now = SystemTime::now();
     read_provider_usage_at(usage_paths(), now)
+}
+
+pub(crate) fn read_provider_account(
+    provider: &str,
+) -> Result<Option<ProviderAccountSummary>, String> {
+    let paths = usage_paths();
+    match provider {
+        "codex" => Ok(read_codex_account(paths.codex_auth.as_deref())
+            .or_else(|| environment_api_key_account(&["OPENAI_API_KEY"]))),
+        "grok" => Ok(read_grok_account(paths.grok_auth.as_deref())
+            .or_else(|| environment_api_key_account(&["XAI_API_KEY", "GROK_API_KEY"]))),
+        _ => Err("지원하지 않는 AI 서비스입니다.".into()),
+    }
+}
+
+pub(crate) fn read_provider_account_from_home(
+    provider: &str,
+    home: &Path,
+) -> Result<Option<ProviderAccountSummary>, String> {
+    if !home.is_absolute() {
+        return Err("CLI 홈 디렉터리는 절대 경로여야 합니다.".to_owned());
+    }
+    let auth = home.join("auth.json");
+    match provider {
+        "codex" => Ok(read_codex_account(Some(&auth))),
+        "grok" => Ok(read_grok_account(Some(&auth))),
+        _ => Err("지원하지 않는 AI 서비스입니다.".to_owned()),
+    }
+}
+
+fn environment_api_key_account(names: &[&str]) -> Option<ProviderAccountSummary> {
+    names
+        .iter()
+        .any(|name| env::var_os(name).is_some_and(|value| !value.is_empty()))
+        .then(|| ProviderAccountSummary {
+            display_label: "Environment API key".into(),
+            plan: None,
+            auth_mode: "apiKey".into(),
+        })
 }
 
 fn read_provider_usage_at(paths: UsagePaths, now: SystemTime) -> ProviderUsageResponse {
     let now_millis = system_time_millis(now);
     ProviderUsageResponse {
         codex: read_codex(paths.codex_sessions.as_deref(), now_millis),
-        grok: read_grok(paths.grok_log.as_deref()),
+        grok: read_grok(paths.grok_log.as_deref(), now_millis),
         read_at: format_rfc3339_millis(now_millis).unwrap_or_else(epoch_rfc3339),
     }
 }
@@ -87,8 +232,12 @@ fn usage_paths_from(mut lookup: impl FnMut(&str) -> Option<OsString>) -> UsagePa
     let grok_home = non_empty_path(lookup("GROK_HOME"))
         .or_else(|| home.as_ref().map(|path| path.join(".grok")));
     UsagePaths {
-        codex_sessions: codex_home.map(|path| path.join("sessions")),
-        grok_log: grok_home.map(|path| path.join("logs").join("unified.jsonl")),
+        codex_sessions: codex_home.as_ref().map(|path| path.join("sessions")),
+        codex_auth: codex_home.map(|path| path.join("auth.json")),
+        grok_log: grok_home
+            .as_ref()
+            .map(|path| path.join("logs").join("unified.jsonl")),
+        grok_auth: grok_home.map(|path| path.join("auth.json")),
     }
 }
 
@@ -133,6 +282,165 @@ fn empty_provider() -> ProviderUsage {
         weekly: None,
         updated_at: None,
     }
+}
+
+fn read_codex_account(path: Option<&Path>) -> Option<ProviderAccountSummary> {
+    let root = read_bounded_auth::<CodexAuthFile>(path?)?;
+    let api_key_connected = root.api_key.0;
+    let id_token = root.tokens.and_then(|tokens| tokens.id_token);
+    if let Some(claims) = id_token.as_deref().and_then(decode_jwt_payload) {
+        let label = claims
+            .email
+            .as_deref()
+            .and_then(|value| sanitized_account_text(value, ACCOUNT_LABEL_MAX_CHARS));
+        let plan = claims
+            .openai_auth
+            .and_then(|auth| auth.chatgpt_plan_type)
+            .as_deref()
+            .and_then(|value| sanitized_account_text(value, ACCOUNT_META_MAX_CHARS));
+        if let Some(display_label) = label {
+            return Some(ProviderAccountSummary {
+                display_label,
+                plan,
+                auth_mode: "chatgpt".into(),
+            });
+        }
+    }
+    api_key_connected.then(|| ProviderAccountSummary {
+        display_label: "OpenAI API key".into(),
+        plan: None,
+        auth_mode: "apiKey".into(),
+    })
+}
+
+fn read_grok_account(path: Option<&Path>) -> Option<ProviderAccountSummary> {
+    let accounts = read_bounded_auth::<BTreeMap<String, GrokAuthCredential>>(path?)?;
+    let mut summaries = accounts
+        .into_values()
+        .filter_map(|account| {
+            let email = account
+                .email
+                .as_deref()
+                .and_then(|value| sanitized_account_text(value, ACCOUNT_LABEL_MAX_CHARS));
+            let first_name = account
+                .first_name
+                .as_deref()
+                .and_then(|value| sanitized_account_text(value, ACCOUNT_META_MAX_CHARS));
+            let last_name = account
+                .last_name
+                .as_deref()
+                .and_then(|value| sanitized_account_text(value, ACCOUNT_META_MAX_CHARS));
+            let display_label = email.or_else(|| {
+                sanitized_account_text(
+                    &format!(
+                        "{} {}",
+                        first_name.as_deref().unwrap_or(""),
+                        last_name.as_deref().unwrap_or("")
+                    ),
+                    ACCOUNT_LABEL_MAX_CHARS,
+                )
+            })?;
+            Some(ProviderAccountSummary {
+                display_label,
+                plan: None,
+                auth_mode: "xai".into(),
+            })
+        })
+        .collect::<Vec<_>>();
+    summaries.sort_by(|left, right| left.display_label.cmp(&right.display_label));
+    summaries.dedup_by(|left, right| left.display_label == right.display_label);
+    (summaries.len() == 1).then(|| summaries.remove(0))
+}
+
+fn read_bounded_auth<T: DeserializeOwned>(path: &Path) -> Option<T> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() > AUTH_FILE_MAX_BYTES as u64
+    {
+        return None;
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+        const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let mut file = options.open(path).ok()?;
+    let opened_metadata = file.metadata().ok()?;
+    if !opened_metadata.is_file() || opened_metadata.len() > AUTH_FILE_MAX_BYTES as u64 {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(opened_metadata.len() as usize);
+    (&mut file)
+        .take((AUTH_FILE_MAX_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    let final_metadata = file.metadata().ok()?;
+    if bytes.is_empty()
+        || bytes.len() > AUTH_FILE_MAX_BYTES
+        || !final_metadata.is_file()
+        || final_metadata.len() > AUTH_FILE_MAX_BYTES as u64
+    {
+        bytes.fill(0);
+        return None;
+    }
+    let parsed = serde_json::from_slice(&bytes).ok();
+    bytes.fill(0);
+    parsed
+}
+
+fn decode_jwt_payload(token: &str) -> Option<CodexIdTokenClaims> {
+    if token.len() > AUTH_FILE_MAX_BYTES {
+        return None;
+    }
+    let mut parts = token.split('.');
+    let header = parts.next()?;
+    let payload = parts.next()?;
+    let signature = parts.next()?;
+    if parts.next().is_some()
+        || header.is_empty()
+        || payload.is_empty()
+        || signature.is_empty()
+        || payload.len() > JWT_PAYLOAD_MAX_BYTES * 2
+    {
+        return None;
+    }
+    let mut decoded = URL_SAFE_NO_PAD.decode(payload).ok()?;
+    if decoded.len() > JWT_PAYLOAD_MAX_BYTES {
+        decoded.fill(0);
+        return None;
+    }
+    let claims = serde_json::from_slice(&decoded).ok();
+    decoded.fill(0);
+    claims
+}
+
+fn sanitized_account_text(value: &str, maximum_chars: usize) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty()
+        || trimmed.chars().count() > maximum_chars
+        || trimmed.chars().any(|character| {
+            character.is_control()
+                || matches!(
+                    character,
+                    '\u{200b}'..='\u{200f}'
+                        | '\u{202a}'..='\u{202e}'
+                        | '\u{2060}'..='\u{206f}'
+                        | '\u{feff}'
+                )
+        })
+    {
+        return None;
+    }
+    Some(trimmed.to_owned())
 }
 
 fn newest_codex_candidates(root: &Path) -> Vec<FileCandidate> {
@@ -256,16 +564,19 @@ fn choose_current(
         .filter(|record| {
             record.resets_at_millis > now_millis && window_matches(record.window_minutes)
         })
-        .min_by(|left, right| {
-            left.resets_at_millis
-                .cmp(&right.resets_at_millis)
-                .then_with(|| right.used_percent.total_cmp(&left.used_percent))
-                .then_with(|| right.updated_at_millis.cmp(&left.updated_at_millis))
+        .max_by(|left, right| {
+            // A rate-limit reset starts a new window with a later reset time and
+            // lower usage. Prefer the newest account observation so a still-live
+            // record from the previous window cannot mask that reset.
+            left.updated_at_millis
+                .cmp(&right.updated_at_millis)
+                .then_with(|| left.resets_at_millis.cmp(&right.resets_at_millis))
+                .then_with(|| left.used_percent.total_cmp(&right.used_percent))
         })
         .cloned()
 }
 
-fn read_grok(log: Option<&Path>) -> ProviderUsage {
+fn read_grok(log: Option<&Path>, now_millis: i64) -> ProviderUsage {
     let Some(path) = log else {
         return empty_provider();
     };
@@ -295,10 +606,12 @@ fn read_grok(log: Option<&Path>) -> ProviderUsage {
         else {
             continue;
         };
-        let reset_text = match config.get("currentPeriod").and_then(Value::as_object) {
-            Some(period) => period.get("end").and_then(Value::as_str),
-            None => config.get("billingPeriodEnd").and_then(Value::as_str),
-        };
+        let reset_text = config
+            .get("currentPeriod")
+            .and_then(Value::as_object)
+            .and_then(|period| period.get("end"))
+            .and_then(Value::as_str)
+            .or_else(|| config.get("billingPeriodEnd").and_then(Value::as_str));
         let Some(resets_at_millis) = reset_text.and_then(parse_rfc3339_millis) else {
             continue;
         };
@@ -313,6 +626,9 @@ fn read_grok(log: Option<&Path>) -> ProviderUsage {
             resets_at_millis,
             updated_at_millis,
         };
+        let Some(record) = project_grok_record_into_current_window(record, now_millis) else {
+            continue;
+        };
         let Some(weekly) = provider_limit_usage(record.clone()) else {
             continue;
         };
@@ -323,6 +639,33 @@ fn read_grok(log: Option<&Path>) -> ProviderUsage {
         };
     }
     empty_provider()
+}
+
+fn project_grok_record_into_current_window(
+    mut record: LimitRecord,
+    now_millis: i64,
+) -> Option<LimitRecord> {
+    if record.resets_at_millis > now_millis {
+        return Some(record);
+    }
+
+    // Grok only writes a new credit observation after the account is used again.
+    // Until then, the final observation from the previous billing window remains
+    // in unified.jsonl. Once its known reset boundary has elapsed, project that
+    // stale observation into the current empty window instead of showing the old
+    // usage until the first post-reset request is made.
+    let window_millis = record.window_minutes.checked_mul(60_000)?;
+    if window_millis <= 0 {
+        return None;
+    }
+    let elapsed_millis = now_millis.checked_sub(record.resets_at_millis)?;
+    let elapsed_windows = elapsed_millis.checked_div(window_millis)?;
+    let windows_to_advance = elapsed_windows.checked_add(1)?;
+    record.resets_at_millis = record
+        .resets_at_millis
+        .checked_add(windows_to_advance.checked_mul(window_millis)?)?;
+    record.used_percent = 0.0;
+    Some(record)
 }
 
 fn provider_limit_usage(record: LimitRecord) -> Option<ProviderLimitUsage> {
@@ -630,13 +973,17 @@ mod tests {
     fn paths(codex_sessions: Option<PathBuf>, grok_log: Option<PathBuf>) -> UsagePaths {
         UsagePaths {
             codex_sessions,
+            codex_auth: None,
             grok_log,
+            grok_auth: None,
         }
     }
 
     #[test]
     fn public_reader_keeps_the_no_argument_response_signature() {
         let _reader: fn() -> ProviderUsageResponse = read_provider_usage;
+        let _account_reader: fn(&str) -> Result<Option<ProviderAccountSummary>, String> =
+            read_provider_account;
     }
 
     fn codex_line(
@@ -680,6 +1027,152 @@ mod tests {
         .expect("serialize Grok fixture")
     }
 
+    fn codex_auth_fixture(email: &str, plan: &str, api_key: Option<&str>) -> Vec<u8> {
+        let payload = serde_json::to_vec(&json!({
+            "email": email,
+            "https://api.openai.com/auth": {
+                "chatgpt_plan_type": plan,
+                "chatgpt_account_id": "INTERNAL_ACCOUNT_ID_MUST_NOT_ESCAPE"
+            }
+        }))
+        .expect("serialize Codex ID token payload");
+        let id_token = format!(
+            "header.{}.SIGNATURE_MUST_NOT_ESCAPE",
+            URL_SAFE_NO_PAD.encode(payload)
+        );
+        serde_json::to_vec(&json!({
+            "OPENAI_API_KEY": api_key,
+            "tokens": {
+                "id_token": id_token,
+                "access_token": "ACCESS_TOKEN_MUST_NOT_ESCAPE",
+                "refresh_token": "REFRESH_TOKEN_MUST_NOT_ESCAPE",
+                "account_id": "ACCOUNT_ID_MUST_NOT_ESCAPE"
+            }
+        }))
+        .expect("serialize Codex auth fixture")
+    }
+
+    fn grok_auth_fixture() -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "https://auth.x.ai::fixture": {
+                "email": "grok@example.test",
+                "first_name": "Grok",
+                "last_name": "User",
+                "auth_mode": "oauth",
+                "refresh_token": "GROK_REFRESH_TOKEN_MUST_NOT_ESCAPE",
+                "key": "GROK_KEY_MUST_NOT_ESCAPE",
+                "user_id": "GROK_USER_ID_MUST_NOT_ESCAPE",
+                "team_id": "GROK_TEAM_ID_MUST_NOT_ESCAPE"
+            }
+        }))
+        .expect("serialize Grok auth fixture")
+    }
+
+    #[test]
+    fn account_summaries_expose_only_current_login_labels_and_public_plan() {
+        let directory = TestDirectory::new();
+        let codex_path = directory.write(
+            "codex/auth.json",
+            codex_auth_fixture(
+                "codex@example.test",
+                "plus",
+                Some("API_KEY_MUST_NOT_ESCAPE"),
+            ),
+        );
+        let grok_path = directory.write("grok/auth.json", grok_auth_fixture());
+
+        let codex = read_codex_account(Some(&codex_path)).expect("Codex account");
+        assert_eq!(codex.display_label, "codex@example.test");
+        assert_eq!(codex.plan.as_deref(), Some("plus"));
+        assert_eq!(codex.auth_mode, "chatgpt");
+
+        let grok = read_grok_account(Some(&grok_path)).expect("Grok account");
+        assert_eq!(grok.display_label, "grok@example.test");
+        assert_eq!(grok.plan, None);
+        assert_eq!(grok.auth_mode, "xai");
+
+        let encoded = serde_json::to_string(&(codex, grok)).expect("serialize account summaries");
+        for secret in [
+            "ACCESS_TOKEN_MUST_NOT_ESCAPE",
+            "REFRESH_TOKEN_MUST_NOT_ESCAPE",
+            "API_KEY_MUST_NOT_ESCAPE",
+            "INTERNAL_ACCOUNT_ID_MUST_NOT_ESCAPE",
+            "GROK_REFRESH_TOKEN_MUST_NOT_ESCAPE",
+            "GROK_KEY_MUST_NOT_ESCAPE",
+            "GROK_USER_ID_MUST_NOT_ESCAPE",
+            "GROK_TEAM_ID_MUST_NOT_ESCAPE",
+            "SIGNATURE_MUST_NOT_ESCAPE",
+        ] {
+            assert!(!encoded.contains(secret));
+        }
+        assert!(!encoded.contains("token"));
+        assert!(!encoded.contains("accountId"));
+        assert!(!encoded.contains("userId"));
+        assert!(!encoded.contains("teamId"));
+        assert!(!encoded.contains("path"));
+    }
+
+    #[test]
+    fn account_readers_fail_closed_and_support_codex_api_key_mode() {
+        let directory = TestDirectory::new();
+        let api_key_path = directory.write(
+            "api-key/auth.json",
+            serde_json::to_vec(&json!({
+                "OPENAI_API_KEY": "API_KEY_MUST_NOT_ESCAPE",
+                "tokens": null
+            }))
+            .unwrap(),
+        );
+        assert_eq!(
+            read_codex_account(Some(&api_key_path)),
+            Some(ProviderAccountSummary {
+                display_label: "OpenAI API key".into(),
+                plan: None,
+                auth_mode: "apiKey".into(),
+            })
+        );
+
+        let malformed = directory.write("broken/auth.json", b"{not-json");
+        assert_eq!(read_codex_account(Some(&malformed)), None);
+        assert_eq!(read_grok_account(Some(&malformed)), None);
+        assert_eq!(sanitized_account_text("safe\u{202e}evil", 254), None);
+
+        let oversized = directory.write("oversized/auth.json", vec![b'x'; AUTH_FILE_MAX_BYTES + 1]);
+        assert_eq!(read_codex_account(Some(&oversized)), None);
+        assert_eq!(read_grok_account(Some(&oversized)), None);
+
+        let ambiguous = directory.write(
+            "ambiguous/auth.json",
+            serde_json::to_vec(&json!({
+                "first": { "email": "one@example.test" },
+                "second": { "email": "two@example.test" }
+            }))
+            .unwrap(),
+        );
+        assert_eq!(read_grok_account(Some(&ambiguous)), None);
+        assert!(read_provider_account("unknown").is_err());
+    }
+
+    #[test]
+    fn account_readers_do_not_follow_symbolic_links() {
+        let directory = TestDirectory::new();
+        let real = directory.write(
+            "real/auth.json",
+            codex_auth_fixture("linked@example.test", "plus", None),
+        );
+        let linked = directory.root.join("linked-auth.json");
+        #[cfg(windows)]
+        let linked_result = std::os::windows::fs::symlink_file(&real, &linked);
+        #[cfg(unix)]
+        let linked_result = std::os::unix::fs::symlink(&real, &linked);
+        #[cfg(not(any(windows, unix)))]
+        let linked_result: std::io::Result<()> = Err(std::io::ErrorKind::Unsupported.into());
+        if linked_result.is_ok() {
+            assert_eq!(read_codex_account(Some(&linked)), None);
+            assert_eq!(read_grok_account(Some(&linked)), None);
+        }
+    }
+
     #[test]
     fn response_matches_frontend_contract_and_contains_no_source_data() {
         let response = ProviderUsageResponse {
@@ -720,12 +1213,20 @@ mod tests {
             Some(PathBuf::from(r"D:\Agents\Codex").join("sessions"))
         );
         assert_eq!(
+            overridden.codex_auth,
+            Some(PathBuf::from(r"D:\Agents\Codex").join("auth.json"))
+        );
+        assert_eq!(
             overridden.grok_log,
             Some(
                 PathBuf::from(r"E:\Agents\Grok")
                     .join("logs")
                     .join("unified.jsonl")
             )
+        );
+        assert_eq!(
+            overridden.grok_auth,
+            Some(PathBuf::from(r"E:\Agents\Grok").join("auth.json"))
         );
 
         let fallback =
@@ -738,6 +1239,14 @@ mod tests {
             fallback.grok_log,
             Some(PathBuf::from("/safe/home/.grok/logs/unified.jsonl"))
         );
+        assert_eq!(
+            fallback.codex_auth,
+            Some(PathBuf::from("/safe/home/.codex/auth.json"))
+        );
+        assert_eq!(
+            fallback.grok_auth,
+            Some(PathBuf::from("/safe/home/.grok/auth.json"))
+        );
     }
 
     #[test]
@@ -749,7 +1258,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_selects_current_nearest_reset_then_highest_usage() {
+    fn codex_selects_latest_observation_before_reset_time_and_usage() {
         let directory = TestDirectory::new();
         let sessions = directory.directory("sessions");
         directory.write(
@@ -781,15 +1290,83 @@ mod tests {
             format_rfc3339_millis((NOW_SECONDS + 500) * 1_000).unwrap()
         );
         let weekly = response.codex.weekly.expect("weekly");
-        assert_eq!(weekly.used_percent, 20.0);
+        assert_eq!(weekly.used_percent, 95.0);
         assert_eq!(
             weekly.resets_at,
-            format_rfc3339_millis((NOW_SECONDS + 1_000) * 1_000).unwrap()
+            format_rfc3339_millis((NOW_SECONDS + 2_000) * 1_000).unwrap()
         );
         assert_eq!(
             response.codex.updated_at,
             Some("2023-11-14T22:13:22Z".into())
         );
+    }
+
+    #[test]
+    fn codex_reset_pass_new_epoch_supersedes_still_current_old_epoch() {
+        let directory = TestDirectory::new();
+        let sessions = directory.directory("sessions");
+        directory.write(
+            "sessions/before-reset.jsonl",
+            codex_line(
+                "2023-11-14T22:13:20Z",
+                None,
+                Some((98.0, 10_080, NOW_SECONDS + 500)),
+            ),
+        );
+        directory.write(
+            "sessions/after-reset.jsonl",
+            codex_line(
+                "2023-11-14T22:13:21Z",
+                None,
+                Some((1.0, 10_080, NOW_SECONDS + 604_800)),
+            ),
+        );
+
+        let response = read_provider_usage_at(paths(Some(sessions), None), fixed_now());
+        let weekly = response.codex.weekly.expect("weekly after reset");
+        assert_eq!(weekly.used_percent, 1.0);
+        assert_eq!(weekly.updated_at, "2023-11-14T22:13:21Z");
+        assert_eq!(
+            weekly.resets_at,
+            format_rfc3339_millis((NOW_SECONDS + 604_800) * 1_000).unwrap()
+        );
+    }
+
+    #[test]
+    fn current_limit_ties_prefer_later_reset_then_higher_usage_and_ignore_expired() {
+        let now_millis = NOW_SECONDS * 1_000;
+        let records = vec![
+            LimitRecord {
+                used_percent: 40.0,
+                window_minutes: 300,
+                resets_at_millis: (NOW_SECONDS + 500) * 1_000,
+                updated_at_millis: (NOW_SECONDS + 100) * 1_000,
+            },
+            LimitRecord {
+                used_percent: 10.0,
+                window_minutes: 300,
+                resets_at_millis: (NOW_SECONDS + 600) * 1_000,
+                updated_at_millis: (NOW_SECONDS + 100) * 1_000,
+            },
+            LimitRecord {
+                used_percent: 80.0,
+                window_minutes: 300,
+                resets_at_millis: (NOW_SECONDS + 600) * 1_000,
+                updated_at_millis: (NOW_SECONDS + 100) * 1_000,
+            },
+            LimitRecord {
+                used_percent: 99.0,
+                window_minutes: 300,
+                resets_at_millis: now_millis,
+                updated_at_millis: (NOW_SECONDS + 1_000) * 1_000,
+            },
+        ];
+
+        let selected = choose_current(&records, now_millis, |window| window == 300)
+            .expect("current five-hour record");
+        assert_eq!(selected.used_percent, 80.0);
+        assert_eq!(selected.resets_at_millis, (NOW_SECONDS + 600) * 1_000);
+        assert_eq!(selected.updated_at_millis, (NOW_SECONDS + 100) * 1_000);
     }
 
     #[test]
@@ -922,6 +1499,93 @@ mod tests {
     }
 
     #[test]
+    fn grok_reset_boundary_reports_full_allowance_without_a_new_usage_event() {
+        let directory = TestDirectory::new();
+        let reset_at = format_rfc3339_millis(NOW_SECONDS * 1_000).unwrap();
+        let log = directory.write(
+            "grok/logs/unified.jsonl",
+            grok_line(
+                97.0,
+                json!({ "billingPeriodEnd": reset_at }),
+                Some("2023-11-14T22:13:19Z"),
+            ),
+        );
+
+        let response = read_provider_usage_at(paths(None, Some(log)), fixed_now());
+        let weekly = response.grok.weekly.expect("projected current Grok window");
+        assert_eq!(weekly.used_percent, 0.0);
+        assert_eq!(
+            weekly.resets_at,
+            format_rfc3339_millis((NOW_SECONDS + 604_800) * 1_000).unwrap()
+        );
+        assert_eq!(weekly.updated_at, "2023-11-14T22:13:19Z");
+        assert_eq!(
+            response.grok.updated_at,
+            Some("2023-11-14T22:13:19Z".into())
+        );
+    }
+
+    #[test]
+    fn grok_fresh_post_reset_observation_remains_authoritative() {
+        let directory = TestDirectory::new();
+        let previous_reset = format_rfc3339_millis(NOW_SECONDS * 1_000).unwrap();
+        let current_reset = format_rfc3339_millis((NOW_SECONDS + 604_800) * 1_000).unwrap();
+        let log = directory.write(
+            "grok/logs/unified.jsonl",
+            [
+                grok_line(
+                    97.0,
+                    json!({ "billingPeriodEnd": previous_reset }),
+                    Some("2023-11-14T22:13:19Z"),
+                ),
+                b"\n".to_vec(),
+                grok_line(
+                    1.0,
+                    json!({ "billingPeriodEnd": current_reset }),
+                    Some("2023-11-14T22:13:21Z"),
+                ),
+            ]
+            .concat(),
+        );
+
+        let response = read_provider_usage_at(paths(None, Some(log)), fixed_now());
+        let weekly = response
+            .grok
+            .weekly
+            .expect("authoritative current Grok window");
+        assert_eq!(weekly.used_percent, 1.0);
+        assert_eq!(
+            weekly.resets_at,
+            format_rfc3339_millis((NOW_SECONDS + 604_800) * 1_000).unwrap()
+        );
+        assert_eq!(weekly.updated_at, "2023-11-14T22:13:21Z");
+    }
+
+    #[test]
+    fn grok_stale_record_advances_across_multiple_elapsed_windows() {
+        let window_millis = GROK_WINDOW_MINUTES * 60_000;
+        let original_reset = NOW_SECONDS * 1_000 - window_millis * 2 - 30_000;
+        let projected = project_grok_record_into_current_window(
+            LimitRecord {
+                used_percent: 80.0,
+                window_minutes: GROK_WINDOW_MINUTES,
+                resets_at_millis: original_reset,
+                updated_at_millis: original_reset - 1_000,
+            },
+            NOW_SECONDS * 1_000,
+        )
+        .expect("project stale Grok record");
+
+        assert_eq!(projected.used_percent, 0.0);
+        assert_eq!(
+            projected.resets_at_millis,
+            original_reset + window_millis * 3
+        );
+        assert!(projected.resets_at_millis > NOW_SECONDS * 1_000);
+        assert_eq!(projected.updated_at_millis, original_reset - 1_000);
+    }
+
+    #[test]
     fn grok_supports_billing_fallback_and_rejects_bad_shapes_resiliently() {
         let directory = TestDirectory::new();
         let fallback = directory.write(
@@ -941,6 +1605,27 @@ mod tests {
         );
         let response = read_provider_usage_at(paths(None, Some(invalid)), fixed_now());
         assert_eq!(response.grok, empty_provider());
+    }
+
+    #[test]
+    fn grok_uses_billing_fallback_when_current_period_has_no_valid_end() {
+        let directory = TestDirectory::new();
+        let log = directory.write(
+            "grok/logs/unified.jsonl",
+            grok_line(
+                25.0,
+                json!({
+                    "currentPeriod": { "end": false },
+                    "billingPeriodEnd": "2023-11-17T00:00:00Z"
+                }),
+                Some("2023-11-14T22:13:21Z"),
+            ),
+        );
+
+        let response = read_provider_usage_at(paths(None, Some(log)), fixed_now());
+        let weekly = response.grok.weekly.expect("Grok billing fallback");
+        assert_eq!(weekly.used_percent, 25.0);
+        assert_eq!(weekly.resets_at, "2023-11-17T00:00:00Z");
     }
 
     #[test]

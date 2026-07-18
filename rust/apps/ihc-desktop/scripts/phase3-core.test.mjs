@@ -169,7 +169,7 @@ test("closing the final tab always creates one blank replacement", () => {
   assert.equal(closed.activeTabId, closed.tabs[0].id);
 });
 
-test("restore capacity is atomic at the global twenty-pane boundary", () => {
+test("restore capacity is atomic at a project's twenty-pane boundary", () => {
   assert.deepEqual(core.evaluateRestoreCapacity(12, 8), {
     allowed: true,
     current: 12,
@@ -183,14 +183,10 @@ test("restore capacity is atomic at the global twenty-pane boundary", () => {
   assert.throws(() => core.evaluateRestoreCapacity(-1, 1), /non-negative integer/);
 });
 
-test("catalog mutation and recovery controls start disabled", () => {
+test("catalog mutation controls start disabled", () => {
   for (const id of ["create-project", "add-workspace-tab", "add-terminal"]) {
     assert.match(startupHtml, new RegExp(`id=["']${id}["'][^>]*disabled`));
   }
-  assert.match(
-    startupHtml,
-    /id=["']recover-project-catalog["'][^>]*disabled[^>]*hidden|id=["']recover-project-catalog["'][^>]*hidden[^>]*disabled/,
-  );
 });
 
 test("graceful close can destroy the Tauri main window", () => {

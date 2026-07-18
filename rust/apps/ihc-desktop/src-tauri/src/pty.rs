@@ -1,6 +1,9 @@
 use crate::agent_runtime::{
     AgentResumeBinding, AgentRuntime, StableTerminalKey, TerminalLaunchPlan,
 };
+use crate::codex_notify;
+use crate::grok_notify;
+use crate::provider_accounts::{CODEX_OAUTH_ISOLATION_ENV, GROK_OAUTH_ISOLATION_ENV};
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use serde::Serialize;
 use std::{
@@ -32,6 +35,15 @@ use windows_sys::Win32::System::JobObjects::{
 use portable_pty::ChildKiller;
 
 pub(crate) const MAX_TERMINAL_SESSIONS: usize = 20;
+pub(crate) const MAX_TERMINAL_SESSIONS_PER_PROJECT: usize = MAX_TERMINAL_SESSIONS;
+const MAX_TERMINAL_PROJECTS: usize = 256;
+const MAX_TOTAL_TERMINAL_SESSIONS: usize =
+    MAX_TERMINAL_SESSIONS_PER_PROJECT * MAX_TERMINAL_PROJECTS;
+const LEGACY_TERMINAL_ENVIRONMENT: [(&str, &str); 3] = [
+    ("TERM", "xterm-256color"),
+    ("COLORTERM", "truecolor"),
+    ("TERM_PROGRAM", "IHATECODING"),
+];
 
 const OUTPUT_READ_BUFFER_BYTES: usize = 16 * 1024;
 const OUTPUT_QUEUE_CAPACITY: usize = 32;
@@ -47,6 +59,36 @@ const RESIZE_COALESCE_WINDOW: Duration = Duration::from_millis(12);
 const WORKER_JOIN_TIMEOUT: Duration = Duration::from_millis(750);
 const SHUTDOWN_COMMAND_TIMEOUT: Duration = Duration::from_secs(8);
 const SHUTDOWN_EXIT_TIMEOUT: Duration = Duration::from_secs(2);
+
+fn configure_terminal_environment(command: &mut CommandBuilder) {
+    let codex_oauth_isolated =
+        env::var_os(CODEX_OAUTH_ISOLATION_ENV).is_some_and(|value| value == "1");
+    let grok_oauth_isolated =
+        env::var_os(GROK_OAUTH_ISOLATION_ENV).is_some_and(|value| value == "1");
+    configure_terminal_environment_for_oauth_isolation(
+        command,
+        codex_oauth_isolated,
+        grok_oauth_isolated,
+    );
+}
+
+fn configure_terminal_environment_for_oauth_isolation(
+    command: &mut CommandBuilder,
+    codex_oauth_isolated: bool,
+    grok_oauth_isolated: bool,
+) {
+    for (name, value) in LEGACY_TERMINAL_ENVIRONMENT {
+        command.env(name, value);
+    }
+    if codex_oauth_isolated {
+        command.env_remove("OPENAI_API_KEY");
+        command.env_remove("CODEX_ACCESS_TOKEN");
+    }
+    if grok_oauth_isolated {
+        command.env_remove("XAI_API_KEY");
+        command.env_remove("GROK_API_KEY");
+    }
+}
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(
@@ -233,6 +275,7 @@ impl SessionPhase {
 }
 
 struct TerminalSession {
+    root_process_id: Option<u32>,
     io: Arc<TerminalIo>,
     terminator: ProcessTerminator,
     flow: Arc<OutputFlow>,
@@ -301,8 +344,23 @@ enum ManagerLifecycle {
 }
 
 enum SessionEntry {
-    Starting,
-    Active(Arc<TerminalSession>),
+    Starting {
+        project_id: Option<String>,
+    },
+    Active {
+        project_id: Option<String>,
+        session: Arc<TerminalSession>,
+    },
+}
+
+impl SessionEntry {
+    fn project_id(&self) -> Option<&str> {
+        match self {
+            Self::Starting { project_id } | Self::Active { project_id, .. } => {
+                project_id.as_deref()
+            }
+        }
+    }
 }
 
 struct ManagerState {
@@ -567,9 +625,10 @@ impl TerminalManager {
         sink: Arc<dyn TerminalEventSink>,
     ) -> Result<StartTerminalResponse, String> {
         let cwd = validate_working_directory(cwd)?;
+        let project_id = terminal_key.as_ref().map(|key| key.project_id.clone());
         let launch_plan = TerminalLaunchPlan::from_request(terminal_key, resume)?;
         let size = normalized_size(columns, rows);
-        let mut reservation = self.reserve_start()?;
+        let mut reservation = self.reserve_start_for_project(project_id.as_deref())?;
         let binding_lease = launch_plan
             .ownership()
             .map(|(terminal_key, binding)| {
@@ -592,7 +651,12 @@ impl TerminalManager {
             .map_err(|error| format!("ConPTY input connection failed: {error}"))?;
 
         let mut command = CommandBuilder::new(resolve_powershell());
+        configure_terminal_environment(&mut command);
         command.args(launch_plan.arguments());
+        let notify_route = codex_notify::route_path(&reservation.session_id)?;
+        command.env(codex_notify::NOTIFY_ROUTE_ENV, &notify_route);
+        let grok_notify_route = grok_notify::route_path(&reservation.session_id)?;
+        command.env(grok_notify::NOTIFY_ROUTE_ENV, &grok_notify_route);
         if let Some(directory) = &cwd {
             command.cwd(directory);
         }
@@ -610,6 +674,7 @@ impl TerminalManager {
         drop(pair.slave);
 
         let session = Arc::new(TerminalSession {
+            root_process_id: process_id,
             io: Arc::new(TerminalIo {
                 master: Mutex::new(Some(pair.master)),
                 writer: Mutex::new(Some(writer)),
@@ -686,7 +751,7 @@ impl TerminalManager {
         let session = {
             let state = lock(&self.state)?;
             match state.sessions.get(session_id) {
-                Some(SessionEntry::Active(session)) => Some(Arc::clone(session)),
+                Some(SessionEntry::Active { session, .. }) => Some(Arc::clone(session)),
                 _ => None,
             }
         };
@@ -701,7 +766,7 @@ impl TerminalManager {
         let session = {
             let state = lock(&self.state)?;
             match state.sessions.get(session_id) {
-                Some(SessionEntry::Active(session)) => Some(Arc::clone(session)),
+                Some(SessionEntry::Active { session, .. }) => Some(Arc::clone(session)),
                 _ => None,
             }
         };
@@ -718,8 +783,12 @@ impl TerminalManager {
         };
         matches!(
             state.sessions.get(session_id),
-            Some(SessionEntry::Active(_))
+            Some(SessionEntry::Active { .. })
         )
+    }
+
+    pub(crate) fn root_process_id(&self, session_id: &str) -> Result<Option<u32>, String> {
+        Ok(self.session(session_id)?.root_process_id)
     }
 
     #[cfg(test)]
@@ -757,7 +826,7 @@ impl TerminalManager {
             while state
                 .sessions
                 .values()
-                .any(|entry| matches!(entry, SessionEntry::Starting))
+                .any(|entry| matches!(entry, SessionEntry::Starting { .. }))
             {
                 state = self.wait_for_shutdown_progress(state, deadline)?;
             }
@@ -765,8 +834,8 @@ impl TerminalManager {
                 .sessions
                 .values()
                 .filter_map(|entry| match entry {
-                    SessionEntry::Starting => None,
-                    SessionEntry::Active(session) => Some(Arc::clone(session)),
+                    SessionEntry::Starting { .. } => None,
+                    SessionEntry::Active { session, .. } => Some(Arc::clone(session)),
                 })
                 .collect::<Vec<_>>()
         };
@@ -828,8 +897,8 @@ impl TerminalManager {
                     .sessions
                     .values()
                     .map(|entry| match entry {
-                        SessionEntry::Starting => None,
-                        SessionEntry::Active(session) => Some(Arc::clone(session)),
+                        SessionEntry::Starting { .. } => None,
+                        SessionEntry::Active { session, .. } => Some(Arc::clone(session)),
                     })
                     .collect::<Vec<_>>(),
             ),
@@ -841,8 +910,8 @@ impl TerminalManager {
                         .sessions
                         .values()
                         .map(|entry| match entry {
-                            SessionEntry::Starting => None,
-                            SessionEntry::Active(session) => Some(Arc::clone(session)),
+                            SessionEntry::Starting { .. } => None,
+                            SessionEntry::Active { session, .. } => Some(Arc::clone(session)),
                         })
                         .collect::<Vec<_>>(),
                 )
@@ -896,7 +965,7 @@ impl TerminalManager {
             max_sessions: MAX_TERMINAL_SESSIONS,
             max_concurrent_spawns: MAX_CONCURRENT_SPAWNS,
             accepting_sessions: lifecycle == ManagerLifecycle::Running
-                && active_sessions < MAX_TERMINAL_SESSIONS,
+                && active_sessions < MAX_TOTAL_TERMINAL_SESSIONS,
             output_batch_max_bytes: OUTPUT_BATCH_MAX_BYTES,
             output_max_unacked_batches: OUTPUT_MAX_UNACKED_BATCHES,
             output_max_unacked_bytes: OUTPUT_MAX_UNACKED_BYTES,
@@ -905,20 +974,41 @@ impl TerminalManager {
         }
     }
 
+    #[cfg(test)]
     fn reserve_start(&self) -> Result<StartReservation, String> {
+        self.reserve_start_for_project(None)
+    }
+
+    fn reserve_start_for_project(
+        &self,
+        project_id: Option<&str>,
+    ) -> Result<StartReservation, String> {
         let mut state = lock(&self.state)?;
         if state.lifecycle != ManagerLifecycle::Running {
             return Err("Terminal engine is shutting down.".to_owned());
         }
-        if state.sessions.len() >= MAX_TERMINAL_SESSIONS {
+        if state.sessions.len() >= MAX_TOTAL_TERMINAL_SESSIONS {
             return Err(format!(
-                "Terminal session limit reached ({MAX_TERMINAL_SESSIONS})."
+                "Terminal session limit reached ({MAX_TOTAL_TERMINAL_SESSIONS})."
+            ));
+        }
+        let project_sessions = state
+            .sessions
+            .values()
+            .filter(|entry| entry.project_id() == project_id)
+            .count();
+        if project_sessions >= MAX_TERMINAL_SESSIONS_PER_PROJECT {
+            return Err(format!(
+                "Terminal session limit reached for this project ({MAX_TERMINAL_SESSIONS_PER_PROJECT})."
             ));
         }
         let session_id = Uuid::new_v4().simple().to_string();
-        state
-            .sessions
-            .insert(session_id.clone(), SessionEntry::Starting);
+        state.sessions.insert(
+            session_id.clone(),
+            SessionEntry::Starting {
+                project_id: project_id.map(str::to_owned),
+            },
+        );
         drop(state);
         Ok(StartReservation {
             state: Arc::clone(&self.state),
@@ -931,7 +1021,10 @@ impl TerminalManager {
     fn ensure_start_pending(&self, session_id: &str) -> Result<(), String> {
         let state = lock(&self.state)?;
         if state.lifecycle == ManagerLifecycle::Running
-            && matches!(state.sessions.get(session_id), Some(SessionEntry::Starting))
+            && matches!(
+                state.sessions.get(session_id),
+                Some(SessionEntry::Starting { .. })
+            )
         {
             Ok(())
         } else {
@@ -948,15 +1041,27 @@ impl TerminalManager {
         workers: &mut WorkerSet,
     ) -> Result<(), String> {
         let mut state = lock(&self.state)?;
-        if state.lifecycle != ManagerLifecycle::Running
-            || !matches!(state.sessions.get(session_id), Some(SessionEntry::Starting))
-        {
+        let project_id = match state.sessions.get(session_id) {
+            Some(SessionEntry::Starting { project_id })
+                if state.lifecycle == ManagerLifecycle::Running =>
+            {
+                project_id.clone()
+            }
+            _ => {
+                return Err("Terminal start was cancelled during shutdown.".to_owned());
+            }
+        };
+        if state.lifecycle != ManagerLifecycle::Running {
             return Err("Terminal start was cancelled during shutdown.".to_owned());
         }
 
-        state
-            .sessions
-            .insert(session_id.to_owned(), SessionEntry::Active(session));
+        state.sessions.insert(
+            session_id.to_owned(),
+            SessionEntry::Active {
+                project_id,
+                session,
+            },
+        );
 
         if let Err(error) = sink.send(TerminalEvent::Started {
             session_id: session_id.to_owned(),
@@ -976,7 +1081,7 @@ impl TerminalManager {
     fn session(&self, session_id: &str) -> Result<Arc<TerminalSession>, String> {
         let state = lock(&self.state)?;
         match state.sessions.get(session_id) {
-            Some(SessionEntry::Active(session)) => Ok(Arc::clone(session)),
+            Some(SessionEntry::Active { session, .. }) => Ok(Arc::clone(session)),
             _ => Err("Terminal session was not found.".to_owned()),
         }
     }
@@ -1326,6 +1431,8 @@ fn spawn_workers(
             }
             remove_session(&manager_state, &manager_state_changed, &wait_id);
             agent_runtime.unbind(&wait_id);
+            codex_notify::remove_route(&wait_id);
+            grok_notify::remove_route(&wait_id);
             let _ = wait_sink.send(TerminalEvent::Exited {
                 session_id: wait_id,
                 exit_code,
@@ -2213,6 +2320,57 @@ mod tests {
     }
 
     #[test]
+    fn terminal_commands_restore_the_legacy_environment_without_dropping_routes() {
+        let mut command = CommandBuilder::new("powershell.exe");
+        command.env(codex_notify::NOTIFY_ROUTE_ENV, "codex-route");
+        command.env(grok_notify::NOTIFY_ROUTE_ENV, "grok-route");
+
+        configure_terminal_environment(&mut command);
+
+        for (name, value) in LEGACY_TERMINAL_ENVIRONMENT {
+            assert_eq!(command.get_env(name), Some(std::ffi::OsStr::new(value)));
+        }
+        assert_eq!(
+            command.get_env(codex_notify::NOTIFY_ROUTE_ENV),
+            Some(std::ffi::OsStr::new("codex-route"))
+        );
+        assert_eq!(
+            command.get_env(grok_notify::NOTIFY_ROUTE_ENV),
+            Some(std::ffi::OsStr::new("grok-route"))
+        );
+    }
+
+    #[test]
+    fn oauth_isolation_removes_only_the_selected_providers_ambient_credentials() {
+        let mut command = CommandBuilder::new("powershell.exe");
+        for name in [
+            "OPENAI_API_KEY",
+            "CODEX_ACCESS_TOKEN",
+            "XAI_API_KEY",
+            "GROK_API_KEY",
+        ] {
+            command.env(name, "fixture-secret");
+        }
+
+        configure_terminal_environment_for_oauth_isolation(&mut command, true, false);
+
+        assert_eq!(command.get_env("OPENAI_API_KEY"), None);
+        assert_eq!(command.get_env("CODEX_ACCESS_TOKEN"), None);
+        assert_eq!(
+            command.get_env("XAI_API_KEY"),
+            Some(std::ffi::OsStr::new("fixture-secret"))
+        );
+        assert_eq!(
+            command.get_env("GROK_API_KEY"),
+            Some(std::ffi::OsStr::new("fixture-secret"))
+        );
+
+        configure_terminal_environment_for_oauth_isolation(&mut command, false, true);
+        assert_eq!(command.get_env("XAI_API_KEY"), None);
+        assert_eq!(command.get_env("GROK_API_KEY"), None);
+    }
+
+    #[test]
     fn preserves_korean_split_across_chunks() {
         let source = "우리가 실험용 한글 입력을 확인합니다".as_bytes();
         let mut decoder = Utf8StreamDecoder::default();
@@ -2237,6 +2395,14 @@ mod tests {
         let source = [0x00, 0x7f, 0x80, 0xff];
         let mut destination = Vec::new();
         write_bytes(&mut destination, &source).expect("raw bytes should be writable");
+        assert_eq!(destination, source);
+    }
+
+    #[test]
+    fn raw_terminal_input_preserves_arrow_key_sequences() {
+        let source = b"\x1b[D\x1b[C\x1b[A\x1b[B";
+        let mut destination = Vec::new();
+        write_bytes(&mut destination, source).expect("arrow key bytes should be writable");
         assert_eq!(destination, source);
     }
 
@@ -2320,6 +2486,76 @@ mod tests {
         );
         assert_eq!(manager.status().starting_sessions, MAX_TERMINAL_SESSIONS);
         drop(reservations);
+        assert_eq!(manager.status().active_sessions, 0);
+    }
+
+    #[test]
+    fn each_project_has_an_independent_twenty_session_pool() {
+        let manager = TerminalManager::default();
+        let mut first = (0..MAX_TERMINAL_SESSIONS_PER_PROJECT)
+            .map(|_| {
+                manager
+                    .reserve_start_for_project(Some("project-a"))
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let mut second = (0..MAX_TERMINAL_SESSIONS_PER_PROJECT)
+            .map(|_| {
+                manager
+                    .reserve_start_for_project(Some("project-b"))
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            manager.status().active_sessions,
+            MAX_TERMINAL_SESSIONS_PER_PROJECT * 2
+        );
+        assert!(
+            manager
+                .reserve_start_for_project(Some("project-a"))
+                .is_err()
+        );
+        assert!(
+            manager
+                .reserve_start_for_project(Some("project-b"))
+                .is_err()
+        );
+
+        drop(
+            first
+                .pop()
+                .expect("project A should have a slot to release"),
+        );
+        let first_replacement = manager
+            .reserve_start_for_project(Some("project-a"))
+            .expect("releasing a project A reservation must recover its slot");
+        assert!(
+            manager
+                .reserve_start_for_project(Some("project-a"))
+                .is_err(),
+            "the replacement must restore project A to its twenty-session limit"
+        );
+
+        drop(
+            second
+                .pop()
+                .expect("project B should have a slot to release"),
+        );
+        let second_replacement = manager
+            .reserve_start_for_project(Some("project-b"))
+            .expect("releasing a project B reservation must recover its slot");
+        assert!(
+            manager
+                .reserve_start_for_project(Some("project-b"))
+                .is_err(),
+            "the replacement must restore project B to its twenty-session limit"
+        );
+        let third = manager
+            .reserve_start_for_project(Some("project-c"))
+            .expect("a different project must retain its own capacity");
+
+        drop((first, first_replacement, second, second_replacement, third));
         assert_eq!(manager.status().active_sessions, 0);
     }
 
@@ -2705,6 +2941,7 @@ mod tests {
             .expect("ConPTY writer should open");
 
         let mut command = CommandBuilder::new(resolve_powershell());
+        configure_terminal_environment(&mut command);
         command.args([
             "-NoLogo",
             "-NoProfile",
@@ -2807,6 +3044,14 @@ mod tests {
             .map(|response| response.session_id.clone())
             .collect::<HashSet<_>>();
         assert_eq!(ids.len(), MAX_TERMINAL_SESSIONS);
+        for response in &responses {
+            assert_eq!(
+                manager
+                    .root_process_id(&response.session_id)
+                    .expect("active session should expose its root process id"),
+                response.process_id
+            );
+        }
         let status = manager.status();
         assert_eq!(status.active_sessions, MAX_TERMINAL_SESSIONS);
         assert!(status.peak_concurrent_spawns <= MAX_CONCURRENT_SPAWNS);

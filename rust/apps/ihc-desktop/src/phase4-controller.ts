@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { open } from "@tauri-apps/plugin-dialog";
 import {
   applyWorkspaceSaveSuccess,
   beginWorkspaceSave,
@@ -17,25 +18,42 @@ import {
   activateRelativeWorkspaceTab,
   activateWorkspaceTab,
   addBlankWorkspaceTab,
+  appendProjectBrowserPane,
   appendProjectPane,
   appendWorkspaceProject,
   applyProjectPaneInsertion,
+  blockWorkspaceProviderResumeForAccountSwitch,
   closeWorkspaceTab,
+  createWorkspaceBrowserPane,
   createWorkspaceProject,
   createWorkspaceTerminal,
   evaluateWorkspaceRestoreCapacity,
   findWorkspaceProjectByFolder,
   moveWorkspaceTabByKeyboard,
+  migrateLegacyAutomaticProjectTabsToManual,
   nextWorkspacePaneName,
   openProjectWorkspaceTab,
+  projectBrowserPanes,
+  removeProjectBrowserPane,
   removeProjectPane,
+  renameProjectBrowserPane,
   renameProjectPane,
+  setProjectBrowserPaneUrl,
+  setTerminalAgentConversation,
+  suggestWorkspaceProjectName,
+  terminalAgentBindingChanged,
   uniqueWorkspaceProjectName,
   validateWorkspaceProjectDraft,
   type PaneInsertionTarget,
   type RestoreCapacityDecision,
+  type WorkspaceBrowserPane,
+  type WorkspaceAgentProvider,
 } from "./phase4-core";
-import { deriveSafeResumePlans, type SafeResumePlan } from "./phase5-core";
+import {
+  ProjectActivityTracker,
+  deriveSafeResumePlans,
+  type SafeResumePlan,
+} from "./phase5-core";
 
 type StatusTone = "normal" | "error";
 
@@ -58,9 +76,15 @@ export type Phase4RuntimePort = {
   ): RestoreCapacityDecision;
   showProject(project: WorkspaceProject): boolean;
   showEmptyView(): void;
+  canAddPane(projectId: string): boolean;
   unloadProject(projectId: string): Promise<void>;
   unloadAllProjects(): Promise<void>;
   addPane(projectId: string, terminal: WorkspaceTerminal, focus?: boolean): unknown;
+  addBrowserPane(
+    projectId: string,
+    browser: WorkspaceBrowserPane,
+    focus?: boolean,
+  ): unknown;
   syncProject(project: WorkspaceProject): void;
   setResumePlans(plans: SafeResumePlan[]): void;
   setTerminalCompletionPending(
@@ -71,13 +95,12 @@ export type Phase4RuntimePort = {
   ): void;
   setCatalogWritable(writable: boolean): void;
   setFooterStatus(message: string, tone?: StatusTone): void;
+  setModalOverlayOpen(reason: string, open: boolean): void;
 };
 
 export type Phase4ControllerElements = {
   projectList: HTMLElement;
-  projectCount: HTMLElement;
   tabList: HTMLElement;
-  currentProject: HTMLElement;
   addTerminalButton: HTMLButtonElement;
   addTabButton: HTMLButtonElement;
   createProjectButton: HTMLButtonElement;
@@ -85,6 +108,7 @@ export type Phase4ControllerElements = {
   projectForm: HTMLFormElement;
   projectName: HTMLInputElement;
   projectPath: HTMLInputElement;
+  selectProjectFolderButton: HTMLButtonElement;
   projectFormError: HTMLElement;
   cancelProjectButton: HTMLButtonElement;
   upgradeButton: HTMLButtonElement;
@@ -111,7 +135,12 @@ export class Phase4WorkspaceController {
   private pendingOperationCount = 0;
   private externalReplacementBarrier: Promise<void> | null = null;
   private resolveExternalReplacement: (() => void) | null = null;
+  private projectFolderPickerPending = false;
+  private projectFolderDefaultPath: string | null = null;
+  private providerAccountRestartRollback: WorkspaceState | null = null;
+  private readonly projectActivity = new ProjectActivityTracker();
   private readonly listeners = new AbortController();
+  private readonly projectListToggle: HTMLButtonElement | null;
 
   constructor(
     private readonly runtime: Phase4RuntimePort,
@@ -119,9 +148,17 @@ export class Phase4WorkspaceController {
     private readonly idFactory: () => string = createOpaqueId,
   ) {
     const signal = this.listeners.signal;
-    elements.addTerminalButton.addEventListener("click", () => void this.addTerminal(), {
-      signal,
-    });
+    this.projectListToggle = elements.projectList.parentElement?.querySelector<HTMLButtonElement>(
+      "#toggle-project-list",
+    ) ?? null;
+    this.projectListToggle?.addEventListener(
+      "click",
+      () => {
+        const expanded = this.projectListToggle?.getAttribute("aria-expanded") === "true";
+        this.setProjectListExpanded(!expanded);
+      },
+      { signal },
+    );
     elements.addTabButton.addEventListener("click", () => void this.addBlankTab(), { signal });
     elements.createProjectButton.addEventListener(
       "click",
@@ -133,6 +170,11 @@ export class Phase4WorkspaceController {
     elements.cancelProjectButton.addEventListener(
       "click",
       () => elements.projectDialog.close(),
+      { signal },
+    );
+    elements.selectProjectFolderButton.addEventListener(
+      "click",
+      () => void this.selectProjectFolder(),
       { signal },
     );
     elements.projectForm.addEventListener(
@@ -164,12 +206,32 @@ export class Phase4WorkspaceController {
       },
       { signal },
     );
+    elements.projectDialog.addEventListener(
+      "close",
+      () => this.runtime.setModalOverlayOpen("project", false),
+      { signal },
+    );
+    elements.upgradeDialog.addEventListener(
+      "close",
+      () => this.runtime.setModalOverlayOpen("upgrade", false),
+      { signal },
+    );
     elements.commitUpgradeButton.addEventListener(
       "click",
       () => void this.commitPhase3PreviewUpgrade(),
       { signal },
     );
+    this.setProjectListExpanded(true);
     this.refreshControls();
+  }
+
+  private setProjectListExpanded(expanded: boolean): void {
+    this.elements.projectList.hidden = !expanded;
+    if (!this.projectListToggle) return;
+    const action = expanded ? "접기" : "펼치기";
+    this.projectListToggle.setAttribute("aria-expanded", String(expanded));
+    this.projectListToggle.setAttribute("aria-label", `프로젝트 목록 ${action}`);
+    this.projectListToggle.title = `프로젝트 목록 ${action}`;
   }
 
   async initialize(): Promise<void> {
@@ -207,10 +269,52 @@ export class Phase4WorkspaceController {
     }
   }
 
+  async assertProviderAccountRestartReady(): Promise<void> {
+    if (!this.canMutate()) {
+      throw new Error("계정 전환을 시작할 수 있는 상태가 아닙니다.");
+    }
+    await this.flushSaves();
+    if (!this.canMutate()) {
+      throw new Error("계정 전환을 시작할 수 있는 상태가 아닙니다.");
+    }
+  }
+
+  async prepareProviderAccountRestart(provider: WorkspaceAgentProvider): Promise<void> {
+    if (!this.canMutate()) {
+      throw new Error("계정 전환을 저장할 수 있는 상태가 아닙니다.");
+    }
+    await this.enqueueOperation(async () => {
+      const state = this.currentState();
+      if (!state) throw new Error("작업 공간 상태를 불러오지 못했습니다.");
+      const next = blockWorkspaceProviderResumeForAccountSwitch(state, provider);
+      const saved = await this.persistNow(next, "계정 전환 상태를 저장하지 못했습니다");
+      if (!saved) throw new Error("계정 전환 상태를 저장하지 못했습니다.");
+      this.providerAccountRestartRollback = structuredClone(state);
+    });
+    await this.flushSaves();
+  }
+
+  async rollbackProviderAccountRestart(): Promise<void> {
+    const previous = this.providerAccountRestartRollback;
+    if (!previous) return;
+    await this.enqueueOperation(async () => {
+      const saved = await this.persistNow(
+        previous,
+        "계정 전환 재시작 상태를 복구하지 못했습니다",
+      );
+      if (!saved) throw new Error("계정 전환 재시작 상태를 복구하지 못했습니다.");
+      this.providerAccountRestartRollback = null;
+    });
+    await this.flushSaves();
+  }
+
   dispose(): void {
-    this.listeners.abort();
+    this.projectActivity.clear();
     if (this.elements.projectDialog.open) this.elements.projectDialog.close();
     if (this.elements.upgradeDialog.open) this.elements.upgradeDialog.close();
+    this.runtime.setModalOverlayOpen("project", false);
+    this.runtime.setModalOverlayOpen("upgrade", false);
+    this.listeners.abort();
   }
 
   async prepareForExternalReplacement(allowPreviewUpgrade = false): Promise<void> {
@@ -281,12 +385,82 @@ export class Phase4WorkspaceController {
     }
   }
 
+  async onBrowserPaneClosed(projectId: string, paneId: string): Promise<boolean> {
+    const state = this.currentState();
+    if (!state || !this.canMutate(false)) return false;
+    try {
+      const next = removeProjectBrowserPane(state, projectId, paneId);
+      return await this.persist(next, "웹 패널 삭제 상태를 저장하지 못했습니다");
+    } catch (error) {
+      this.runtime.setFooterStatus(errorMessage(error), "error");
+      return false;
+    }
+  }
+
   /**
    * Durable provider completion. Runtime decoration and sound are deliberately
    * applied only after the canonical compare-and-swap has committed.
    */
   async onAgentTurnCompleted(projectId: string, terminalId: string): Promise<boolean> {
     return this.persistRuntimeCompletion(projectId, terminalId, true, true);
+  }
+
+  /** Durably associate a provider conversation before it can be resumed later. */
+  async onAgentConversationDiscovered(
+    projectId: string,
+    terminalId: string,
+    provider: WorkspaceAgentProvider,
+    conversationId: string,
+  ): Promise<boolean> {
+    if (!this.canPersistRuntimeMutation()) return false;
+
+    return this.enqueueOperation(async () => {
+      const state = this.currentState();
+      const terminal = state?.projects
+        .find((project) => project.id === projectId)
+        ?.terminals.find((item) => item.id === terminalId);
+      if (!state || !terminal) return false;
+
+      try {
+        const next = setTerminalAgentConversation(
+          state,
+          projectId,
+          terminalId,
+          provider,
+          conversationId,
+        );
+        const nextTerminal = next.projects
+          .find((project) => project.id === projectId)
+          ?.terminals.find((item) => item.id === terminalId);
+        const bindingChanged =
+          nextTerminal !== undefined && terminalAgentBindingChanged(terminal, nextTerminal);
+        if (bindingChanged) {
+          const saved = await this.persistNow(
+            next,
+            "에이전트 대화 연결을 저장하지 못했습니다",
+          );
+          if (!saved) return false;
+        }
+
+        const committed = this.currentState();
+        if (!committed) return false;
+        this.runtime.setResumePlans(deriveSafeResumePlans(committed));
+        const committedProject = committed.projects.find((item) => item.id === projectId);
+        if (committedProject) this.runtime.syncProject(committedProject);
+        return true;
+      } catch (error) {
+        this.runtime.setFooterStatus(
+          `에이전트 대화를 연결하지 못했습니다: ${errorMessage(error)}`,
+          "error",
+        );
+        return false;
+      }
+    });
+  }
+
+  setTerminalAgentWorking(projectId: string, terminalId: string, working: boolean): void {
+    this.projectActivity.setTerminalWorking(projectId, terminalId, working);
+    this.refreshProjectActivity(projectId);
   }
 
   /** Explicit pane interaction is the only acknowledgement path. */
@@ -307,6 +481,38 @@ export class Phase4WorkspaceController {
     try {
       const next = renameProjectPane(state, projectId, paneId, title);
       return await this.persist(next, "PowerShell 이름을 저장하지 못했습니다");
+    } catch (error) {
+      this.runtime.setFooterStatus(errorMessage(error), "error");
+      return false;
+    }
+  }
+
+  async onBrowserPaneRenamed(
+    projectId: string,
+    paneId: string,
+    title: string,
+  ): Promise<boolean> {
+    const state = this.currentState();
+    if (!state || !this.canMutate(false)) return false;
+    try {
+      const next = renameProjectBrowserPane(state, projectId, paneId, title);
+      return await this.persist(next, "웹 패널 이름을 저장하지 못했습니다");
+    } catch (error) {
+      this.runtime.setFooterStatus(errorMessage(error), "error");
+      return false;
+    }
+  }
+
+  async onBrowserPaneUrlChanged(
+    projectId: string,
+    paneId: string,
+    url: string,
+  ): Promise<boolean> {
+    const state = this.currentState();
+    if (!state || !this.canMutate(false)) return false;
+    try {
+      const next = setProjectBrowserPaneUrl(state, projectId, paneId, url);
+      return await this.persist(next, "웹 패널 주소를 저장하지 못했습니다");
     } catch (error) {
       this.runtime.setFooterStatus(errorMessage(error), "error");
       return false;
@@ -399,12 +605,19 @@ export class Phase4WorkspaceController {
 
       this.upgradeInspection = null;
       this.elements.upgradeButton.hidden = true;
+      const current = this.currentState();
+      if (
+        this.session.access === "ready" &&
+        current &&
+        current.legacyExtensions.manualProjectTabsV1 !== true
+      ) {
+        const migrated = migrateLegacyAutomaticProjectTabsToManual(current);
+        if (!(await this.persistNow(migrated, "수동 프로젝트 탭 전환을 저장하지 못했습니다"))) {
+          this.renderAndActivate();
+          return false;
+        }
+      }
       this.renderAndActivate();
-      this.runtime.setFooterStatus(
-        status.revision === null
-          ? "Rust 작업 공간을 준비했습니다."
-          : `Rust 작업 공간 r${status.revision}을 불러왔습니다.`,
-      );
       return true;
     } catch (error) {
       if (this.shuttingDown) return false;
@@ -428,7 +641,6 @@ export class Phase4WorkspaceController {
     this.renderSidebar();
     const state = this.currentState();
     if (!state) {
-      this.elements.currentProject.textContent = "프로젝트 없음";
       this.runtime.showEmptyView();
       return;
     }
@@ -439,12 +651,10 @@ export class Phase4WorkspaceController {
       if (project && this.canStartRuntime()) {
         this.runtime.syncProject(project);
         if (this.runtime.showProject(project)) {
-          this.elements.currentProject.textContent = project.name;
           return;
         }
       }
     }
-    this.elements.currentProject.textContent = "프로젝트 없음";
     this.runtime.showEmptyView();
     if (tab && tab.kind !== "empty" && tab.kind !== "project") {
       this.runtime.setFooterStatus(
@@ -463,10 +673,19 @@ export class Phase4WorkspaceController {
       element.className = "workspace-tab";
       element.dataset.active = String(tab.id === state.activeTabId);
       element.dataset.tabId = tab.id;
+      if (tab.projectId) element.dataset.projectId = tab.projectId;
       element.setAttribute("role", "tab");
       element.setAttribute("aria-selected", String(tab.id === state.activeTabId));
       element.setAttribute("aria-disabled", String(!enabled));
       element.tabIndex = tab.id === state.activeTabId ? 0 : -1;
+
+      const working = Boolean(
+        tab.kind === "project" &&
+        tab.projectId &&
+        this.projectActivity.isProjectWorking(tab.projectId),
+      );
+      element.dataset.working = String(working);
+      element.setAttribute("aria-busy", String(working));
 
       const kind = document.createElement("span");
       kind.className = "workspace-tab-kind";
@@ -474,6 +693,17 @@ export class Phase4WorkspaceController {
       const title = document.createElement("span");
       title.className = "workspace-tab-title";
       title.textContent = tab.title;
+      const status = document.createElement("span");
+      status.className = "workspace-tab-status";
+      let activity: HTMLSpanElement | null = null;
+      if (tab.kind === "project" && tab.projectId) {
+        activity = document.createElement("span");
+        activity.className = "workspace-tab-activity";
+        activity.hidden = !working;
+        activity.title = "작업 중";
+        activity.setAttribute("aria-hidden", "true");
+        status.append(activity);
+      }
       let unreadBadge: HTMLSpanElement | null = null;
       if (tab.projectId) {
         const unread = projectUnreadCount(state, tab.projectId);
@@ -486,6 +716,8 @@ export class Phase4WorkspaceController {
           unreadBadge = badge;
         }
       }
+      if (unreadBadge) status.append(unreadBadge);
+      status.hidden = !working && unreadBadge === null;
       const close = document.createElement("button");
       close.className = "workspace-tab-close";
       close.type = "button";
@@ -500,17 +732,29 @@ export class Phase4WorkspaceController {
       const activate = () => void this.activateTab(tab.id);
       element.addEventListener("click", activate);
       element.addEventListener("keydown", (event) => this.onTabKeyDown(event, tab.id));
-      element.append(kind, title);
-      if (unreadBadge) element.append(unreadBadge);
-      element.append(close);
+      element.append(kind, title, status, close);
       this.elements.tabList.append(element);
+    }
+  }
+
+  private refreshProjectActivity(projectId: string): void {
+    const working = this.projectActivity.isProjectWorking(projectId);
+    for (const tab of this.elements.tabList.querySelectorAll<HTMLElement>(".workspace-tab")) {
+      if (tab.dataset.projectId !== projectId) continue;
+      tab.dataset.working = String(working);
+      tab.setAttribute("aria-busy", String(working));
+      const activity = tab.querySelector<HTMLElement>(".workspace-tab-activity");
+      if (activity) activity.hidden = !working;
+      const status = tab.querySelector<HTMLElement>(".workspace-tab-status");
+      if (status) {
+        status.hidden = !working && status.querySelector(".completion-badge") === null;
+      }
     }
   }
 
   private renderSidebar(): void {
     const state = this.currentState();
     this.elements.projectList.replaceChildren();
-    this.elements.projectCount.textContent = String(state?.projects.length ?? 0);
     if (!state) return;
     const enabled = this.mutationsEnabled();
     for (const project of state.projects) {
@@ -519,14 +763,11 @@ export class Phase4WorkspaceController {
       button.type = "button";
       button.disabled = !enabled;
       button.dataset.active = String(project.id === state.selectedProjectId);
-      button.title = project.folderPath;
       const name = document.createElement("strong");
       name.textContent = project.name;
-      const folder = document.createElement("small");
-      folder.textContent = project.folderPath;
       const unread = projectUnreadCount(state, project.id);
       button.dataset.hasCompletion = String(unread > 0);
-      button.append(name, folder);
+      button.append(name);
       if (unread > 0) {
         const badge = document.createElement("span");
         badge.className = "completion-badge project-completion-badge";
@@ -622,10 +863,45 @@ export class Phase4WorkspaceController {
   }
 
   private openProjectDialog(): void {
+    const state = this.currentState();
+    this.projectFolderDefaultPath =
+      state?.projects.find((project) => project.id === state.selectedProjectId)?.folderPath ?? null;
     this.elements.projectForm.reset();
     this.elements.projectFormError.textContent = "";
-    this.elements.projectDialog.showModal();
+    this.runtime.setModalOverlayOpen("project", true);
+    try {
+      this.elements.projectDialog.showModal();
+    } catch (error) {
+      this.runtime.setModalOverlayOpen("project", false);
+      throw error;
+    }
     requestAnimationFrame(() => this.elements.projectName.focus());
+  }
+
+  private async selectProjectFolder(): Promise<void> {
+    if (this.projectFolderPickerPending || !this.canMutate()) return;
+    this.projectFolderPickerPending = true;
+    this.elements.selectProjectFolderButton.disabled = true;
+    try {
+      const currentPath = this.elements.projectPath.value.trim();
+      const selected = await open({
+        directory: true,
+        multiple: false,
+        title: "프로젝트 폴더 선택",
+        defaultPath: currentPath || this.projectFolderDefaultPath || undefined,
+      });
+      if (typeof selected !== "string") return;
+      this.elements.projectPath.value = selected;
+      if (!this.elements.projectName.value.trim()) {
+        this.elements.projectName.value = suggestWorkspaceProjectName(selected);
+      }
+      this.elements.projectFormError.textContent = "";
+    } catch (error) {
+      this.elements.projectFormError.textContent = `폴더 선택기를 열지 못했습니다. ${errorMessage(error)}`;
+    } finally {
+      this.projectFolderPickerPending = false;
+      this.elements.selectProjectFolderButton.disabled = !this.mutationsEnabled();
+    }
   }
 
   private async createProject(): Promise<void> {
@@ -661,17 +937,29 @@ export class Phase4WorkspaceController {
     }
   }
 
-  private async addTerminal(): Promise<void> {
+  async addTerminal(): Promise<void> {
     const state = this.currentState();
     if (!state || !this.canMutate()) return;
     const tab = state.tabs.find((item) => item.id === state.activeTabId);
     if (tab?.kind !== "project" || !tab.projectId) return;
     const project = state.projects.find((item) => item.id === tab.projectId);
     if (!project) return;
-    const globalRunning = this.runtime.restoreCapacity({ ...project, terminals: [] }).current;
-    const capacity = evaluateWorkspaceRestoreCapacity(globalRunning, 1);
-    if (!capacity.allowed || project.terminals.length >= 20) {
-      this.runtime.setFooterStatus("PowerShell은 동시에 최대 20개까지 실행할 수 있습니다.", "error");
+    if (!this.runtime.canAddPane(project.id)) {
+      this.runtime.setFooterStatus(
+        "이 프로젝트의 분할 화면은 최대 20개까지 열 수 있습니다.",
+        "error",
+      );
+      return;
+    }
+    const capacity = evaluateWorkspaceRestoreCapacity(
+      project.terminals.length + projectBrowserPanes(project).length,
+      1,
+    );
+    if (!capacity.allowed) {
+      this.runtime.setFooterStatus(
+        `PowerShell은 프로젝트마다 최대 ${capacity.maximum}개까지 실행할 수 있습니다.`,
+        "error",
+      );
       return;
     }
     const terminal = createWorkspaceTerminal(
@@ -689,6 +977,31 @@ export class Phase4WorkspaceController {
       );
     }
     this.renderSidebar();
+  }
+
+  async addBrowserPane(): Promise<void> {
+    const state = this.currentState();
+    if (!state || !this.canMutate()) return;
+    const tab = state.tabs.find((item) => item.id === state.activeTabId);
+    if (tab?.kind !== "project" || !tab.projectId) return;
+    const project = state.projects.find((item) => item.id === tab.projectId);
+    if (!project) return;
+    if (!this.runtime.canAddPane(project.id)) {
+      this.runtime.setFooterStatus(
+        "이 프로젝트의 분할 화면은 최대 20개까지 열 수 있습니다.",
+        "error",
+      );
+      return;
+    }
+    const browser = createWorkspaceBrowserPane(this.idFactory());
+    const next = appendProjectBrowserPane(state, project.id, browser);
+    if (!(await this.persist(next, "웹 패널 상태를 저장하지 못했습니다"))) return;
+    if (!this.runtime.addBrowserPane(project.id, browser, true)) {
+      this.runtime.setFooterStatus(
+        "웹 패널 상태는 저장했지만 실행 슬롯을 확보하지 못했습니다.",
+        "error",
+      );
+    }
   }
 
   private async persist(next: WorkspaceState, context: string): Promise<boolean> {
@@ -728,15 +1041,7 @@ export class Phase4WorkspaceController {
     completionPending: boolean,
     playSound: boolean,
   ): Promise<boolean> {
-    if (
-      !this.initialized ||
-      !this.storageWritable ||
-      this.session?.access !== "ready" ||
-      this.shuttingDown ||
-      this.externalReplacementPending ||
-      this.storageFaulted ||
-      this.upgradeInspection !== null
-    ) {
+    if (!this.canPersistRuntimeMutation()) {
       return Promise.resolve(false);
     }
 
@@ -781,6 +1086,18 @@ export class Phase4WorkspaceController {
       this.renderSidebar();
       return true;
     });
+  }
+
+  private canPersistRuntimeMutation(): boolean {
+    return (
+      this.initialized &&
+      this.storageWritable &&
+      this.session?.access === "ready" &&
+      !this.shuttingDown &&
+      !this.externalReplacementPending &&
+      !this.storageFaulted &&
+      this.upgradeInspection === null
+    );
   }
 
   private async persistNow(next: WorkspaceState, context: string): Promise<boolean> {
@@ -872,6 +1189,7 @@ export class Phase4WorkspaceController {
     const enabled = this.mutationsEnabled();
     this.elements.addTabButton.disabled = !enabled;
     this.elements.createProjectButton.disabled = !enabled;
+    this.elements.selectProjectFolderButton.disabled = !enabled || this.projectFolderPickerPending;
     this.runtime.setCatalogWritable(enabled);
     this.elements.commitUpgradeButton.disabled =
       this.mutationPending ||
@@ -896,7 +1214,13 @@ export class Phase4WorkspaceController {
   private openUpgradeDialog(): void {
     if (!this.upgradeInspection || this.elements.upgradeDialog.open) return;
     this.renderUpgradeInspection();
-    this.elements.upgradeDialog.showModal();
+    this.runtime.setModalOverlayOpen("upgrade", true);
+    try {
+      this.elements.upgradeDialog.showModal();
+    } catch (error) {
+      this.runtime.setModalOverlayOpen("upgrade", false);
+      throw error;
+    }
     this.elements.commitUpgradeButton.focus();
   }
 

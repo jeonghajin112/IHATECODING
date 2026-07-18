@@ -41,16 +41,6 @@ else {
     }
 }
 
-function Get-AvailableRollbackPath {
-    $index = 0
-    do {
-        $suffix = if ($index -eq 0) { '' } else { ".$index" }
-        $candidate = Join-Path $PSScriptRoot "IHATECODING.csharp-rollback$suffix.exe"
-        $index++
-    } while (Test-Path -LiteralPath $candidate)
-    return $candidate
-}
-
 function Get-AvailablePreviousBuildPath {
     $index = 0
     do {
@@ -59,15 +49,6 @@ function Get-AvailablePreviousBuildPath {
         $index++
     } while (Test-Path -LiteralPath $candidate)
     return $candidate
-}
-
-function Test-LegacyCSharpExecutable {
-    param([Parameter(Mandatory)] [string] $Path)
-    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
-    $version = (Get-Item -LiteralPath $Path).VersionInfo
-    return $version.FileDescription -eq 'IHATECODING' -and
-        $version.ProductName -eq 'IHATECODING' -and
-        $version.OriginalFilename -eq 'IHATECODING.dll'
 }
 
 function Test-IHATECODINGRustCandidate {
@@ -83,40 +64,6 @@ function Test-IHATECODINGRustCandidate {
     $bytes = [System.IO.File]::ReadAllBytes($Path)
     $ascii = [System.Text.Encoding]::ASCII.GetString($bytes)
     return $ascii.Contains('IHATECODING_PHASE6_STATE_ROOT')
-}
-
-function Preserve-InitialRollback {
-    if (-not (Test-Path -LiteralPath $target -PathType Leaf)) { return $null }
-    $existing = @(Get-ChildItem -LiteralPath $PSScriptRoot -Filter 'IHATECODING.csharp-rollback*.exe' -File)
-
-    if (-not (Test-LegacyCSharpExecutable $target)) {
-        $verified = @($existing | Where-Object { Test-LegacyCSharpExecutable $_.FullName })
-        if ($verified.Count -eq 0) {
-            throw 'Cutover is blocked because no verified C# rollback executable is available.'
-        }
-        return $verified[0].FullName
-    }
-
-    $sourceHash = (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash
-    foreach ($candidate in $existing) {
-        if ((Test-LegacyCSharpExecutable $candidate.FullName) -and
-            [System.StringComparer]::OrdinalIgnoreCase.Equals(
-                $sourceHash,
-                (Get-FileHash -LiteralPath $candidate.FullName -Algorithm SHA256).Hash
-            )) {
-            return $candidate.FullName
-        }
-    }
-
-    $rollback = Get-AvailableRollbackPath
-    Copy-Item -LiteralPath $target -Destination $rollback
-    $rollbackHash = (Get-FileHash -LiteralPath $rollback -Algorithm SHA256).Hash
-    if (-not (Test-LegacyCSharpExecutable $rollback) -or
-        -not [System.StringComparer]::OrdinalIgnoreCase.Equals($sourceHash, $rollbackHash)) {
-        Remove-Item -LiteralPath $rollback -Force -ErrorAction SilentlyContinue
-        throw 'The C# rollback copy did not match the current executable.'
-    }
-    return $rollback
 }
 
 if (-not $CandidatePath) {
@@ -166,7 +113,7 @@ if (-not $NoInstaller -and -not $CandidatePath) {
 }
 
 if (-not $Cutover) {
-    Write-Host 'The current default executable was not changed. Use -Cutover only after the Phase 6 release gates pass.' -ForegroundColor Yellow
+    Write-Host 'The current default executable was not changed. Use -Cutover only after the release checks pass.' -ForegroundColor Yellow
     return
 }
 
@@ -198,11 +145,6 @@ else {
     if ($null -eq $signature.TimeStamperCertificate) {
         throw 'Cutover rejected a signed candidate without a timestamp certificate.'
     }
-}
-
-$rollback = Preserve-InitialRollback
-if ($rollback) {
-    Write-Host "Rollback preserved: $rollback" -ForegroundColor Yellow
 }
 
 try {

@@ -14,6 +14,17 @@ import {
 export const DEFAULT_MIN_PANE_WIDTH_PX = 160;
 export const DEFAULT_INSERTION_HYSTERESIS_PX = 14;
 export const DEFAULT_SNAP_DISTANCE_PX = 8;
+export const PROJECT_BROWSER_PANES_EXTENSION = "browserPanesV1";
+
+const MAX_BROWSER_PANE_TITLE_LENGTH = 80;
+const MAX_BROWSER_PANE_URL_BYTES = 16 * 1024;
+
+export type WorkspaceBrowserPane = {
+  [key: string]: unknown;
+  id: string;
+  title: string;
+  url: string;
+};
 
 export type LinearMoveCommand = "previous" | "next" | "first" | "last";
 
@@ -77,6 +88,24 @@ export type ProjectPaneResizeRequest = Omit<HorizontalResizeRequest, "ratios" | 
 };
 
 export type KeyboardResizeCommand = "grow-left" | "shrink-left";
+export type WorkspaceAgentProvider = "codex" | "grok";
+
+export function blockWorkspaceProviderResumeForAccountSwitch(
+  state: WorkspaceState,
+  provider: WorkspaceAgentProvider,
+): WorkspaceState {
+  const next = cloneWorkspaceState(state);
+  for (const project of next.projects) {
+    for (const terminal of project.terminals) {
+      const hasBinding =
+        provider === "codex"
+          ? terminal.codexThreadId !== null
+          : terminal.grokSessionId !== null;
+      if (hasBinding) terminal.legacyExtensions.resumeBlocked = true;
+    }
+  }
+  return normalizeWorkspaceState(next);
+}
 
 export type WorkspaceProjectDraft = {
   name: string;
@@ -91,6 +120,49 @@ export type RestoreCapacityDecision = {
   available: number;
   maximum: number;
 };
+
+/**
+ * One-shot conversion from the legacy automatically-created project tabs to
+ * manually assigned tabs. The migration deliberately collapses only the
+ * exact legacy shape; any ambiguous/user-authored layout is left untouched.
+ */
+export function migrateLegacyAutomaticProjectTabsToManual(
+  state: WorkspaceState,
+): WorkspaceState {
+  const next = editableClone(state);
+  if (next.legacyExtensions.manualProjectTabsV1 === true) {
+    return next;
+  }
+
+  next.legacyExtensions.manualProjectTabsV1 = true;
+  const projectIds = new Set(next.projects.map((project) => project.id));
+  const representedProjectIds = new Set<string>();
+  const hasExactLegacyShape =
+    next.tabs.length > 0 &&
+    next.tabs.length === next.projects.length &&
+    next.tabs.every((tab) => {
+      if (
+        tab.kind !== "project" ||
+        tab.projectId === null ||
+        !projectIds.has(tab.projectId) ||
+        representedProjectIds.has(tab.projectId)
+      ) {
+        return false;
+      }
+      representedProjectIds.add(tab.projectId);
+      return true;
+    }) &&
+    representedProjectIds.size === projectIds.size;
+  const active = next.tabs.find((tab) => tab.id === next.activeTabId) ?? null;
+
+  if (hasExactLegacyShape && active?.kind === "project" && active.projectId !== null) {
+    next.tabs = [active];
+    next.activeTabId = active.id;
+    next.selectedProjectId = active.projectId;
+  }
+
+  return normalizeWorkspaceState(next);
+}
 
 /** Add and activate a blank tab. The caller owns ID generation. */
 export function addBlankWorkspaceTab(
@@ -119,13 +191,14 @@ export function addBlankWorkspaceTab(
 }
 
 /**
- * Open a project using the current blank tab when possible. A project has at
- * most one dedicated project tab: an existing tab wins over a new/blank one.
+ * Assign a project to the current tab without creating a tab implicitly.
+ * Explicitly-added blank tabs keep their stable identity, project tabs are
+ * reassigned in place, and an already-open project tab is activated as-is.
  */
 export function openProjectWorkspaceTab(
   state: WorkspaceState,
   projectId: string,
-  newTabId: string,
+  _newTabId: string,
 ): WorkspaceState {
   const next = editableClone(state);
   const project = requireProject(next, projectId);
@@ -134,25 +207,14 @@ export function openProjectWorkspaceTab(
     (tab) => tab.kind === "project" && tab.projectId === projectId,
   );
 
-  if (active?.kind === "empty") {
-    if (existing && existing.id !== active.id) {
-      next.tabs = next.tabs.filter((tab) => tab.id !== active.id);
-      next.activeTabId = existing.id;
-    } else {
-      replaceBlankWithProject(active, project);
-      next.activeTabId = active.id;
-    }
-  } else if (existing) {
+  if (existing) {
     next.activeTabId = existing.id;
-  } else {
-    if (next.tabs.length >= MAX_WORKSPACE_TABS) {
-      throw new Error(`A workspace can contain at most ${MAX_WORKSPACE_TABS} tabs.`);
-    }
-    assertNewTabId(next, newTabId);
-    next.tabs.push(projectTab(project, newTabId));
-    next.activeTabId = newTabId;
+  } else if (active?.kind === "empty" || active?.kind === "project") {
+    replaceTabWithProject(active, project);
+    next.activeTabId = active.id;
   }
-  next.selectedProjectId = projectId;
+  const selected = next.tabs.find((tab) => tab.id === next.activeTabId);
+  next.selectedProjectId = selected?.kind === "project" ? selected.projectId : null;
   return normalizeWorkspaceState(next);
 }
 
@@ -171,10 +233,9 @@ export function assignBlankWorkspaceTabToProject(
     (tab) => tab.id !== tabId && tab.kind === "project" && tab.projectId === projectId,
   );
   if (existing) {
-    next.tabs = next.tabs.filter((tab) => tab.id !== tabId);
     next.activeTabId = existing.id;
   } else {
-    replaceBlankWithProject(target, project);
+    replaceTabWithProject(target, project);
     next.activeTabId = target.id;
   }
   next.selectedProjectId = projectId;
@@ -286,7 +347,10 @@ export function appendProjectPane(
 ): WorkspaceState {
   const next = editableClone(state);
   const project = requireProject(next, projectId);
-  if (project.terminals.length >= MAX_WORKSPACE_TERMINALS) {
+  if (
+    project.terminals.length + projectBrowserPanes(project).length >=
+    MAX_WORKSPACE_TERMINALS
+  ) {
     throw new Error(`A project can contain at most ${MAX_WORKSPACE_TERMINALS} panes.`);
   }
   if (project.terminals.some((item) => item.id === pane.id)) {
@@ -294,6 +358,109 @@ export function appendProjectPane(
   }
   project.terminals.push(pane);
   return normalizeWorkspaceState(next);
+}
+
+/**
+ * Browser panes predate a first-class canonical field. Keep them in the
+ * project extension envelope so schema-v1 workspaces remain forwards and
+ * backwards compatible while still restoring the pane itself after restart.
+ */
+export function projectBrowserPanes(
+  project: WorkspaceProject,
+): WorkspaceBrowserPane[] {
+  const source = project.legacyExtensions[PROJECT_BROWSER_PANES_EXTENSION];
+  if (!Array.isArray(source)) return [];
+  const panes: WorkspaceBrowserPane[] = [];
+  const ids = new Set<string>();
+  for (const entry of source) {
+    if (panes.length >= MAX_WORKSPACE_TERMINALS || !isRecord(entry)) continue;
+    try {
+      const id = String(entry.id ?? "");
+      assertOpaqueLocalId(id, "browser pane");
+      if (ids.has(id)) continue;
+      const title = normalizeBrowserPaneTitle(String(entry.title ?? ""));
+      const url = normalizePersistedBrowserPaneUrl(String(entry.url ?? ""));
+      ids.add(id);
+      panes.push({ ...structuredClone(entry), id, title, url });
+    } catch {
+      // Opaque extension data must never make an otherwise valid project
+      // impossible to open. Invalid browser entries are ignored on restore.
+    }
+  }
+  return panes;
+}
+
+export function createWorkspaceBrowserPane(
+  id: string,
+  title = "WEB",
+  url = "https://www.google.com/",
+): WorkspaceBrowserPane {
+  assertOpaqueLocalId(id, "browser pane");
+  return {
+    id,
+    title: normalizeBrowserPaneTitle(title),
+    url: normalizePersistedBrowserPaneUrl(url),
+  };
+}
+
+export function appendProjectBrowserPane(
+  state: WorkspaceState,
+  projectId: string,
+  pane: WorkspaceBrowserPane,
+): WorkspaceState {
+  const next = editableClone(state);
+  const project = requireProject(next, projectId);
+  const browsers = projectBrowserPanes(project);
+  if (project.terminals.length + browsers.length >= MAX_WORKSPACE_TERMINALS) {
+    throw new Error(`A project can contain at most ${MAX_WORKSPACE_TERMINALS} panes.`);
+  }
+  const normalized = createWorkspaceBrowserPane(pane.id, pane.title, pane.url);
+  if (
+    project.terminals.some((item) => item.id === normalized.id) ||
+    browsers.some((item) => item.id === normalized.id)
+  ) {
+    throw new Error("The pane identifier is already in use.");
+  }
+  browsers.push({ ...structuredClone(pane), ...normalized });
+  project.legacyExtensions[PROJECT_BROWSER_PANES_EXTENSION] = browsers;
+  return normalizeWorkspaceState(next);
+}
+
+export function removeProjectBrowserPane(
+  state: WorkspaceState,
+  projectId: string,
+  paneId: string,
+): WorkspaceState {
+  const next = editableClone(state);
+  const project = requireProject(next, projectId);
+  const browsers = projectBrowserPanes(project);
+  const index = browsers.findIndex((pane) => pane.id === paneId);
+  if (index < 0) throw new Error("The requested browser pane does not exist.");
+  browsers.splice(index, 1);
+  project.legacyExtensions[PROJECT_BROWSER_PANES_EXTENSION] = browsers;
+  return normalizeWorkspaceState(next);
+}
+
+export function renameProjectBrowserPane(
+  state: WorkspaceState,
+  projectId: string,
+  paneId: string,
+  title: string,
+): WorkspaceState {
+  return updateProjectBrowserPane(state, projectId, paneId, (pane) => {
+    pane.title = normalizeBrowserPaneTitle(title);
+  });
+}
+
+export function setProjectBrowserPaneUrl(
+  state: WorkspaceState,
+  projectId: string,
+  paneId: string,
+  url: string,
+): WorkspaceState {
+  return updateProjectBrowserPane(state, projectId, paneId, (pane) => {
+    pane.url = normalizePersistedBrowserPaneUrl(url);
+  });
 }
 
 /** Append a canonical project without creating hidden runtime state. */
@@ -342,6 +509,68 @@ export function renameProjectPane(
   if (!normalized) throw new Error("A pane title cannot be empty.");
   pane.name = normalized;
   return normalizeWorkspaceState(next);
+}
+
+/**
+ * Persist a provider conversation against one stable terminal. Provider IDs
+ * are exclusive per terminal and a conversation may have only one terminal
+ * owner for the same provider across the workspace.
+ */
+export function setTerminalAgentConversation(
+  state: WorkspaceState,
+  projectId: string,
+  terminalId: string,
+  provider: WorkspaceAgentProvider,
+  conversationId: string,
+): WorkspaceState {
+  if (provider !== "codex" && provider !== "grok") {
+    throw new Error("The agent provider is invalid.");
+  }
+  const normalizedConversationId = normalizeConversationId(conversationId);
+  const next = editableClone(state);
+  const project = requireProject(next, projectId);
+  const terminal = project.terminals.find((item) => item.id === terminalId);
+  if (!terminal) throw new Error("The requested pane does not exist.");
+
+  const providerField = provider === "codex" ? "codexThreadId" : "grokSessionId";
+  for (const candidateProject of next.projects) {
+    for (const candidate of candidateProject.terminals) {
+      if (candidateProject.id === projectId && candidate.id === terminalId) continue;
+      if (candidate[providerField]?.toLowerCase() === normalizedConversationId) {
+        throw new Error("The agent conversation is already owned by another pane.");
+      }
+    }
+  }
+
+  if (provider === "codex") {
+    terminal.codexThreadId = normalizedConversationId;
+    terminal.grokSessionId = null;
+  } else {
+    terminal.codexThreadId = null;
+    terminal.grokSessionId = normalizedConversationId;
+  }
+  if (terminal.legacyExtensions.resumeBlocked === true) {
+    delete terminal.legacyExtensions.resumeBlocked;
+  }
+  return normalizeWorkspaceState(next);
+}
+
+/**
+ * Compare the canonical fields that control agent ownership and safe resume.
+ * `resumeBlocked` is part of the binding semantics even though it lives in the
+ * legacy extension bag, so clearing it must be persisted when the IDs already
+ * match.
+ */
+export function terminalAgentBindingChanged(
+  previous: WorkspaceTerminal,
+  next: WorkspaceTerminal,
+): boolean {
+  return (
+    previous.codexThreadId !== next.codexThreadId ||
+    previous.grokSessionId !== next.grokSessionId ||
+    (previous.legacyExtensions.resumeBlocked === true) !==
+      (next.legacyExtensions.resumeBlocked === true)
+  );
 }
 
 export function createWorkspaceProject(
@@ -400,6 +629,17 @@ export function validateWorkspaceProjectDraft(
     throw new Error("드라이브 또는 UNC로 시작하는 절대 폴더 경로를 입력하세요.");
   }
   return { name: normalizedName, folderPath: normalizedFolder };
+}
+
+/** Match the legacy dialog: suggest the selected folder's final path segment. */
+export function suggestWorkspaceProjectName(folderPath: string): string {
+  const withoutTrailingSeparators = folderPath.trim().replace(/[\\/]+$/, "");
+  if (!withoutTrailingSeparators || /^[a-z]:$/i.test(withoutTrailingSeparators)) {
+    return "새 프로젝트";
+  }
+  const segments = withoutTrailingSeparators.split(/[\\/]/);
+  const finalSegment = segments[segments.length - 1]?.trim();
+  return finalSegment || "새 프로젝트";
 }
 
 export function findWorkspaceProjectByFolder(
@@ -703,30 +943,70 @@ function editableClone(state: WorkspaceState): WorkspaceState {
   return cloneWorkspaceState(normalizeWorkspaceState(state));
 }
 
+function updateProjectBrowserPane(
+  state: WorkspaceState,
+  projectId: string,
+  paneId: string,
+  update: (pane: WorkspaceBrowserPane) => void,
+): WorkspaceState {
+  const next = editableClone(state);
+  const project = requireProject(next, projectId);
+  const browsers = projectBrowserPanes(project);
+  const pane = browsers.find((item) => item.id === paneId);
+  if (!pane) throw new Error("The requested browser pane does not exist.");
+  update(pane);
+  project.legacyExtensions[PROJECT_BROWSER_PANES_EXTENSION] = browsers;
+  return normalizeWorkspaceState(next);
+}
+
+function normalizeBrowserPaneTitle(value: string): string {
+  const normalized = value.trim();
+  if (!normalized) throw new Error("A browser pane title cannot be empty.");
+  if (normalized.length > MAX_BROWSER_PANE_TITLE_LENGTH) {
+    throw new Error(`A browser pane title cannot exceed ${MAX_BROWSER_PANE_TITLE_LENGTH} characters.`);
+  }
+  return normalized;
+}
+
+function normalizePersistedBrowserPaneUrl(value: string): string {
+  const normalized = value.trim();
+  if (!normalized || new TextEncoder().encode(normalized).byteLength > MAX_BROWSER_PANE_URL_BYTES) {
+    throw new Error("The browser pane URL is empty or too long.");
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(normalized);
+  } catch {
+    throw new Error("The browser pane URL is invalid.");
+  }
+  if (
+    (parsed.protocol !== "http:" && parsed.protocol !== "https:") ||
+    !parsed.hostname ||
+    parsed.username ||
+    parsed.password ||
+    [...normalized].some((character) => /\s|\p{Cc}/u.test(character))
+  ) {
+    throw new Error("The browser pane URL is not allowed for restore.");
+  }
+  return parsed.href;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 function requireProject(state: WorkspaceState, projectId: string): WorkspaceProject {
   const project = state.projects.find((item) => item.id === projectId);
   if (!project) throw new Error("The requested workspace project does not exist.");
   return project;
 }
 
-function replaceBlankWithProject(tab: WorkspaceTab, project: WorkspaceProject): void {
+function replaceTabWithProject(tab: WorkspaceTab, project: WorkspaceProject): void {
   tab.kind = "project";
   tab.title = project.name;
   tab.projectId = project.id;
   tab.browser = null;
   tab.output = null;
-}
-
-function projectTab(project: WorkspaceProject, id: string): WorkspaceTab {
-  return {
-    id,
-    kind: "project",
-    title: project.name,
-    projectId: project.id,
-    browser: null,
-    output: null,
-    extensions: {},
-  };
 }
 
 function assertNewTabId(state: WorkspaceState, tabId: string): void {
@@ -740,6 +1020,14 @@ function assertOpaqueLocalId(value: string, label: string): void {
   if (typeof value !== "string" || !value.trim()) {
     throw new Error(`The ${label} identifier must be non-empty.`);
   }
+}
+
+function normalizeConversationId(value: string): string {
+  const normalized = typeof value === "string" ? value.toLowerCase() : "";
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(normalized)) {
+    throw new Error("The agent conversation identifier is not a valid UUID.");
+  }
+  return normalized;
 }
 
 function linearTarget(

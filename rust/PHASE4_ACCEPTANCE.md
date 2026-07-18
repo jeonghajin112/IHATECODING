@@ -15,7 +15,7 @@ on Windows before Phase 4 is promoted.
 | Source isolation | Upgrade source bytes, timestamps, identity, and ACL fingerprint remain unchanged | Pass |
 | Unknown fields | Root, project, terminal, tab, and provenance extensions survive normalization and mutations | Pass |
 | Tabs | Blank assignment, activation, close, keyboard order, and non-project selection invariants | Pass |
-| Terminals | Save-before-spawn, active-project restore, stable names/folders/order, and global limit of 20 | Pass |
+| Terminals | Save-before-spawn, active-project restore, stable names/folders/order, and an independent 20-terminal limit per project | Pass |
 | Save failure | Close waits for durable commit; title, order, and ratios roll back to the last clean snapshot | Pass |
 | Replacement | Live terminal trees unload before import, recovery, or upgrade; shutdown waits on the replacement barrier | Pass |
 | Start queue | Pending starts are reprioritized for the project currently on screen while preserving FIFO ties | Pass |

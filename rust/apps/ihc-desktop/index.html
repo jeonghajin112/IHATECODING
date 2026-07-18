@@ -4,52 +4,57 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <link rel="stylesheet" href="/assets/main.css" />
-    <title>IHATECODING · Rust</title>
+    <title>IHATECODING</title>
     <script type="module" src="/assets/main.js" defer></script>
   </head>
   <body>
     <main id="app" class="shell" data-workspace-view="empty">
       <aside class="project-sidebar" aria-label="프로젝트">
-        <div class="sidebar-brand">
-          <span class="brand-mark" aria-hidden="true">I</span>
-          <span>
-            <strong>IHATECODING</strong>
-            <small>RUST · NATIVE</small>
-          </span>
-        </div>
-
         <div class="project-section-heading">
-          <span>프로젝트</span>
-          <span id="project-count">0</span>
+          <button
+            id="toggle-project-list"
+            class="project-list-toggle"
+            type="button"
+            aria-controls="project-list"
+            aria-expanded="true"
+            aria-label="프로젝트 목록 접기"
+            title="프로젝트 목록 접기"
+          >
+            <span class="project-list-chevron" aria-hidden="true">›</span>
+            <span>프로젝트</span>
+          </button>
+          <button
+            id="create-project"
+            class="create-project"
+            type="button"
+            title="새 프로젝트"
+            aria-label="새 프로젝트"
+            disabled
+          >
+            ＋
+          </button>
         </div>
         <nav id="project-list" class="project-list" aria-label="저장된 프로젝트"></nav>
         <div class="sidebar-footer">
-          <button id="create-project" class="create-project" type="button" disabled>＋ 새 프로젝트</button>
-          <section class="storage-panel" aria-label="Rust 저장소">
-            <div class="storage-panel-status">
-              <span id="storage-mode-dot" class="storage-mode-dot" aria-hidden="true"></span>
-              <span id="storage-mode-badge" class="storage-mode-badge" role="status">저장소 확인 중</span>
-            </div>
-            <button id="open-legacy-import" class="open-legacy-import" type="button">
-              복사본 가져오기
-            </button>
-            <button
-              id="open-phase3-upgrade"
-              class="open-legacy-import"
-              type="button"
-              hidden
-            >
-              이전 Rust Preview 복사
-            </button>
-            <button
-              id="recover-project-catalog"
-              type="button"
-              disabled
-              hidden
-              aria-hidden="true"
-              tabindex="-1"
-            ></button>
-          </section>
+          <button
+            id="open-settings"
+            class="settings-button"
+            type="button"
+            aria-haspopup="dialog"
+            aria-controls="settings-dialog"
+            aria-label="환경설정 열기"
+            title="환경설정"
+            disabled
+          >
+            <svg viewBox="0 0 16 16" aria-hidden="true" fill="none">
+              <path d="M6.7 1.6h2.6l.42 1.45c.35.13.69.33.99.57l1.48-.36 1.3 2.25-1.05 1.1c.03.2.05.4.05.59s-.02.39-.05.59l1.05 1.1-1.3 2.25-1.48-.36c-.3.24-.64.44-.99.57L9.3 12.8H6.7l-.42-1.45a4.3 4.3 0 0 1-.99-.57l-1.48.36-1.3-2.25 1.05-1.1a3.8 3.8 0 0 1 0-1.18l-1.05-1.1 1.3-2.25 1.48.36c.3-.24.64-.44.99-.57L6.7 1.6Z" />
+              <circle cx="8" cy="7.2" r="1.65" />
+            </svg>
+            <span>환경설정</span>
+          </button>
+          <button id="open-phase3-upgrade" class="compatibility-recovery" type="button" hidden>
+            이전 작업 복구
+          </button>
         </div>
       </aside>
 
@@ -69,18 +74,30 @@
         </nav>
 
         <header class="toolbar">
-          <button id="add-terminal" class="toolbar-action toolbar-action-primary" type="button" disabled>
-            ＋ PowerShell
-          </button>
-          <span class="current-label">CURRENT</span>
-          <strong id="current-project" class="current-project">프로젝트 없음</strong>
+          <div id="pane-launcher" class="pane-launcher">
+            <button
+              id="add-terminal"
+              class="toolbar-action toolbar-action-primary pane-launcher-toggle"
+              type="button"
+              aria-haspopup="menu"
+              aria-expanded="false"
+              disabled
+            >
+              <span>＋ 추가</span>
+              <span class="pane-launcher-chevron" aria-hidden="true">⌄</span>
+            </button>
+            <div id="pane-launcher-menu" class="pane-launcher-menu" role="menu" hidden>
+              <button id="add-powershell-pane" type="button" role="menuitem">
+                <span class="pane-launcher-icon" aria-hidden="true">&gt;_</span>
+                <span><strong>PowerShell</strong><small>새 터미널</small></span>
+              </button>
+              <button id="add-browser-pane" type="button" role="menuitem">
+                <span class="pane-launcher-icon" aria-hidden="true">◎</span>
+                <span><strong>웹 브라우저</strong><small>분할 화면</small></span>
+              </button>
+            </div>
+          </div>
           <span class="toolbar-spacer"></span>
-          <button id="close-active-terminal" class="toolbar-action" type="button" disabled>
-            현재 창 닫기
-          </button>
-          <button id="toggle-browser" class="toolbar-action" type="button" hidden>
-            브라우저 PoC
-          </button>
         </header>
 
         <section id="workspace-stage" class="workspace-stage">
@@ -93,47 +110,138 @@
           <section
             id="terminal-surface"
             class="terminal-grid"
-            aria-label="Rust ConPTY PowerShell 작업 공간"
+            aria-label="프로젝트 분할 작업 공간"
           >
             <div id="empty-workspace" class="empty-workspace">
               <span class="empty-glyph">&gt;_</span>
               <strong>열려 있는 PowerShell이 없습니다</strong>
-              <span>＋ PowerShell을 눌러 이 프로젝트에 터미널을 추가하세요.</span>
+              <span>＋ 추가에서 PowerShell이나 웹 브라우저를 선택하세요.</span>
             </div>
           </section>
 
-          <section id="browser-surface" class="browser-surface" aria-label="브라우저 PoC">
-            <div class="browser-placeholder">
-              <strong>격리된 브라우저 WebView</strong>
-              <span>터미널은 뒤에서 계속 실행됩니다.</span>
-            </div>
-          </section>
         </section>
 
         <footer class="statusbar">
-          <span class="backend">RUST · ConPTY</span>
-          <span id="session-count" class="session-count">0 / 20</span>
-          <span class="status-separator" aria-hidden="true"></span>
-          <span id="status" role="status" aria-live="polite" aria-atomic="true">
-            프로젝트를 불러오는 중…
-          </span>
           <section class="provider-usage" aria-label="AI 남은 사용량">
-            <div class="provider-usage-item" data-provider="codex" title="Codex 남은 한도">
-              <svg class="provider-icon" viewBox="0 0 24 24" aria-hidden="true">
-                <path d="M12 3.2 16 5.5l4.1-.1v4.7l2 3.5-4.1 2.3-2 3.6-4-2.4-4 2.4-2-3.6-4.1-2.3 2-3.5V5.4l4.1.1L12 3.2Zm0 4.1-4 2.3v4.8l4 2.3 4-2.3V9.6l-4-2.3Z" />
+            <button
+              id="codex-usage-trigger"
+              class="provider-usage-item"
+              data-provider="codex"
+              type="button"
+              aria-label="Codex 남은 한도 상세 보기"
+              aria-haspopup="dialog"
+              aria-controls="provider-usage-popover"
+              aria-expanded="false"
+            >
+              <svg class="provider-icon" viewBox="0 0 16 16" aria-hidden="true">
+                <path d="M6.13671 5.82399V4.30398C6.13671 4.17596 6.18431 4.07991 6.29527 4.01598L9.32406 2.256C9.73637 2.01602 10.228 1.90406 10.7353 1.90406C12.6382 1.90406 13.8434 3.3921 13.8434 4.97604C13.8434 5.088 13.8434 5.21602 13.8274 5.34404L10.6877 3.488C10.4975 3.37605 10.3071 3.37605 10.1168 3.488L6.13671 5.82399ZM13.209 11.7441V8.11195C13.209 7.88789 13.1138 7.72791 12.9236 7.61594L8.94344 5.27995L10.2437 4.5279C10.3547 4.46397 10.4499 4.46397 10.5609 4.5279L13.5896 6.28789C14.4619 6.79996 15.0484 7.88789 15.0484 8.94385C15.0484 10.1598 14.335 11.28 13.209 11.7441ZM5.20114 8.54404L3.90086 7.77608C3.78989 7.71215 3.7423 7.6161 3.7423 7.48808V3.96811C3.7423 2.25615 5.04259 0.960061 6.80278 0.960061C7.46883 0.960061 8.08714 1.18413 8.61056 1.58409L5.48672 3.40816C5.29649 3.52012 5.20129 3.68011 5.20129 3.90418L5.20114 8.54404ZM7.99999 10.176L6.13671 9.12005V6.8801L7.99999 5.82414L9.8631 6.8801V9.12005L7.99999 10.176ZM9.19719 15.0401C8.53113 15.0401 7.91282 14.816 7.3894 14.4161L10.5132 12.5919C10.7034 12.48 10.7987 12.3201 10.7987 12.096V7.45596L12.1149 8.22392C12.2258 8.28785 12.2734 8.3839 12.2734 8.51192V12.0319C12.2734 13.7438 10.9572 15.0401 9.19719 15.0401ZM5.43898 11.4721L2.41018 9.71211C1.53796 9.20003 0.95134 8.11211 0.95134 7.05615C0.95134 5.82414 1.68077 4.72016 2.80657 4.25611V7.9041C2.80657 8.12817 2.90177 8.28815 3.092 8.40012L7.05637 10.72L5.75609 11.4721C5.64513 11.5361 5.54993 11.5361 5.43898 11.4721ZM5.26465 14.0961C3.47278 14.0961 2.15658 12.736 2.15658 11.056C2.15658 10.928 2.17249 10.8 2.18826 10.672L5.3121 12.4961C5.50234 12.608 5.69273 12.608 5.88297 12.4961L9.8631 10.1762V11.6962C9.8631 11.8242 9.8155 11.9202 9.70454 11.9841L6.67574 13.7441C6.26344 13.9841 5.77199 14.0961 5.26465 14.0961ZM9.19719 16C11.1159 16 12.7174 14.624 13.0823 12.8C14.8582 12.3359 16 10.6559 16 8.944C16 7.82396 15.5243 6.73603 14.668 5.95201C14.7473 5.61598 14.7949 5.27995 14.7949 4.94407C14.7949 2.65612 12.9554 0.944002 10.8305 0.944002C10.4025 0.944002 9.99013 1.00794 9.57782 1.15201C8.86416 0.447988 7.88099 0 6.80278 0C4.88403 0 3.28254 1.37593 2.91768 3.19999C1.14173 3.66404 0 5.34404 0 7.056C0 8.17604 0.475669 9.26397 1.33197 10.048C1.25269 10.384 1.20509 10.72 1.20509 11.0559C1.20509 13.3438 3.04456 15.0559 5.16946 15.0559C5.59753 15.0559 6.00984 14.9921 6.42215 14.848C7.13565 15.552 8.11882 16 9.19719 16Z" />
               </svg>
               <span class="provider-name">CODEX</span>
-              <span id="codex-five-hour-remaining" class="usage-value">--</span>
-              <span class="usage-divider">·</span>
-              <span id="codex-weekly-remaining" class="usage-value">--</span>
-            </div>
-            <div class="provider-usage-item" data-provider="grok" title="Grok 남은 한도">
-              <svg class="provider-icon" viewBox="0 0 24 24" aria-hidden="true">
-                <path d="M4 4h4.1l3.9 5.1L15.9 4H20l-6 7.8L20.3 20h-4.2L12 14.5 7.9 20H3.7l6.2-8.2L4 4Z" />
+              <span id="codex-five-hour-usage" class="usage-limit" data-available="false">
+                <span class="usage-label">5시간</span>
+                <progress class="usage-meter" max="100" value="0" aria-label="Codex 5시간 남은 한도" hidden></progress>
+                <span id="codex-five-hour-remaining" class="usage-value">--</span>
+                <span class="usage-reset" hidden></span>
+              </span>
+              <span id="codex-weekly-usage" class="usage-limit" data-available="false">
+                <span class="usage-label">주간</span>
+                <progress class="usage-meter" max="100" value="0" aria-label="Codex 주간 남은 한도" hidden></progress>
+                <span id="codex-weekly-remaining" class="usage-value">--</span>
+                <span class="usage-reset" hidden></span>
+              </span>
+            </button>
+            <button
+              id="grok-usage-trigger"
+              class="provider-usage-item"
+              data-provider="grok"
+              type="button"
+              aria-label="Grok 남은 한도 상세 보기"
+              aria-haspopup="dialog"
+              aria-controls="provider-usage-popover"
+              aria-expanded="false"
+            >
+              <svg class="provider-icon" viewBox="0 0 24 23" aria-hidden="true">
+                <path d="M4.94 4.96A9.97 9.97 0 0 1 15.775 2.778A8.7 8.7 0 0 1 17.808 3.888L14.802 5.278C12.003 4.101 8.797 4.9 6.84 6.86C4.276 9.425 3.694 13.814 6.48 16.782L6.758 17.066L0.124 23C1.999 21.027 3.895 18.573 2.76 15.81C1.24 12.112 2.125 7.78 4.94 4.96M23.9 0.1C21.636 3.274 20.716 5.489 21.703 9.74L21.696 9.733C22.449 12.934 21.644 16.483 19.043 19.088C15.764 22.373 10.517 23.104 6.196 20.148L9.21 18.75C11.968 19.834 14.985 19.357 17.153 17.186C19.322 15.016 19.808 11.854 18.719 9.223C18.512 8.723 17.891 8.598 17.456 8.919L8.59 15.472L21.29 2.702V2.712Z" />
               </svg>
               <span class="provider-name">GROK</span>
-              <span id="grok-remaining" class="usage-value">--</span>
+              <span id="grok-weekly-usage" class="usage-limit" data-available="false">
+                <span class="usage-label">주간</span>
+                <progress class="usage-meter" max="100" value="0" aria-label="Grok 주간 남은 한도" hidden></progress>
+                <span id="grok-remaining" class="usage-value">--</span>
+                <span class="usage-reset" hidden></span>
+              </span>
+            </button>
+          </section>
+          <span id="status" role="status" aria-live="polite" aria-atomic="true"></span>
+          <section
+            id="provider-usage-popover"
+            class="provider-usage-popover"
+            role="dialog"
+            aria-modal="false"
+            aria-labelledby="provider-usage-detail-title"
+            hidden
+          >
+            <header class="provider-usage-popover-heading">
+              <strong id="provider-usage-detail-title">CODEX</strong>
+              <button
+                id="close-provider-usage"
+                class="provider-usage-popover-close"
+                type="button"
+                aria-label="사용량 상세 닫기"
+                title="닫기"
+              >
+                ×
+              </button>
+            </header>
+
+            <div class="provider-usage-detail-limits" aria-label="남은 사용량">
+              <article id="provider-usage-detail-five-hour" class="provider-usage-detail-limit">
+                <div class="provider-usage-detail-limit-heading">
+                  <span>5시간 한도</span>
+                  <strong class="provider-usage-detail-remaining">--</strong>
+                </div>
+                <progress
+                  class="provider-usage-detail-meter"
+                  max="100"
+                  value="0"
+                  aria-label="5시간 남은 한도"
+                ></progress>
+                <p class="provider-usage-detail-reset-row">
+                  <span>초기화</span>
+                  <time class="provider-usage-detail-reset">--</time>
+                </p>
+              </article>
+
+              <article id="provider-usage-detail-weekly" class="provider-usage-detail-limit">
+                <div class="provider-usage-detail-limit-heading">
+                  <span>주간 한도</span>
+                  <strong class="provider-usage-detail-remaining">--</strong>
+                </div>
+                <progress
+                  class="provider-usage-detail-meter"
+                  max="100"
+                  value="0"
+                  aria-label="주간 남은 한도"
+                ></progress>
+                <p class="provider-usage-detail-reset-row">
+                  <span>초기화</span>
+                  <time class="provider-usage-detail-reset">--</time>
+                </p>
+              </article>
             </div>
+
+            <section class="provider-account-detail" aria-labelledby="provider-account-detail-title">
+              <span id="provider-account-detail-title" class="provider-account-label">계정</span>
+              <div class="provider-account-controls">
+                <select id="provider-account-select" aria-label="CLI 계정 선택" disabled>
+                  <option>확인 중</option>
+                </select>
+                <button id="add-provider-account" type="button">+ 추가</button>
+              </div>
+              <p id="provider-account-state" class="provider-detail-state" role="status" aria-live="polite"></p>
+            </section>
+
+            <p id="provider-usage-detail-state" class="provider-detail-state" role="status" aria-live="polite"></p>
           </section>
         </footer>
       </section>
@@ -142,27 +250,111 @@
         <form id="project-form" method="dialog">
           <div class="dialog-heading">
             <strong id="project-dialog-title">새 프로젝트</strong>
-            <span>프로젝트 폴더는 실제 절대 경로로 입력하세요.</span>
+            <span>프로젝트 이름과 작업할 폴더를 선택하세요.</span>
           </div>
           <label>
             <span>이름</span>
             <input id="project-name" name="project-name" maxlength="50" autocomplete="off" required />
           </label>
-          <label>
-            <span>폴더 경로</span>
-            <input
-              id="project-path"
-              name="project-path"
-              placeholder="C:\Users\name\Documents\project"
-              autocomplete="off"
-              spellcheck="false"
-              required
-            />
-          </label>
+          <div class="project-path-field">
+            <label for="project-path">폴더 경로</label>
+            <div class="project-path-row">
+              <input
+                id="project-path"
+                name="project-path"
+                placeholder="폴더를 선택하세요"
+                autocomplete="off"
+                spellcheck="false"
+                readonly
+                required
+              />
+              <button id="select-project-folder" class="folder-picker-button" type="button">
+                폴더 선택
+              </button>
+            </div>
+          </div>
           <p id="project-form-error" class="project-form-error" role="alert"></p>
           <div class="dialog-actions">
             <button id="cancel-project" type="button">취소</button>
             <button class="dialog-submit" type="submit">프로젝트 만들기</button>
+          </div>
+        </form>
+      </dialog>
+
+      <dialog
+        id="settings-dialog"
+        class="project-dialog settings-dialog"
+        aria-labelledby="settings-title"
+      >
+        <form id="settings-form">
+          <div class="dialog-heading">
+            <strong id="settings-title">환경설정</strong>
+            <span>IHATECODING의 알림과 동작 방식을 관리합니다.</span>
+          </div>
+
+          <section class="settings-section" aria-labelledby="discord-notification-settings-title">
+            <div class="settings-section-heading">
+              <strong id="discord-notification-settings-title">Discord 휴대폰 알림</strong>
+              <span>CLI 작업 완료와 오류를 Discord 채널로 알려줍니다.</span>
+            </div>
+
+            <label class="phone-notification-toggle phone-notification-master">
+              <input id="phone-notification-enabled" type="checkbox" />
+              <span>휴대폰 알림 사용</span>
+            </label>
+
+            <div class="phone-notification-webhook-field">
+              <div class="phone-notification-webhook-heading">
+                <label for="phone-notification-webhook">Discord 웹훅 URL</label>
+                <span id="phone-notification-webhook-state">등록 안 됨</span>
+              </div>
+              <div class="phone-notification-webhook-row">
+                <input
+                  id="phone-notification-webhook"
+                  type="password"
+                  inputmode="url"
+                  autocomplete="new-password"
+                  autocapitalize="off"
+                  spellcheck="false"
+                  aria-describedby="phone-notification-webhook-help"
+                  placeholder="새 웹훅 URL을 입력하세요"
+                />
+                <button id="remove-phone-notification-webhook" type="button">제거</button>
+              </div>
+              <small id="phone-notification-webhook-help">저장된 URL은 다시 표시하지 않습니다. 비워두면 기존 URL을 유지합니다.</small>
+            </div>
+
+            <div class="phone-notification-guide">
+              <span>1. Discord 서버에서 알림을 받을 채널의 설정을 엽니다.</span>
+              <span>2. 연동 → 웹후크에서 웹후크를 만들고 URL 복사를 누릅니다.</span>
+              <span>3. 복사한 URL을 위 입력란에 붙여넣고 저장합니다.</span>
+              <small>프로젝트명, CLI 이름, 완료/오류 상태만 전송합니다. 경로, PID, 프롬프트, 답변과 원문 오류는 보내지 않습니다.</small>
+            </div>
+
+            <fieldset class="phone-notification-kinds">
+              <legend>알림 받을 때</legend>
+              <label class="phone-notification-toggle">
+                <input id="phone-notification-success" type="checkbox" />
+                <span>작업 완료</span>
+              </label>
+              <label class="phone-notification-toggle">
+                <input id="phone-notification-error" type="checkbox" />
+                <span>작업 오류</span>
+              </label>
+            </fieldset>
+
+            <p
+              id="phone-notification-status"
+              class="phone-notification-status"
+              role="status"
+              aria-live="polite"
+            ></p>
+          </section>
+
+          <div class="dialog-actions">
+            <button id="close-settings" type="button">닫기</button>
+            <button id="test-phone-notifications" type="button">테스트</button>
+            <button class="dialog-submit" type="submit">저장</button>
           </div>
         </form>
       </dialog>
@@ -174,10 +366,10 @@
       >
         <section class="phase3-upgrade-content">
           <div class="dialog-heading">
-            <strong id="phase3-upgrade-title">이전 Rust Preview 작업 복사</strong>
+            <strong id="phase3-upgrade-title">이전 작업 복구</strong>
             <span>
-              기존 Phase 3 Preview 파일은 그대로 두고, 정확한 복사본을 만든 뒤 새 canonical
-              저장소에 한 번만 반영합니다. Codex/Grok 대화는 자동으로 실행하거나 재개하지 않습니다.
+              이전 버전에서 저장한 작업이 발견됐습니다. 원본은 그대로 보존하고 안전한 복사본만
+              현재 작업 공간에 반영합니다. Codex/Grok 대화는 자동으로 실행하거나 재개하지 않습니다.
             </span>
           </div>
           <div class="legacy-inspection-counts">
@@ -200,73 +392,6 @@
         </section>
       </dialog>
 
-      <dialog
-        id="legacy-import-dialog"
-        class="project-dialog migration-dialog"
-        aria-labelledby="legacy-import-title"
-      >
-        <form id="legacy-import-form">
-          <div class="dialog-heading">
-            <strong id="legacy-import-title">프로젝트 복사본 가져오기</strong>
-            <span>
-              원본이 아닌 분리된 projects.json 복사본의 절대 경로를 입력하세요.
-              검사가 끝나기 전에는 저장소를 바꾸지 않습니다.
-            </span>
-          </div>
-
-          <label>
-            <span>분리된 복사본 경로</span>
-            <input
-              id="legacy-source-path"
-              name="legacy-source-path"
-              placeholder="C:\Users\name\Desktop\projects-copy.json"
-              autocomplete="off"
-              spellcheck="false"
-              required
-            />
-          </label>
-
-          <div id="legacy-inspection" class="legacy-inspection" hidden>
-            <div class="legacy-inspection-counts">
-              <span><strong id="legacy-project-count">0</strong> 프로젝트</span>
-              <span><strong id="legacy-terminal-count">0</strong> PowerShell</span>
-            </div>
-            <dl class="legacy-inspection-meta">
-              <div>
-                <dt>SHA-256</dt>
-                <dd id="legacy-source-sha">-</dd>
-              </div>
-            </dl>
-            <section id="legacy-warning-section" class="legacy-diagnostic-section" hidden>
-              <strong>확인할 항목</strong>
-              <ul id="legacy-warning-list"></ul>
-            </section>
-            <section id="legacy-blocking-section" class="legacy-diagnostic-section is-blocking" hidden>
-              <strong>가져오기를 막는 항목</strong>
-              <ul id="legacy-blocking-list"></ul>
-            </section>
-          </div>
-
-          <p id="legacy-import-error" class="project-form-error" role="alert"></p>
-          <p id="legacy-import-result" class="legacy-import-result" role="status" aria-live="polite"></p>
-
-          <section id="storage-recovery" class="storage-recovery" hidden>
-            <div class="storage-recovery-heading">
-              <strong>저장소 복구 필요</strong>
-              <span>검증을 통과한 백업만 직접 선택해 복구할 수 있습니다.</span>
-            </div>
-            <div id="recovery-candidate-list" class="recovery-candidate-list"></div>
-          </section>
-
-          <div class="dialog-actions migration-dialog-actions">
-            <button id="close-legacy-import" type="button">닫기</button>
-            <button id="inspect-legacy-copy" type="submit">검사</button>
-            <button id="commit-legacy-import" class="dialog-submit" type="button" disabled>
-              Rust 저장소로 가져오기
-            </button>
-          </div>
-        </form>
-      </dialog>
     </main>
   </body>
 </html>

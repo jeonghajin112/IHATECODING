@@ -141,7 +141,132 @@ const geometry = [
   { paneId: "pane-c", left: 200, top: 0, width: 100, height: 80 },
 ];
 
-test("blank/project tab assignment keeps stable IDs and project switching is deterministic", () => {
+test("legacy automatic project tabs collapse once to the active stable tab", () => {
+  const source = workspace({
+    selectedProjectId: "project-a",
+    tabs: [
+      projectTab("tab-alpha", "project-a", {
+        futureTab: { keep: "alpha" },
+      }),
+      projectTab("tab-beta", "project-b", {
+        extensions: { retained: "beta", nested: { opaque: true } },
+        futureTab: { keep: "beta" },
+      }),
+    ],
+    activeTabId: "tab-beta",
+    legacyExtensions: {
+      rootLegacy: [1, 2, 3],
+      manualProjectTabsV1: false,
+    },
+  });
+  const before = structuredClone(source);
+
+  const result = core.migrateLegacyAutomaticProjectTabsToManual(source);
+
+  assert.deepEqual(source, before);
+  assert.equal(result.legacyExtensions.manualProjectTabsV1, true);
+  assert.deepEqual(result.legacyExtensions.rootLegacy, [1, 2, 3]);
+  assert.equal(result.tabs.length, 1);
+  assert.equal(result.tabs[0].id, "tab-beta");
+  assert.equal(result.tabs[0].projectId, "project-b");
+  assert.deepEqual(result.tabs[0].extensions, before.tabs[1].extensions);
+  assert.deepEqual(result.tabs[0].futureTab, before.tabs[1].futureTab);
+  assert.equal(result.activeTabId, "tab-beta");
+  assert.equal(result.selectedProjectId, "project-b");
+});
+
+test("manual project tab migration marker makes repeated calls a no-op", () => {
+  const source = workspace({
+    selectedProjectId: "project-a",
+    tabs: [
+      projectTab("tab-alpha", "project-a"),
+      projectTab("tab-beta", "project-b"),
+    ],
+    activeTabId: "tab-alpha",
+    legacyExtensions: {
+      rootLegacy: [1, 2, 3],
+      manualProjectTabsV1: true,
+    },
+  });
+  const before = structuredClone(source);
+
+  const result = core.migrateLegacyAutomaticProjectTabsToManual(source);
+
+  assert.deepEqual(source, before);
+  assert.deepEqual(result, before);
+});
+
+test("ambiguous or user-authored tab layouts only receive the migration marker", () => {
+  const cases = [
+    {
+      name: "blank",
+      tabs: [projectTab("tab-alpha", "project-a"), blankTab("tab-blank")],
+      activeTabId: "tab-blank",
+      selectedProjectId: null,
+    },
+    {
+      name: "browser",
+      tabs: [projectTab("tab-alpha", "project-a"), browserTab("tab-browser")],
+      activeTabId: "tab-browser",
+      selectedProjectId: null,
+    },
+    {
+      name: "output",
+      tabs: [projectTab("tab-alpha", "project-a"), outputTab("tab-output")],
+      activeTabId: "tab-output",
+      selectedProjectId: null,
+    },
+    {
+      name: "duplicate project",
+      tabs: [
+        projectTab("tab-alpha", "project-a"),
+        projectTab("tab-alpha-copy", "project-a"),
+      ],
+      activeTabId: "tab-alpha-copy",
+      selectedProjectId: "project-a",
+    },
+    {
+      name: "partial project set",
+      tabs: [projectTab("tab-alpha", "project-a")],
+      activeTabId: "tab-alpha",
+      selectedProjectId: "project-a",
+    },
+    {
+      name: "user-created extra tab",
+      tabs: [
+        projectTab("tab-alpha", "project-a"),
+        projectTab("tab-beta", "project-b"),
+        blankTab("tab-extra", { futureTab: { userOwned: true } }),
+      ],
+      activeTabId: "tab-extra",
+      selectedProjectId: null,
+    },
+  ];
+
+  for (const candidate of cases) {
+    const source = workspace({
+      tabs: candidate.tabs,
+      activeTabId: candidate.activeTabId,
+      selectedProjectId: candidate.selectedProjectId,
+      legacyExtensions: { rootLegacy: candidate.name },
+    });
+    const before = structuredClone(source);
+    const result = core.migrateLegacyAutomaticProjectTabsToManual(source);
+
+    assert.deepEqual(source, before, `${candidate.name}: source`);
+    assert.deepEqual(result.tabs, before.tabs, `${candidate.name}: tabs`);
+    assert.equal(result.activeTabId, before.activeTabId, `${candidate.name}: active`);
+    assert.equal(
+      result.selectedProjectId,
+      before.selectedProjectId,
+      `${candidate.name}: selected project`,
+    );
+    assert.equal(result.legacyExtensions.manualProjectTabsV1, true);
+    assert.equal(result.legacyExtensions.rootLegacy, candidate.name);
+  }
+});
+
+test("project selection assigns or replaces the active tab without creating tabs", () => {
   const source = workspace();
   const before = structuredClone(source);
   const assigned = core.openProjectWorkspaceTab(source, "project-a", "unused-id");
@@ -154,23 +279,42 @@ test("blank/project tab assignment keeps stable IDs and project switching is det
   assert.equal(assigned.selectedProjectId, "project-a");
 
   const second = core.openProjectWorkspaceTab(assigned, "project-b", "tab-beta");
-  assert.deepEqual(second.tabs.map((tab) => tab.id), ["tab-blank", "tab-beta"]);
-  const existing = core.openProjectWorkspaceTab(second, "project-a", "unused-again");
-  assert.deepEqual(existing.tabs.map((tab) => tab.id), ["tab-blank", "tab-beta"]);
-  assert.equal(existing.activeTabId, "tab-blank");
-  assert.equal(existing.selectedProjectId, "project-a");
+  assert.equal(second.tabs.length, 1);
+  assert.equal(second.tabs[0].id, "tab-blank");
+  assert.equal(second.tabs[0].projectId, "project-b");
+  assert.equal(second.tabs[0].futureTab.keep, true);
+  assert.equal(second.activeTabId, "tab-blank");
+  assert.equal(second.selectedProjectId, "project-b");
 });
 
-test("assigning a blank tab to an already open project removes only the blank", () => {
+test("selecting an already-open project activates it without deleting the active blank", () => {
   const state = workspace({
     selectedProjectId: null,
     tabs: [projectTab("tab-alpha", "project-a"), blankTab("tab-new")],
     activeTabId: "tab-new",
   });
   const result = core.assignBlankWorkspaceTabToProject(state, "tab-new", "project-a");
-  assert.deepEqual(result.tabs.map((tab) => tab.id), ["tab-alpha"]);
+  assert.deepEqual(result.tabs.map((tab) => tab.id), ["tab-alpha", "tab-new"]);
   assert.equal(result.activeTabId, "tab-alpha");
   assert.equal(result.selectedProjectId, "project-a");
+  assert.equal(result.tabs[1].kind, "empty");
+  assert.equal(result.tabs[1].futureTab.keep, true);
+});
+
+test("an already-open project wins while another project tab remains unchanged", () => {
+  const state = workspace({
+    selectedProjectId: "project-a",
+    tabs: [
+      projectTab("tab-alpha", "project-a"),
+      projectTab("tab-beta", "project-b"),
+    ],
+    activeTabId: "tab-alpha",
+  });
+  const before = structuredClone(state);
+  const result = core.openProjectWorkspaceTab(state, "project-b", "must-not-be-used");
+  assert.deepEqual(result.tabs, before.tabs);
+  assert.equal(result.activeTabId, "tab-beta");
+  assert.equal(result.selectedProjectId, "project-b");
 });
 
 test("blank add, close, keyboard activation, reorder, and ARIA roving focus stay coherent", () => {
@@ -199,20 +343,123 @@ test("blank add, close, keyboard activation, reorder, and ARIA roving focus stay
   assert.equal(state.selectedProjectId, null);
 });
 
-test("pane creation permits exactly twenty and rejects the twenty-first", () => {
+test("each project independently permits twenty panes and rejects only its own twenty-first", () => {
   let state = workspace({
-    projects: [project("project-a", [])],
+    projects: [project("project-a", []), project("project-b", [])],
     tabs: [projectTab("tab-alpha", "project-a")],
     activeTabId: "tab-alpha",
     selectedProjectId: "project-a",
   });
   for (let index = 0; index < 20; index += 1) {
-    state = core.appendProjectPane(state, "project-a", pane(`pane-${index}`));
+    state = core.appendProjectPane(state, "project-a", pane(`pane-a-${index}`));
+    state = core.appendProjectPane(
+      state,
+      "project-b",
+      pane(`pane-b-${index}`, { startDirectory: "D:\\Work\\Beta" }),
+    );
   }
   assert.equal(state.projects[0].terminals.length, 20);
+  assert.equal(state.projects[1].terminals.length, 20);
+  assert.equal(
+    state.projects.reduce((total, item) => total + item.terminals.length, 0),
+    40,
+  );
   assert.throws(
-    () => core.appendProjectPane(state, "project-a", pane("pane-20")),
+    () => core.appendProjectPane(state, "project-a", pane("pane-a-20")),
     /at most 20 panes/,
+  );
+  assert.throws(
+    () =>
+      core.appendProjectPane(
+        state,
+        "project-b",
+        pane("pane-b-20", { startDirectory: "D:\\Work\\Beta" }),
+      ),
+    /at most 20 panes/,
+  );
+});
+
+test("browser panes persist in the project extension with title, URL, and close semantics", () => {
+  const source = workspace();
+  const before = structuredClone(source);
+  const browser = core.createWorkspaceBrowserPane(
+    "browser-one",
+    "  Preview  ",
+    "https://example.com/docs",
+  );
+
+  let state = core.appendProjectBrowserPane(source, "project-a", browser);
+  assert.deepEqual(source, before);
+  assert.deepEqual(core.projectBrowserPanes(state.projects[0]), [
+    {
+      id: "browser-one",
+      title: "Preview",
+      url: "https://example.com/docs",
+    },
+  ]);
+  assert.equal(state.projects[0].legacyExtensions.projectLegacy, "project-a");
+
+  state = core.renameProjectBrowserPane(
+    state,
+    "project-a",
+    "browser-one",
+    "  Local app  ",
+  );
+  state = core.setProjectBrowserPaneUrl(
+    state,
+    "project-a",
+    "browser-one",
+    "http://localhost:3000/dashboard",
+  );
+  assert.deepEqual(core.projectBrowserPanes(state.projects[0]), [
+    {
+      id: "browser-one",
+      title: "Local app",
+      url: "http://localhost:3000/dashboard",
+    },
+  ]);
+
+  state = core.removeProjectBrowserPane(state, "project-a", "browser-one");
+  assert.deepEqual(core.projectBrowserPanes(state.projects[0]), []);
+  assert.equal(state.projects[0].legacyExtensions.projectLegacy, "project-a");
+});
+
+test("browser pane restore ignores malformed opaque entries and enforces shared pane capacity", () => {
+  const malformed = project("project-a", ["pane-a"], {
+    legacyExtensions: {
+      projectLegacy: "project-a",
+      browserPanesV1: [
+        { id: "bad-scheme", title: "Bad", url: "file:///private" },
+        { id: "good", title: "Good", url: "https://example.com/" },
+        { id: "good", title: "Duplicate", url: "https://duplicate.example/" },
+      ],
+    },
+  });
+  assert.deepEqual(core.projectBrowserPanes(malformed), [
+    { id: "good", title: "Good", url: "https://example.com/" },
+  ]);
+
+  let state = workspace({
+    projects: [project("project-a", Array.from({ length: 19 }, (_, index) => `pane-${index}`))],
+  });
+  state = core.appendProjectBrowserPane(
+    state,
+    "project-a",
+    core.createWorkspaceBrowserPane("browser-final"),
+  );
+  assert.equal(core.projectBrowserPanes(state.projects[0]).length, 1);
+  assert.throws(
+    () =>
+      core.appendProjectBrowserPane(
+        state,
+        "project-a",
+        core.createWorkspaceBrowserPane("browser-overflow"),
+      ),
+    /at most 20 panes/,
+  );
+  assert.throws(
+    () => core.setProjectBrowserPaneUrl(state, "project-a", "browser-final", "javascript:1"),
+    /not allowed/,
   );
 });
 
@@ -321,7 +568,7 @@ test("closing project tabs never deletes projects and recomputes sidebar selecti
   assert.equal(state.selectedProjectId, null);
 });
 
-test("global restore capacity allows the twentieth pane and rejects overflow", () => {
+test("per-project restore capacity allows its twentieth pane and rejects its overflow", () => {
   assert.deepEqual(core.evaluateWorkspaceRestoreCapacity(18, 2), {
     allowed: true,
     current: 18,
@@ -378,6 +625,176 @@ test("project and terminal mutations preserve all unrelated unknown fields", () 
   assert.deepEqual(state.projects.at(-1).terminals[0].futurePane, { created: "opaque" });
 });
 
+test("discovered agent conversations are exclusive, durable-shaped terminal mutations", () => {
+  const CODEX_ID = "01981F62-94AC-7A3B-8C12-111111111111";
+  const GROK_ID = "01981F62-94AC-7A3B-8C12-222222222222";
+  const source = workspace({
+    projects: [
+      project("project-a", ["pane-a"], {
+        terminals: [
+          pane("pane-a", {
+            grokSessionId: GROK_ID,
+            legacyExtensions: {
+              resumeBlocked: true,
+              opaqueLegacy: { keep: true },
+            },
+            futurePane: { nested: [1, 2, 3] },
+          }),
+        ],
+      }),
+      project("project-b", ["pane-b"]),
+    ],
+  });
+  const before = structuredClone(source);
+
+  const codex = core.setTerminalAgentConversation(
+    source,
+    "project-a",
+    "pane-a",
+    "codex",
+    CODEX_ID.toUpperCase(),
+  );
+  const codexPane = codex.projects[0].terminals[0];
+  assert.equal(codexPane.codexThreadId, CODEX_ID.toLowerCase());
+  assert.equal(codexPane.grokSessionId, null);
+  assert.equal(codexPane.legacyExtensions.resumeBlocked, undefined);
+  assert.deepEqual(codexPane.legacyExtensions.opaqueLegacy, { keep: true });
+  assert.deepEqual(codexPane.futurePane, before.projects[0].terminals[0].futurePane);
+  assert.deepEqual(codex.futureRoot, before.futureRoot);
+  assert.deepEqual(source, before);
+
+  const grok = core.setTerminalAgentConversation(
+    codex,
+    "project-a",
+    "pane-a",
+    "grok",
+    GROK_ID,
+  );
+  assert.equal(grok.projects[0].terminals[0].codexThreadId, null);
+  assert.equal(grok.projects[0].terminals[0].grokSessionId, GROK_ID.toLowerCase());
+});
+
+test("account switching blocks selected-provider auto resume without losing conversation ids", () => {
+  const source = workspace({
+    projects: [
+      project("project-a", ["pane-a"], {
+        terminals: [
+          pane("pane-a", {
+            codexThreadId: "01981f62-94ac-7a3b-8c12-111111111111",
+            grokSessionId: "01981f62-94ac-7a3b-8c12-222222222222",
+          }),
+        ],
+      }),
+    ],
+  });
+  const before = structuredClone(source);
+
+  const codex = core.blockWorkspaceProviderResumeForAccountSwitch(source, "codex");
+  assert.equal(codex.projects[0].terminals[0].codexThreadId, before.projects[0].terminals[0].codexThreadId);
+  assert.equal(codex.projects[0].terminals[0].grokSessionId, before.projects[0].terminals[0].grokSessionId);
+  assert.equal(codex.projects[0].terminals[0].legacyExtensions.resumeBlocked, true);
+  assert.deepEqual(source, before);
+
+  const grok = core.blockWorkspaceProviderResumeForAccountSwitch(source, "grok");
+  assert.equal(grok.projects[0].terminals[0].codexThreadId, before.projects[0].terminals[0].codexThreadId);
+  assert.equal(grok.projects[0].terminals[0].grokSessionId, before.projects[0].terminals[0].grokSessionId);
+  assert.equal(grok.projects[0].terminals[0].legacyExtensions.resumeBlocked, true);
+});
+
+test("rediscovering the same agent ID still clears the durable resume blocker", () => {
+  const CODEX_ID = "01981f62-94ac-7a3b-8c12-111111111111";
+  const source = workspace({
+    projects: [
+      project("project-a", ["pane-a"], {
+        terminals: [
+          pane("pane-a", {
+            codexThreadId: CODEX_ID,
+            legacyExtensions: {
+              resumeBlocked: true,
+              opaqueLegacy: { keep: true },
+            },
+          }),
+        ],
+      }),
+    ],
+  });
+  const previous = source.projects[0].terminals[0];
+
+  const next = core.setTerminalAgentConversation(
+    source,
+    "project-a",
+    "pane-a",
+    "codex",
+    CODEX_ID.toUpperCase(),
+  );
+  const nextTerminal = next.projects[0].terminals[0];
+
+  assert.equal(nextTerminal.codexThreadId, CODEX_ID);
+  assert.equal(nextTerminal.grokSessionId, null);
+  assert.equal(nextTerminal.legacyExtensions.resumeBlocked, undefined);
+  assert.deepEqual(nextTerminal.legacyExtensions.opaqueLegacy, { keep: true });
+  assert.equal(core.terminalAgentBindingChanged(previous, nextTerminal), true);
+
+  const repeated = core.setTerminalAgentConversation(
+    next,
+    "project-a",
+    "pane-a",
+    "codex",
+    CODEX_ID,
+  );
+  assert.equal(
+    core.terminalAgentBindingChanged(nextTerminal, repeated.projects[0].terminals[0]),
+    false,
+  );
+});
+
+test("agent conversation discovery rejects same-provider duplicate ownership", () => {
+  const ID = "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA";
+  const source = workspace({
+    projects: [
+      project("project-a", ["pane-a"], {
+        terminals: [pane("pane-a", { codexThreadId: ID })],
+      }),
+      project("project-b", ["pane-b"]),
+    ],
+  });
+  const before = structuredClone(source);
+
+  assert.throws(
+    () =>
+      core.setTerminalAgentConversation(
+        source,
+        "project-b",
+        "pane-b",
+        "codex",
+        ID.toLowerCase(),
+      ),
+    /already owned/,
+  );
+  assert.deepEqual(source, before);
+
+  const crossProvider = core.setTerminalAgentConversation(
+    source,
+    "project-b",
+    "pane-b",
+    "grok",
+    ID.toLowerCase(),
+  );
+  assert.equal(crossProvider.projects[1].terminals[0].grokSessionId, ID.toLowerCase());
+  assert.throws(
+    () => core.setTerminalAgentConversation(source, "project-b", "pane-b", "codex", "bad"),
+    /valid UUID/,
+  );
+  assert.throws(
+    () => core.setTerminalAgentConversation(source, "project-b", "pane-b", "other", ID),
+    /provider is invalid/,
+  );
+  assert.throws(
+    () => core.setTerminalAgentConversation(source, "project-b", "missing", "grok", ID),
+    /does not exist/,
+  );
+});
+
 test("Windows project and terminal paths are normalized and invalid paths fail closed", () => {
   assert.deepEqual(core.validateWorkspaceProjectDraft(" Network ", " \\\\server\\share\\team\\ "), {
     name: "Network",
@@ -399,6 +816,12 @@ test("Windows project and terminal paths are normalized and invalid paths fail c
       /absolute Windows path/,
     );
   }
+});
+
+test("the folder picker suggestion follows Windows folder names without overwriting intent", () => {
+  assert.equal(core.suggestWorkspaceProjectName("C:\\Work\\Alpha\\"), "Alpha");
+  assert.equal(core.suggestWorkspaceProjectName("\\\\server\\share\\Team"), "Team");
+  assert.equal(core.suggestWorkspaceProjectName("C:\\"), "새 프로젝트");
 });
 
 test("drag insertion uses stable target identity even when its preview index is stale", () => {

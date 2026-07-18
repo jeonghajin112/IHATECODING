@@ -35,8 +35,10 @@ const MAX_ID_BYTES: usize = 256;
 const MAX_NAME_BYTES: usize = 4 * 1024;
 const MAX_PATH_BYTES: usize = 32 * 1024;
 const MAX_URL_BYTES: usize = 16 * 1024;
+const MAX_BROWSER_PANE_TITLE_BYTES: usize = 4 * 80;
 const MAX_EXTENSION_DEPTH: usize = 32;
 const MAX_EXTENSION_STRING_BYTES: usize = 64 * 1024;
+const PROJECT_BROWSER_PANES_EXTENSION: &str = "browserPanesV1";
 const BACKUP_COUNT: usize = 3;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -1196,9 +1198,22 @@ fn merge_preserved_extensions(incoming: &mut WorkspaceStateV1, current: &Workspa
         else {
             continue;
         };
+        // Project extensions are backend-owned by default so an older/lossy
+        // frontend cannot overwrite opaque values. browserPanesV1 is the one
+        // narrowly allowlisted UI-owned payload: it must accept edits and an
+        // empty array so rename/navigation/close survive the next save.
+        let incoming_browser_panes = project
+            .legacy_extensions
+            .get(PROJECT_BROWSER_PANES_EXTENSION)
+            .cloned();
         project
             .legacy_extensions
             .extend(current_project.legacy_extensions.clone());
+        if let Some(browser_panes) = incoming_browser_panes {
+            project
+                .legacy_extensions
+                .insert(PROJECT_BROWSER_PANES_EXTENSION.to_owned(), browser_panes);
+        }
         for terminal in &mut project.terminals {
             if let Some(current_terminal) = current_project
                 .terminals
@@ -1359,6 +1374,17 @@ fn validate_state(state: &WorkspaceStateV1) -> StorageResult<()> {
                 &terminal.legacy_extensions,
                 &format!("{terminal_prefix}/legacyExtensions"),
             )?;
+        }
+        let browser_pane_count = validate_project_browser_panes(
+            &project.legacy_extensions,
+            &terminal_ids,
+            &format!("{prefix}/legacyExtensions/{PROJECT_BROWSER_PANES_EXTENSION}"),
+        )?;
+        if project.terminals.len() + browser_pane_count > MAX_TERMINALS_PER_PROJECT {
+            return Err(StorageError::invalid(
+                "A project contains too many terminal and browser panes.",
+                format!("{prefix}/legacyExtensions/{PROJECT_BROWSER_PANES_EXTENSION}"),
+            ));
         }
         for (key, ratios) in &project.pane_width_ratios {
             if key.len() > MAX_ID_BYTES || ratios.is_empty() || ratios.len() > 5 {
@@ -1608,6 +1634,78 @@ fn validate_optional_uuid(value: Option<&str>, pointer: &str) -> StorageResult<(
         ));
     }
     Ok(())
+}
+
+fn validate_project_browser_panes(
+    extensions: &BTreeMap<String, Value>,
+    terminal_ids: &HashSet<&str>,
+    pointer: &str,
+) -> StorageResult<usize> {
+    let Some(value) = extensions.get(PROJECT_BROWSER_PANES_EXTENSION) else {
+        return Ok(0);
+    };
+    let Value::Array(panes) = value else {
+        return Err(StorageError::invalid(
+            "The browser pane extension must be an array.",
+            pointer,
+        ));
+    };
+    if panes.len() > MAX_TERMINALS_PER_PROJECT {
+        return Err(StorageError::invalid(
+            "A project contains too many browser panes.",
+            pointer,
+        ));
+    }
+
+    let mut browser_ids = HashSet::new();
+    for (index, pane) in panes.iter().enumerate() {
+        let pane_pointer = format!("{pointer}/{index}");
+        let Value::Object(pane) = pane else {
+            return Err(StorageError::invalid(
+                "A browser pane entry must be an object.",
+                pane_pointer,
+            ));
+        };
+        let id = required_browser_pane_string(pane, "id", &pane_pointer)?;
+        validate_text(id, MAX_ID_BYTES, false, &format!("{pane_pointer}/id"))?;
+        if terminal_ids.contains(id) || !browser_ids.insert(id) {
+            return Err(StorageError::invalid(
+                "Browser pane identifiers must be unique within a project.",
+                format!("{pane_pointer}/id"),
+            ));
+        }
+
+        let title = required_browser_pane_string(pane, "title", &pane_pointer)?;
+        validate_text(
+            title,
+            MAX_BROWSER_PANE_TITLE_BYTES,
+            false,
+            &format!("{pane_pointer}/title"),
+        )?;
+
+        let url = required_browser_pane_string(pane, "url", &pane_pointer)?;
+        if url.eq_ignore_ascii_case("about:blank") {
+            return Err(StorageError::invalid(
+                "A browser pane URL uses an unsafe scheme.",
+                format!("{pane_pointer}/url"),
+            ));
+        }
+        validate_browser_url(url, &format!("{pane_pointer}/url"))?;
+    }
+    Ok(panes.len())
+}
+
+fn required_browser_pane_string<'a>(
+    pane: &'a Map<String, Value>,
+    key: &str,
+    pointer: &str,
+) -> StorageResult<&'a str> {
+    pane.get(key).and_then(Value::as_str).ok_or_else(|| {
+        StorageError::invalid(
+            "A browser pane field is missing or is not a string.",
+            format!("{pointer}/{key}"),
+        )
+    })
 }
 
 fn validate_browser_url(url: &str, pointer: &str) -> StorageResult<()> {
@@ -2477,6 +2575,142 @@ mod tests {
         assert_eq!(
             state.projects[0].terminals[0].legacy_extensions["nestedFutureInteger"].as_u64(),
             Some(sentinel)
+        );
+    }
+
+    #[test]
+    fn browser_pane_extension_is_ui_owned_while_other_extensions_remain_preserved() {
+        let test = TestDirectory::new();
+        let store = test.open();
+        let sentinel = 9_007_199_254_740_993_u64;
+        let mut base = sample_state();
+        base.projects[0]
+            .legacy_extensions
+            .insert("backendOwned".to_owned(), Value::from(sentinel));
+        save(&store, 0, base);
+
+        let mut added = sample_state();
+        added.projects[0]
+            .legacy_extensions
+            .insert("backendOwned".to_owned(), Value::from(1));
+        added.projects[0].legacy_extensions.insert(
+            PROJECT_BROWSER_PANES_EXTENSION.to_owned(),
+            serde_json::json!([{
+                "id": "browser-one",
+                "title": "Preview",
+                "url": "https://example.com/first"
+            }]),
+        );
+        save(&store, 1, added);
+
+        let mut renamed = sample_state();
+        renamed.projects[0]
+            .legacy_extensions
+            .insert("backendOwned".to_owned(), Value::from(2));
+        renamed.projects[0].legacy_extensions.insert(
+            PROJECT_BROWSER_PANES_EXTENSION.to_owned(),
+            serde_json::json!([{
+                "id": "browser-one",
+                "title": "Dashboard",
+                "url": "http://localhost:3000/dashboard"
+            }]),
+        );
+        save(&store, 2, renamed);
+        let state = store.load().unwrap().snapshot.unwrap().state;
+        assert_eq!(
+            state.projects[0].legacy_extensions["backendOwned"].as_u64(),
+            Some(sentinel)
+        );
+        assert_eq!(
+            state.projects[0].legacy_extensions[PROJECT_BROWSER_PANES_EXTENSION][0]["title"],
+            "Dashboard"
+        );
+        assert_eq!(
+            state.projects[0].legacy_extensions[PROJECT_BROWSER_PANES_EXTENSION][0]["url"],
+            "http://localhost:3000/dashboard"
+        );
+
+        let mut closed = sample_state();
+        closed.projects[0]
+            .legacy_extensions
+            .insert("backendOwned".to_owned(), Value::from(3));
+        closed.projects[0].legacy_extensions.insert(
+            PROJECT_BROWSER_PANES_EXTENSION.to_owned(),
+            Value::Array(Vec::new()),
+        );
+        save(&store, 3, closed);
+        let state = store.load().unwrap().snapshot.unwrap().state;
+        assert_eq!(
+            state.projects[0].legacy_extensions["backendOwned"].as_u64(),
+            Some(sentinel)
+        );
+        assert_eq!(
+            state.projects[0].legacy_extensions[PROJECT_BROWSER_PANES_EXTENSION],
+            Value::Array(Vec::new())
+        );
+    }
+
+    #[test]
+    fn browser_pane_extension_rejects_unsafe_or_conflicting_entries() {
+        let valid = serde_json::json!([{
+            "id": "browser-one",
+            "title": "Preview",
+            "url": "https://example.com/"
+        }]);
+        let mut state = sample_state();
+        state.projects[0]
+            .legacy_extensions
+            .insert(PROJECT_BROWSER_PANES_EXTENSION.to_owned(), valid.clone());
+        normalize_and_validate_state(&mut state).unwrap();
+
+        let invalid_payloads = [
+            serde_json::json!([{
+                "id": "browser-one",
+                "title": "Preview",
+                "url": "file:///private"
+            }]),
+            serde_json::json!([{
+                "id": "terminal-1",
+                "title": "Collision",
+                "url": "https://example.com/"
+            }]),
+            serde_json::json!([{
+                "id": "browser-one",
+                "title": "",
+                "url": "https://example.com/"
+            }]),
+        ];
+        for payload in invalid_payloads {
+            let mut invalid = sample_state();
+            invalid.projects[0]
+                .legacy_extensions
+                .insert(PROJECT_BROWSER_PANES_EXTENSION.to_owned(), payload);
+            assert_eq!(
+                normalize_and_validate_state(&mut invalid).unwrap_err().code,
+                StorageErrorCode::InvalidState
+            );
+        }
+
+        let mut overflow = sample_state();
+        overflow.projects[0].legacy_extensions.insert(
+            PROJECT_BROWSER_PANES_EXTENSION.to_owned(),
+            Value::Array(
+                (0..MAX_TERMINALS_PER_PROJECT)
+                    .map(|index| {
+                        serde_json::json!({
+                            "id": format!("browser-{index}"),
+                            "title": format!("Browser {index}"),
+                            "url": "https://example.com/"
+                        })
+                    })
+                    .collect(),
+            ),
+        );
+        assert_eq!(
+            normalize_and_validate_state(&mut overflow)
+                .unwrap_err()
+                .code,
+            StorageErrorCode::InvalidState
         );
     }
 

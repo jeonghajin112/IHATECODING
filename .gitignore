@@ -1,20 +1,9 @@
-PowerWorkspace/bin/
-PowerWorkspace/obj/
-PowerWorkspace/WebTerminal/node_modules/
-publish/
-publish-csharp/
 artifacts/
-PowerWorkspace.exe
-PowerWorkspace.previous.exe
-XXCODING.exe
-XXCODING.previous.exe
-XXCODING.previous.*.exe
 IHATECODING.exe
 IHATECODING.previous.exe
 IHATECODING.previous.*.exe
 IHATECODING.previous-build*.exe
-IHATECODING.CSharp.exe
-IHATECODING.csharp-rollback*.exe
+IHATECODING.running-build*.exe
 *.log
 
 # Machine-local settings and credentials
