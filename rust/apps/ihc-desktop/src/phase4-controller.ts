@@ -54,6 +54,7 @@ import {
   deriveSafeResumePlans,
   type SafeResumePlan,
 } from "./phase5-core";
+import { localizeBackendMessage, tr } from "./i18n";
 
 type StatusTone = "normal" | "error";
 
@@ -228,10 +229,12 @@ export class Phase4WorkspaceController {
   private setProjectListExpanded(expanded: boolean): void {
     this.elements.projectList.hidden = !expanded;
     if (!this.projectListToggle) return;
-    const action = expanded ? "접기" : "펼치기";
     this.projectListToggle.setAttribute("aria-expanded", String(expanded));
-    this.projectListToggle.setAttribute("aria-label", `프로젝트 목록 ${action}`);
-    this.projectListToggle.title = `프로젝트 목록 ${action}`;
+    const label = expanded
+      ? tr("Collapse project list", "프로젝트 목록 접기")
+      : tr("Expand project list", "프로젝트 목록 펼치기");
+    this.projectListToggle.setAttribute("aria-label", label);
+    this.projectListToggle.title = label;
   }
 
   async initialize(): Promise<void> {
@@ -242,7 +245,9 @@ export class Phase4WorkspaceController {
     if (this.shuttingDown) return;
     this.shuttingDown = true;
     this.refreshControls();
-    this.runtime.setFooterStatus("Rust 작업 공간을 저장한 뒤 종료하는 중…");
+    this.runtime.setFooterStatus(
+      tr("Saving the Rust workspace before closing…", "Rust 작업 공간을 저장한 뒤 종료하는 중…"),
+    );
   }
 
   async flushSaves(): Promise<void> {
@@ -264,31 +269,49 @@ export class Phase4WorkspaceController {
     if (this.storageFaulted || this.session?.dirty || this.session?.phase !== "idle") {
       throw new Error(
         this.session?.lastError?.message ??
-          "저장되지 않은 Rust 작업 공간 변경이 남아 있습니다.",
+          tr(
+            "There are unsaved Rust workspace changes.",
+            "저장되지 않은 Rust 작업 공간 변경이 남아 있습니다.",
+          ),
       );
     }
   }
 
   async assertProviderAccountRestartReady(): Promise<void> {
     if (!this.canMutate()) {
-      throw new Error("계정 전환을 시작할 수 있는 상태가 아닙니다.");
+      throw new Error(
+        tr("Account switching cannot start in the current state.", "계정 전환을 시작할 수 있는 상태가 아닙니다."),
+      );
     }
     await this.flushSaves();
     if (!this.canMutate()) {
-      throw new Error("계정 전환을 시작할 수 있는 상태가 아닙니다.");
+      throw new Error(
+        tr("Account switching cannot start in the current state.", "계정 전환을 시작할 수 있는 상태가 아닙니다."),
+      );
     }
   }
 
   async prepareProviderAccountRestart(provider: WorkspaceAgentProvider): Promise<void> {
     if (!this.canMutate()) {
-      throw new Error("계정 전환을 저장할 수 있는 상태가 아닙니다.");
+      throw new Error(
+        tr("Account switching cannot be saved in the current state.", "계정 전환을 저장할 수 있는 상태가 아닙니다."),
+      );
     }
     await this.enqueueOperation(async () => {
       const state = this.currentState();
-      if (!state) throw new Error("작업 공간 상태를 불러오지 못했습니다.");
+      if (!state) {
+        throw new Error(tr("Could not load the workspace state.", "작업 공간 상태를 불러오지 못했습니다."));
+      }
       const next = blockWorkspaceProviderResumeForAccountSwitch(state, provider);
-      const saved = await this.persistNow(next, "계정 전환 상태를 저장하지 못했습니다");
-      if (!saved) throw new Error("계정 전환 상태를 저장하지 못했습니다.");
+      const saved = await this.persistNow(
+        next,
+        tr("Could not save the account-switch state", "계정 전환 상태를 저장하지 못했습니다"),
+      );
+      if (!saved) {
+        throw new Error(
+          tr("Could not save the account-switch state.", "계정 전환 상태를 저장하지 못했습니다."),
+        );
+      }
       this.providerAccountRestartRollback = structuredClone(state);
     });
     await this.flushSaves();
@@ -300,9 +323,19 @@ export class Phase4WorkspaceController {
     await this.enqueueOperation(async () => {
       const saved = await this.persistNow(
         previous,
-        "계정 전환 재시작 상태를 복구하지 못했습니다",
+        tr(
+          "Could not restore the account-switch restart state",
+          "계정 전환 재시작 상태를 복구하지 못했습니다",
+        ),
       );
-      if (!saved) throw new Error("계정 전환 재시작 상태를 복구하지 못했습니다.");
+      if (!saved) {
+        throw new Error(
+          tr(
+            "Could not restore the account-switch restart state.",
+            "계정 전환 재시작 상태를 복구하지 못했습니다.",
+          ),
+        );
+      }
       this.providerAccountRestartRollback = null;
     });
     await this.flushSaves();
@@ -319,13 +352,22 @@ export class Phase4WorkspaceController {
 
   async prepareForExternalReplacement(allowPreviewUpgrade = false): Promise<void> {
     if (this.externalReplacementPending) {
-      throw new Error("다른 저장소 교체 작업이 이미 진행 중입니다.");
+      throw new Error(
+        tr("Another storage replacement is already in progress.", "다른 저장소 교체 작업이 이미 진행 중입니다."),
+      );
     }
     if (this.upgradeInspection !== null && !allowPreviewUpgrade) {
-      throw new Error("이전 Rust Preview 상태의 안전한 복사를 먼저 완료하세요.");
+      throw new Error(
+        tr(
+          "Complete the safe copy of the previous Rust Preview state first.",
+          "이전 Rust Preview 상태의 안전한 복사를 먼저 완료하세요.",
+        ),
+      );
     }
     await this.flushSaves();
-    if (this.shuttingDown) throw new Error("종료 중에는 저장소를 교체할 수 없습니다.");
+    if (this.shuttingDown) {
+      throw new Error(tr("Storage cannot be replaced while closing.", "종료 중에는 저장소를 교체할 수 없습니다."));
+    }
     this.externalReplacementPending = true;
     this.externalReplacementBarrier = new Promise<void>((resolve) => {
       this.resolveExternalReplacement = resolve;
@@ -337,7 +379,9 @@ export class Phase4WorkspaceController {
       // identity that no longer exists.
       await this.runtime.unloadAllProjects();
       if (this.shuttingDown) {
-        throw new Error("종료가 시작되어 저장소 교체를 취소했습니다.");
+        throw new Error(
+          tr("Storage replacement was canceled because shutdown started.", "종료가 시작되어 저장소 교체를 취소했습니다."),
+        );
       }
       this.runtime.showEmptyView();
     } catch (error) {
@@ -359,8 +403,14 @@ export class Phase4WorkspaceController {
         if (!(await this.reloadFromCanonicalStore(recheckUpgrade))) {
           throw new Error(
             committed
-              ? "저장소 교체는 완료됐지만 새 canonical 상태를 다시 불러오지 못했습니다."
-              : "저장소 교체를 취소한 뒤 기존 canonical 상태를 복원하지 못했습니다.",
+              ? tr(
+                  "Storage replacement completed, but the new canonical state could not be reloaded.",
+                  "저장소 교체는 완료됐지만 새 canonical 상태를 다시 불러오지 못했습니다.",
+                )
+              : tr(
+                  "The previous canonical state could not be restored after canceling storage replacement.",
+                  "저장소 교체를 취소한 뒤 기존 canonical 상태를 복원하지 못했습니다.",
+                ),
           );
         }
       }
@@ -378,7 +428,10 @@ export class Phase4WorkspaceController {
     if (!state || !this.canMutate(false)) return false;
     try {
       const next = removeProjectPane(state, projectId, paneId);
-      return await this.persist(next, "PowerShell 삭제 상태를 저장하지 못했습니다");
+      return await this.persist(
+        next,
+        tr("Could not save the PowerShell removal", "PowerShell 삭제 상태를 저장하지 못했습니다"),
+      );
     } catch (error) {
       this.runtime.setFooterStatus(errorMessage(error), "error");
       return false;
@@ -390,7 +443,10 @@ export class Phase4WorkspaceController {
     if (!state || !this.canMutate(false)) return false;
     try {
       const next = removeProjectBrowserPane(state, projectId, paneId);
-      return await this.persist(next, "웹 패널 삭제 상태를 저장하지 못했습니다");
+      return await this.persist(
+        next,
+        tr("Could not save the web pane removal", "웹 패널 삭제 상태를 저장하지 못했습니다"),
+      );
     } catch (error) {
       this.runtime.setFooterStatus(errorMessage(error), "error");
       return false;
@@ -437,7 +493,10 @@ export class Phase4WorkspaceController {
         if (bindingChanged) {
           const saved = await this.persistNow(
             next,
-            "에이전트 대화 연결을 저장하지 못했습니다",
+            tr(
+              "Could not save the agent conversation link",
+              "에이전트 대화 연결을 저장하지 못했습니다",
+            ),
           );
           if (!saved) return false;
         }
@@ -450,7 +509,10 @@ export class Phase4WorkspaceController {
         return true;
       } catch (error) {
         this.runtime.setFooterStatus(
-          `에이전트 대화를 연결하지 못했습니다: ${errorMessage(error)}`,
+          tr(
+            `Could not link the agent conversation: ${errorMessage(error)}`,
+            `에이전트 대화를 연결하지 못했습니다: ${errorMessage(error)}`,
+          ),
           "error",
         );
         return false;
@@ -480,7 +542,10 @@ export class Phase4WorkspaceController {
     if (!state || !this.canMutate(false)) return false;
     try {
       const next = renameProjectPane(state, projectId, paneId, title);
-      return await this.persist(next, "PowerShell 이름을 저장하지 못했습니다");
+      return await this.persist(
+        next,
+        tr("Could not save the PowerShell name", "PowerShell 이름을 저장하지 못했습니다"),
+      );
     } catch (error) {
       this.runtime.setFooterStatus(errorMessage(error), "error");
       return false;
@@ -496,7 +561,10 @@ export class Phase4WorkspaceController {
     if (!state || !this.canMutate(false)) return false;
     try {
       const next = renameProjectBrowserPane(state, projectId, paneId, title);
-      return await this.persist(next, "웹 패널 이름을 저장하지 못했습니다");
+      return await this.persist(
+        next,
+        tr("Could not save the web pane name", "웹 패널 이름을 저장하지 못했습니다"),
+      );
     } catch (error) {
       this.runtime.setFooterStatus(errorMessage(error), "error");
       return false;
@@ -512,7 +580,10 @@ export class Phase4WorkspaceController {
     if (!state || !this.canMutate(false)) return false;
     try {
       const next = setProjectBrowserPaneUrl(state, projectId, paneId, url);
-      return await this.persist(next, "웹 패널 주소를 저장하지 못했습니다");
+      return await this.persist(
+        next,
+        tr("Could not save the web pane address", "웹 패널 주소를 저장하지 못했습니다"),
+      );
     } catch (error) {
       this.runtime.setFooterStatus(errorMessage(error), "error");
       return false;
@@ -528,7 +599,10 @@ export class Phase4WorkspaceController {
     if (!state || !this.canMutate(false)) return;
     try {
       const next = applyProjectPaneInsertion(state, projectId, draggedPaneId, target);
-      void this.persist(next, "PowerShell 배치를 저장하지 못했습니다").then((saved) => {
+      void this.persist(
+        next,
+        tr("Could not save the PowerShell layout", "PowerShell 배치를 저장하지 못했습니다"),
+      ).then((saved) => {
         const project = this.currentState()?.projects.find((item) => item.id === projectId);
         if (project) this.runtime.syncProject(project);
         if (!saved && project) this.runtime.showProject(project);
@@ -548,7 +622,10 @@ export class Phase4WorkspaceController {
     if (!state || !this.canMutate(false)) return;
     try {
       const next = setProjectPaneWidthRatios(state, projectId, layoutKey, ratios);
-      void this.persist(next, "PowerShell 너비를 저장하지 못했습니다").then((saved) => {
+      void this.persist(
+        next,
+        tr("Could not save the PowerShell widths", "PowerShell 너비를 저장하지 못했습니다"),
+      ).then((saved) => {
         const project = this.currentState()?.projects.find((item) => item.id === projectId);
         if (project) this.runtime.syncProject(project);
         if (!saved && project) this.runtime.showProject(project);
@@ -595,7 +672,10 @@ export class Phase4WorkspaceController {
           this.renderUpgradeInspection();
           this.renderAndActivate();
           this.runtime.setFooterStatus(
-            "이전 Rust Preview 작업이 있습니다. 먼저 안전한 복사를 확인하세요.",
+            tr(
+              "A previous Rust Preview workspace was found. Review the safe copy first.",
+              "이전 Rust Preview 작업이 있습니다. 먼저 안전한 복사를 확인하세요.",
+            ),
             "error",
           );
           this.openUpgradeDialog();
@@ -612,7 +692,15 @@ export class Phase4WorkspaceController {
         current.legacyExtensions.manualProjectTabsV1 !== true
       ) {
         const migrated = migrateLegacyAutomaticProjectTabsToManual(current);
-        if (!(await this.persistNow(migrated, "수동 프로젝트 탭 전환을 저장하지 못했습니다"))) {
+        if (
+          !(await this.persistNow(
+            migrated,
+            tr(
+              "Could not save the manual project-tab migration",
+              "수동 프로젝트 탭 전환을 저장하지 못했습니다",
+            ),
+          ))
+        ) {
           this.renderAndActivate();
           return false;
         }
@@ -627,7 +715,10 @@ export class Phase4WorkspaceController {
       this.session = null;
       this.renderAndActivate();
       this.runtime.setFooterStatus(
-        `Rust 작업 공간을 불러오지 못해 실행과 변경을 막았습니다: ${errorMessage(error)}`,
+        tr(
+          `The Rust workspace could not be loaded, so running and editing are disabled: ${errorMessage(error)}`,
+          `Rust 작업 공간을 불러오지 못해 실행과 변경을 막았습니다: ${errorMessage(error)}`,
+        ),
         "error",
       );
       return false;
@@ -657,8 +748,12 @@ export class Phase4WorkspaceController {
     }
     this.runtime.showEmptyView();
     if (tab && tab.kind !== "empty" && tab.kind !== "project") {
+      const localizedTitle = localizeBuiltInTabTitle(tab.title);
       this.runtime.setFooterStatus(
-        `${tab.title} 탭은 저장만 복원했습니다. 실제 실행은 후속 단계에서 연결합니다.`,
+        tr(
+          `Only the saved state of the ${localizedTitle} tab was restored. Runtime support will be connected in a later step.`,
+          `${localizedTitle} 탭은 저장만 복원했습니다. 실제 실행은 후속 단계에서 연결합니다.`,
+        ),
       );
     }
   }
@@ -692,7 +787,8 @@ export class Phase4WorkspaceController {
       kind.textContent = tab.kind === "project" ? ">_" : tab.kind === "empty" ? "○" : "□";
       const title = document.createElement("span");
       title.className = "workspace-tab-title";
-      title.textContent = tab.title;
+      const localizedTitle = localizeBuiltInTabTitle(tab.title);
+      title.textContent = localizedTitle;
       const status = document.createElement("span");
       status.className = "workspace-tab-status";
       let activity: HTMLSpanElement | null = null;
@@ -700,7 +796,7 @@ export class Phase4WorkspaceController {
         activity = document.createElement("span");
         activity.className = "workspace-tab-activity";
         activity.hidden = !working;
-        activity.title = "작업 중";
+        activity.title = tr("Working", "작업 중");
         activity.setAttribute("aria-hidden", "true");
         status.append(activity);
       }
@@ -711,8 +807,12 @@ export class Phase4WorkspaceController {
           const badge = document.createElement("span");
           badge.className = "completion-badge";
           badge.textContent = String(unread);
-          badge.title = `확인하지 않은 완료 알림 ${unread}개`;
-          badge.setAttribute("aria-label", `확인하지 않은 완료 알림 ${unread}개`);
+          const unreadLabel = tr(
+            `${unread} unread completion notification${unread === 1 ? "" : "s"}`,
+            `확인하지 않은 완료 알림 ${unread}개`,
+          );
+          badge.title = unreadLabel;
+          badge.setAttribute("aria-label", unreadLabel);
           unreadBadge = badge;
         }
       }
@@ -722,8 +822,11 @@ export class Phase4WorkspaceController {
       close.className = "workspace-tab-close";
       close.type = "button";
       close.textContent = "×";
-      close.title = `${tab.title} 탭 닫기`;
-      close.setAttribute("aria-label", `${tab.title} 탭 닫기`);
+      const closeLabel = isBuiltInTabTitle(tab.title)
+        ? tr("Close New tab", "새 탭 닫기")
+        : tr(`Close ${tab.title} tab`, `${tab.title} 탭 닫기`);
+      close.title = closeLabel;
+      close.setAttribute("aria-label", closeLabel);
       close.disabled = !enabled;
       close.addEventListener("click", (event) => {
         event.stopPropagation();
@@ -772,8 +875,12 @@ export class Phase4WorkspaceController {
         const badge = document.createElement("span");
         badge.className = "completion-badge project-completion-badge";
         badge.textContent = String(unread);
-        badge.title = `확인하지 않은 완료 알림 ${unread}개`;
-        badge.setAttribute("aria-label", `확인하지 않은 완료 알림 ${unread}개`);
+        const unreadLabel = tr(
+          `${unread} unread completion notification${unread === 1 ? "" : "s"}`,
+          `확인하지 않은 완료 알림 ${unread}개`,
+        );
+        badge.title = unreadLabel;
+        badge.setAttribute("aria-label", unreadLabel);
         button.append(badge);
       }
       button.addEventListener("click", () => void this.openProject(project.id));
@@ -806,7 +913,10 @@ export class Phase4WorkspaceController {
       ? moveWorkspaceTabByKeyboard(state, tabId, command)
       : activateRelativeWorkspaceTab(state, tabId, command);
     if (!this.canActivateWorkspaceState(next)) return;
-    void this.persist(next, "탭 순서를 저장하지 못했습니다").then((saved) => {
+    void this.persist(
+      next,
+      tr("Could not save the tab order", "탭 순서를 저장하지 못했습니다"),
+    ).then((saved) => {
       if (saved) this.renderAndActivate();
     });
   }
@@ -815,7 +925,11 @@ export class Phase4WorkspaceController {
     const state = this.currentState();
     if (!state || !this.canMutate()) return;
     const next = addBlankWorkspaceTab(state, this.idFactory());
-    if (await this.persist(next, "빈 탭을 저장하지 못했습니다")) this.renderAndActivate();
+    if (
+      await this.persist(next, tr("Could not save the blank tab", "빈 탭을 저장하지 못했습니다"))
+    ) {
+      this.renderAndActivate();
+    }
   }
 
   private async activateTab(tabId: string): Promise<void> {
@@ -823,7 +937,9 @@ export class Phase4WorkspaceController {
     if (!state || !this.canMutate()) return;
     const next = activateWorkspaceTab(state, tabId);
     if (!this.canActivateWorkspaceState(next)) return;
-    if (await this.persist(next, "선택한 탭을 저장하지 못했습니다")) {
+    if (
+      await this.persist(next, tr("Could not save the selected tab", "선택한 탭을 저장하지 못했습니다"))
+    ) {
       this.renderAndActivate();
     }
   }
@@ -836,13 +952,20 @@ export class Phase4WorkspaceController {
       projectId !== null &&
       !next.tabs.some((tab) => tab.kind === "project" && tab.projectId === projectId);
     if (!this.canActivateWorkspaceState(next, shouldUnload ? projectId : null)) return;
-    if (!(await this.persist(next, "닫은 탭 상태를 저장하지 못했습니다"))) return;
+    if (
+      !(await this.persist(next, tr("Could not save the closed-tab state", "닫은 탭 상태를 저장하지 못했습니다")))
+    ) {
+      return;
+    }
     if (projectId && shouldUnload) {
       try {
         await this.trackRuntimeTransition(() => this.runtime.unloadProject(projectId));
       } catch (error) {
         this.runtime.setFooterStatus(
-          `닫은 프로젝트의 PowerShell을 정리하지 못했습니다: ${errorMessage(error)}`,
+          tr(
+            `Could not clean up the closed project's PowerShell panes: ${errorMessage(error)}`,
+            `닫은 프로젝트의 PowerShell을 정리하지 못했습니다: ${errorMessage(error)}`,
+          ),
           "error",
         );
       }
@@ -857,7 +980,9 @@ export class Phase4WorkspaceController {
     if (!project) return;
     const next = openProjectWorkspaceTab(state, project.id, this.idFactory());
     if (!this.canActivateWorkspaceState(next)) return;
-    if (await this.persist(next, "프로젝트 탭을 저장하지 못했습니다")) {
+    if (
+      await this.persist(next, tr("Could not save the project tab", "프로젝트 탭을 저장하지 못했습니다"))
+    ) {
       this.renderAndActivate();
     }
   }
@@ -887,7 +1012,7 @@ export class Phase4WorkspaceController {
       const selected = await open({
         directory: true,
         multiple: false,
-        title: "프로젝트 폴더 선택",
+        title: tr("Select project folder", "프로젝트 폴더 선택"),
         defaultPath: currentPath || this.projectFolderDefaultPath || undefined,
       });
       if (typeof selected !== "string") return;
@@ -897,7 +1022,10 @@ export class Phase4WorkspaceController {
       }
       this.elements.projectFormError.textContent = "";
     } catch (error) {
-      this.elements.projectFormError.textContent = `폴더 선택기를 열지 못했습니다. ${errorMessage(error)}`;
+      this.elements.projectFormError.textContent = tr(
+        `Could not open the folder picker. ${errorMessage(error)}`,
+        `폴더 선택기를 열지 못했습니다. ${errorMessage(error)}`,
+      );
     } finally {
       this.projectFolderPickerPending = false;
       this.elements.selectProjectFolderButton.disabled = !this.mutationsEnabled();
@@ -931,7 +1059,7 @@ export class Phase4WorkspaceController {
     );
     const withProject = appendWorkspaceProject(state, project);
     const next = openProjectWorkspaceTab(withProject, project.id, this.idFactory());
-    if (await this.persist(next, "프로젝트를 저장하지 못했습니다")) {
+    if (await this.persist(next, tr("Could not save the project", "프로젝트를 저장하지 못했습니다"))) {
       this.elements.projectDialog.close();
       this.renderAndActivate();
     }
@@ -946,7 +1074,10 @@ export class Phase4WorkspaceController {
     if (!project) return;
     if (!this.runtime.canAddPane(project.id)) {
       this.runtime.setFooterStatus(
-        "이 프로젝트의 분할 화면은 최대 20개까지 열 수 있습니다.",
+        tr(
+          "This project can have at most 20 split panes.",
+          "이 프로젝트의 분할 화면은 최대 20개까지 열 수 있습니다.",
+        ),
         "error",
       );
       return;
@@ -957,7 +1088,10 @@ export class Phase4WorkspaceController {
     );
     if (!capacity.allowed) {
       this.runtime.setFooterStatus(
-        `PowerShell은 프로젝트마다 최대 ${capacity.maximum}개까지 실행할 수 있습니다.`,
+        tr(
+          `Each project can run at most ${capacity.maximum} PowerShell panes.`,
+          `PowerShell은 프로젝트마다 최대 ${capacity.maximum}개까지 실행할 수 있습니다.`,
+        ),
         "error",
       );
       return;
@@ -969,10 +1103,17 @@ export class Phase4WorkspaceController {
       new Date().toISOString(),
     );
     const next = appendProjectPane(state, project.id, terminal);
-    if (!(await this.persist(next, "PowerShell 상태를 저장하지 못했습니다"))) return;
+    if (
+      !(await this.persist(next, tr("Could not save the PowerShell state", "PowerShell 상태를 저장하지 못했습니다")))
+    ) {
+      return;
+    }
     if (!this.runtime.addPane(project.id, terminal, true)) {
       this.runtime.setFooterStatus(
-        "PowerShell 상태는 저장했지만 실행 슬롯을 확보하지 못했습니다.",
+        tr(
+          "The PowerShell state was saved, but no runtime slot could be reserved.",
+          "PowerShell 상태는 저장했지만 실행 슬롯을 확보하지 못했습니다.",
+        ),
         "error",
       );
     }
@@ -988,17 +1129,27 @@ export class Phase4WorkspaceController {
     if (!project) return;
     if (!this.runtime.canAddPane(project.id)) {
       this.runtime.setFooterStatus(
-        "이 프로젝트의 분할 화면은 최대 20개까지 열 수 있습니다.",
+        tr(
+          "This project can have at most 20 split panes.",
+          "이 프로젝트의 분할 화면은 최대 20개까지 열 수 있습니다.",
+        ),
         "error",
       );
       return;
     }
     const browser = createWorkspaceBrowserPane(this.idFactory());
     const next = appendProjectBrowserPane(state, project.id, browser);
-    if (!(await this.persist(next, "웹 패널 상태를 저장하지 못했습니다"))) return;
+    if (
+      !(await this.persist(next, tr("Could not save the web pane state", "웹 패널 상태를 저장하지 못했습니다")))
+    ) {
+      return;
+    }
     if (!this.runtime.addBrowserPane(project.id, browser, true)) {
       this.runtime.setFooterStatus(
-        "웹 패널 상태는 저장했지만 실행 슬롯을 확보하지 못했습니다.",
+        tr(
+          "The web pane state was saved, but no runtime slot could be reserved.",
+          "웹 패널 상태는 저장했지만 실행 슬롯을 확보하지 못했습니다.",
+        ),
         "error",
       );
     }
@@ -1072,8 +1223,11 @@ export class Phase4WorkspaceController {
       const saved = await this.persistNow(
         next,
         completionPending
-          ? "완료 알림을 저장하지 못했습니다"
-          : "완료 알림 확인 상태를 저장하지 못했습니다",
+          ? tr("Could not save the completion notification", "완료 알림을 저장하지 못했습니다")
+          : tr(
+              "Could not save the completion-notification acknowledgement",
+              "완료 알림 확인 상태를 저장하지 못했습니다",
+            ),
       );
       if (!saved) return false;
       this.runtime.setTerminalCompletionPending(
@@ -1137,8 +1291,10 @@ export class Phase4WorkspaceController {
     const capacity = this.runtime.restoreCapacity(project, unloadingProjectId);
     if (capacity.allowed) return true;
     this.runtime.setFooterStatus(
-      `${project.name}을 열려면 PowerShell ${capacity.incoming}개 슬롯이 필요하지만 ` +
-        `${capacity.available}개만 남았습니다.`,
+      tr(
+        `Opening ${project.name} requires ${capacity.incoming} PowerShell slots, but only ${capacity.available} remain.`,
+        `${project.name}을 열려면 PowerShell ${capacity.incoming}개 슬롯이 필요하지만 ${capacity.available}개만 남았습니다.`,
+      ),
       "error",
     );
     return false;
@@ -1168,8 +1324,14 @@ export class Phase4WorkspaceController {
     if (!enabled && report) {
       this.runtime.setFooterStatus(
         this.upgradeInspection
-          ? "이전 Rust Preview 상태의 안전한 복사를 먼저 확인하세요."
-          : "Rust 작업 공간이 변경 가능한 상태가 아닙니다.",
+          ? tr(
+              "Review the safe copy of the previous Rust Preview state first.",
+              "이전 Rust Preview 상태의 안전한 복사를 먼저 확인하세요.",
+            )
+          : tr(
+              "The Rust workspace cannot be changed in its current state.",
+              "Rust 작업 공간이 변경 가능한 상태가 아닙니다.",
+            ),
         "error",
       );
     }
@@ -1257,7 +1419,10 @@ export class Phase4WorkspaceController {
         if (!this.shuttingDown) {
           if (this.elements.upgradeDialog.open) this.elements.upgradeDialog.close();
           this.runtime.setFooterStatus(
-            "이전 Rust Preview 작업을 canonical 저장소로 안전하게 복사했습니다.",
+            tr(
+              "The previous Rust Preview workspace was copied safely into canonical storage.",
+              "이전 Rust Preview 작업을 canonical 저장소로 안전하게 복사했습니다.",
+            ),
           );
         }
       } catch (error) {
@@ -1266,8 +1431,10 @@ export class Phase4WorkspaceController {
             await this.finishExternalReplacement(false);
             prepared = false;
           } catch (restoreError) {
-            this.elements.upgradeError.textContent =
-              `${errorMessage(error)} · 기존 상태 복원 실패: ${errorMessage(restoreError)}`;
+            this.elements.upgradeError.textContent = tr(
+              `${errorMessage(error)} · Failed to restore the previous state: ${errorMessage(restoreError)}`,
+              `${errorMessage(error)} · 기존 상태 복원 실패: ${errorMessage(restoreError)}`,
+            );
             return;
           }
         }
@@ -1321,15 +1488,32 @@ function normalizePhase3PreviewInspection(value: unknown): Phase3PreviewInspecti
 function storageAccessMessage(session: WorkspaceSession): string {
   switch (session.access) {
     case "readOnly":
-      return "다른 앱 창이 canonical 저장소를 사용 중이어서 읽기 전용입니다.";
+      return tr(
+        "Read-only because another app window is using canonical storage.",
+        "다른 앱 창이 canonical 저장소를 사용 중이어서 읽기 전용입니다.",
+      );
     case "recoveryRequired":
     case "recoveryPreview":
-      return "canonical 저장소 복구가 필요합니다.";
+      return tr("Canonical storage needs to be recovered.", "canonical 저장소 복구가 필요합니다.");
     case "unsupportedVersion":
-      return "더 새로운 canonical 저장소라 읽기 전용입니다.";
+      return tr(
+        "Read-only because canonical storage uses a newer format.",
+        "더 새로운 canonical 저장소라 읽기 전용입니다.",
+      );
     default:
-      return "canonical 저장소를 실행 가능한 상태로 불러오지 못했습니다.";
+      return tr(
+        "Canonical storage could not be loaded into a runnable state.",
+        "canonical 저장소를 실행 가능한 상태로 불러오지 못했습니다.",
+      );
   }
+}
+
+function localizeBuiltInTabTitle(title: string): string {
+  return isBuiltInTabTitle(title) ? tr("New tab", "새 탭") : title;
+}
+
+function isBuiltInTabTitle(title: string): boolean {
+  return title === "New tab" || title === "새 탭";
 }
 
 function createOpaqueId(): string {
@@ -1364,10 +1548,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function errorMessage(value: unknown): string {
-  if (value instanceof Error) return value.message;
+  if (value instanceof Error) return localizeBackendMessage(value.message);
   if (isRecord(value)) {
-    if (typeof value.message === "string") return value.message;
+    if (typeof value.message === "string") return localizeBackendMessage(value.message);
     if ("error" in value) return errorMessage(value.error);
   }
-  return String(value);
+  return localizeBackendMessage(String(value));
 }

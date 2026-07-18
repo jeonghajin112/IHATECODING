@@ -29,7 +29,7 @@ test("new projects use the native single-folder picker with narrow capability", 
     source("src-tauri/src/lib.rs"),
   ]);
   assert.match(html, /id="project-path"[\s\S]*readonly/);
-  assert.match(html, /id="select-project-folder"[\s\S]*폴더 선택/);
+  assert.match(html, /id="select-project-folder"[\s\S]*data-i18n-en="Choose folder"[\s\S]*Choose folder/);
   assert.match(main, /requireButton\("select-project-folder"\)/);
   assert.match(controller, /open\(\{[\s\S]*directory:\s*true,[\s\S]*multiple:\s*false/);
   assert.match(controller, /projectFolderPickerPending[\s\S]*finally/);
@@ -89,7 +89,7 @@ test("project browser panes restore their saved title and last accepted address"
   assert.match(controller, /createWorkspaceBrowserPane\(this\.idFactory\(\)\)/);
   assert.match(
     controller,
-    /await this\.persist\(next, "웹 패널 상태를 저장하지 못했습니다"\)[\s\S]*runtime\.addBrowserPane/,
+    /await this\.persist\([\s\S]*next,[\s\S]*tr\("Could not save the web pane state", "웹 패널 상태를 저장하지 못했습니다"\)[\s\S]*runtime\.addBrowserPane/,
   );
   assert.match(main, /this\.titleElement\.addEventListener\("dblclick"/);
   assert.match(main, /this\.workspace\.renameBrowserPane\(this\.id, title\)/);
@@ -286,7 +286,42 @@ test("manual tabs, compact project creation, and the mixed pane launcher are wir
   assert.match(main, /parsed\.username \|\| parsed\.password/);
   assert.match(
     controller,
-    /migrateLegacyAutomaticProjectTabsToManual\(current\)[\s\S]*persistNow\(migrated/,
+    /migrateLegacyAutomaticProjectTabsToManual\(current\)[\s\S]*persistNow\([\s\S]*migrated/,
+  );
+});
+
+test("settings expose localized General and Notifications tabs", async () => {
+  const [html, styles] = await Promise.all([
+    source("index.html"),
+    source("src/styles.css"),
+  ]);
+
+  assert.match(html, /<html lang="en">/);
+  assert.match(
+    html,
+    /class="settings-tabs"[\s\S]*role="tablist"[\s\S]*id="settings-general-tab"[\s\S]*role="tab"[\s\S]*aria-controls="settings-general-panel"[\s\S]*aria-selected="true"[\s\S]*id="settings-notifications-tab"[\s\S]*aria-controls="settings-notifications-panel"[\s\S]*aria-selected="false"/,
+  );
+  assert.match(
+    html,
+    /id="settings-general-panel"[\s\S]*role="tabpanel"[\s\S]*aria-labelledby="settings-general-tab"[\s\S]*id="app-language"[\s\S]*<option value="en">English<\/option>[\s\S]*<option value="ko">한국어<\/option>/,
+  );
+  assert.match(
+    html,
+    /id="settings-notifications-panel"[\s\S]*role="tabpanel"[\s\S]*aria-labelledby="settings-notifications-tab"[\s\S]*hidden[\s\S]*id="discord-notification-settings-title"[\s\S]*id="phone-notification-webhook"/,
+  );
+  assert.match(html, /data-i18n-en="Settings" data-i18n-ko="환경설정"/);
+  assert.match(
+    html,
+    /data-i18n-placeholder-en="Enter a new webhook URL"[\s\S]*data-i18n-placeholder-ko="새 웹훅 URL을 입력하세요"/,
+  );
+  assert.match(
+    styles,
+    /\.settings-layout\s*\{[\s\S]*grid-template-columns:\s*132px minmax\(0, 1fr\)/,
+  );
+  assert.match(styles, /\.settings-panel\[hidden\]\s*\{[\s\S]*display:\s*none/);
+  assert.match(
+    styles,
+    /@media \(max-width:\s*620px\)[\s\S]*\.settings-layout\s*\{[\s\S]*grid-template-columns:\s*minmax\(0, 1fr\)/,
   );
 });
 

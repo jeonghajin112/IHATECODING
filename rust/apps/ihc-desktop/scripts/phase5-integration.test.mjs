@@ -160,7 +160,7 @@ test("terminal answer selections expose reliable copy without resuming output fo
   assert.ok(copyStart >= 0 && copyEnd > copyStart);
 
   assert.match(main, /className = "terminal-window-action terminal-copy"/);
-  assert.match(main, /title = "선택한 답변 복사"/);
+  assert.match(main, /title = tr\("Copy selected response", "선택한 답변 복사"\)/);
   assert.match(
     handlers,
     /terminal\.onSelectionChange\(\(\) => \{[\s\S]*?copyButton\.hidden = !hasSelection;[\s\S]*?if \(hasSelection\) this\.pauseAutoFollow\(\)/,
@@ -635,7 +635,10 @@ test("usage, unread badges, and the single native clipboard snapshot are wired",
   assert.match(html, /viewBox="0 0 24 23"/);
   assert.match(main, /formatProviderResetCountdown\(limit\.resetsAt\)/);
   assert.match(main, /elements\.meter\.value = limit\.remainingPercent/);
-  assert.match(main, /elements\.value\.textContent = `\$\{rounded\}% 남음`/);
+  assert.match(
+    main,
+    /elements\.value\.textContent = tr\(`\$\{rounded\}% remaining`, `\$\{rounded\}% 남음`\)/,
+  );
   assert.match(main, /this\.renderLatestUsage\(\);\s*void this\.refresh\(\)/);
   assert.doesNotMatch(html, /RUST · NATIVE|RUST · ConPTY/);
   assert.doesNotMatch(
@@ -715,11 +718,11 @@ test("provider usage opens a compact account-aware popover above the status bar"
   assert.ok(limitsIndex >= 0 && accountIndex > limitsIndex && accountControlsIndex > accountIndex);
   assert.match(
     popover,
-    /id="provider-account-select"[\s\S]*aria-label="CLI 계정 선택"[\s\S]*id="add-provider-account"/,
+    /id="provider-account-select"[\s\S]*aria-label="Select CLI account"[\s\S]*data-i18n-aria-label-ko="CLI 계정 선택"[\s\S]*id="add-provider-account"/,
   );
   assert.match(
     popover,
-    /id="close-provider-usage"[\s\S]*type="button"[\s\S]*aria-label="사용량 상세 닫기"/,
+    /id="close-provider-usage"[\s\S]*type="button"[\s\S]*aria-label="Close usage details"[\s\S]*data-i18n-aria-label-ko="사용량 상세 닫기"/,
   );
   assert.doesNotMatch(popover, /provider-account-plan|<dt>\s*플랜\s*<\/dt>/);
   assert.doesNotMatch(popover, /provider-usage-detail-used|<dt>\s*사용\s*<\/dt>/);
@@ -762,18 +765,51 @@ test("provider usage opens a compact account-aware popover above the status bar"
   );
   assert.match(
     usageController,
-    /closeButton\.disabled = switching \|\| cancelling;[\s\S]*adding \? "계정 추가 취소하고 닫기"/,
+    /closeButton\.disabled = switching \|\| cancelling;[\s\S]*adding[\s\S]*tr\("Cancel account addition and close", "계정 추가 취소하고 닫기"\)/,
   );
   assert.match(
     usageController,
-    /closeButton\.setAttribute\([\s\S]*"aria-label",[\s\S]*adding \? "계정 추가 취소하고 닫기" : "사용량 상세 닫기"/,
+    /closeButton\.setAttribute\([\s\S]*"aria-label",[\s\S]*adding[\s\S]*tr\("Cancel account addition and close", "계정 추가 취소하고 닫기"\)[\s\S]*tr\("Close usage details", "사용량 상세 닫기"\)/,
   );
   assert.match(
     usageController,
     /positionDetail\(\)[\s\S]*getBoundingClientRect\(\)[\s\S]*const maximum = Math\.max\(8,[\s\S]*Math\.max\(8, Math\.min\(desired, maximum\)\)/,
   );
-  assert.match(usageController, /this\.setNativeOverlayOpen\(true\)/);
-  assert.match(usageController, /this\.setNativeOverlayOpen\(false\)/);
+  assert.match(
+    usageController,
+    /private readonly setNativeOverlayOpen: \(bounds: RectangleBounds \| null\) => void/,
+  );
+  const toggleStart = usageController.indexOf("private toggleDetail(");
+  const toggleEnd = usageController.indexOf("private closeDetail(", toggleStart);
+  const closeStart = toggleEnd;
+  const closeEnd = usageController.indexOf("private requestCloseDetail(", closeStart);
+  const positionStart = usageController.indexOf("private positionDetail(");
+  const positionEnd = usageController.indexOf("private async refreshAccount(", positionStart);
+  assert.ok(toggleStart >= 0 && toggleEnd > toggleStart);
+  assert.ok(closeStart >= 0 && closeEnd > closeStart);
+  assert.ok(positionStart >= 0 && positionEnd > positionStart);
+  const toggleDetail = usageController.slice(toggleStart, toggleEnd);
+  const closeDetail = usageController.slice(closeStart, closeEnd);
+  const positionDetail = usageController.slice(positionStart, positionEnd);
+  assert.match(
+    toggleDetail,
+    /detail\.popover\.hidden = false;[\s\S]*this\.positionDetail\(\)/,
+  );
+  assert.match(
+    positionDetail,
+    /popover\.style\.left[\s\S]*this\.syncNativeOverlayBounds\(\)[\s\S]*private syncNativeOverlayBounds\(\)[\s\S]*this\.setNativeOverlayOpen\([\s\S]*this\.detail\.popover\.hidden \? null : this\.detail\.popover\.getBoundingClientRect\(\)/,
+  );
+  assert.match(
+    closeDetail,
+    /detail\.popover\.hidden = true;[\s\S]*this\.setNativeOverlayOpen\(null\)/,
+  );
+  assert.match(
+    usageController,
+    /dispose\(\)[\s\S]*detail\.popover\.hidden = true;[\s\S]*this\.setNativeOverlayOpen\(null\)/,
+  );
+  assert.doesNotMatch(usageController, /setNativeOverlayOpen\((?:true|false)\)/);
+  assert.doesNotMatch(toggleDetail, /\.hide\(|\.close\(|\.dispose\(/);
+  assert.doesNotMatch(closeDetail, /\.hide\(|\.close\(|\.dispose\(/);
   assert.doesNotMatch(usageController, /\.showModal\(\)/);
 
   assert.match(
@@ -801,14 +837,46 @@ test("provider usage opens a compact account-aware popover above the status bar"
     usageController,
     /private async addAccount\(\)[\s\S]*await this\.ensureAccountSwitchReady\(\)[\s\S]*add_provider_account/,
   );
-  assert.match(main, /\(open\) => workspace\.setNativeOverlayOpen\(open\)/);
+  assert.match(main, /\(bounds\) => workspace\.setNativeOverlayOpen\(bounds\)/);
+  const browserPaneStart = main.indexOf("class BrowserPane");
+  const browserPaneEnd = main.indexOf("type LayoutPane", browserPaneStart);
+  assert.ok(browserPaneStart >= 0 && browserPaneEnd > browserPaneStart);
+  const browserPane = main.slice(browserPaneStart, browserPaneEnd);
   assert.match(
-    main,
-    /setNativeOverlayOpen\(open: boolean\)[\s\S]*setBrowserSuspensionReason\("provider-usage", open\)/,
+    browserPane,
+    /overlapsNativeOverlay\(bounds: RectangleBounds\)[\s\S]*rectanglesOverlap\(this\.viewport\.getBoundingClientRect\(\), bounds\)/,
+  );
+  const overlapStart = browserPane.indexOf("overlapsNativeOverlay(");
+  const overlapEnd = browserPane.indexOf("scheduleFit(", overlapStart);
+  assert.ok(overlapStart >= 0 && overlapEnd > overlapStart);
+  assert.doesNotMatch(
+    browserPane.slice(overlapStart, overlapEnd),
+    /\.hide\(|\.close\(|\.dispose\(/,
+  );
+
+  const workspaceStart = main.indexOf("class TerminalWorkspace");
+  const workspaceEnd = main.indexOf("class BrowserController", workspaceStart);
+  assert.ok(workspaceStart >= 0 && workspaceEnd > workspaceStart);
+  const workspace = main.slice(workspaceStart, workspaceEnd);
+  assert.match(
+    workspace,
+    /providerUsageOverlayBounds: RectangleBounds \| null = null/,
   );
   assert.match(
-    main,
-    /browserSuspensionReasons = new Set<string>\(\)[\s\S]*setBrowserSuspensionReason\(reason: string, suspended: boolean\)[\s\S]*browserSuspensionReasons\.size > 0/,
+    workspace,
+    /setNativeOverlayOpen\(bounds: RectangleBounds \| null\)[\s\S]*providerUsageOverlayBounds = bounds/,
+  );
+  assert.doesNotMatch(
+    workspace,
+    /setNativeOverlayOpen\(bounds: RectangleBounds \| null\)[\s\S]{0,500}setBrowserSuspensionReason\("provider-usage"/,
+  );
+  assert.match(
+    workspace,
+    /const globallySuspended = this\.browserSuspensionReasons\.size > 0;[\s\S]*const overlapsProviderUsage = this\.providerUsageOverlayBounds[\s\S]*pane\.overlapsNativeOverlay\(this\.providerUsageOverlayBounds\)[\s\S]*pane\.setInteractionSuspended\(globallySuspended \|\| overlapsProviderUsage\)/,
+  );
+  assert.match(
+    workspace,
+    /setModalOverlayOpen\(reason: string, open: boolean\)[\s\S]*setBrowserSuspensionReason\(`modal:\$\{reason\}`, open\)/,
   );
   assert.match(main, /setModalOverlayOpen\("settings", open\)/);
   assert.match(
@@ -932,16 +1000,19 @@ test("Discord phone notifications keep webhooks private and bind display names e
 
   assert.match(html, /id="open-settings"/);
   assert.match(html, /id="settings-dialog"[\s\S]*aria-labelledby="settings-title"/);
-  assert.match(html, /id="settings-title">환경설정</);
+  assert.match(html, /id="settings-title"[\s\S]*data-i18n-en="Settings"[\s\S]*data-i18n-ko="환경설정"/);
   assert.match(html, /class="settings-section"[\s\S]*aria-labelledby="discord-notification-settings-title"/);
-  assert.match(html, /id="discord-notification-settings-title">Discord 휴대폰 알림/);
+  assert.match(
+    html,
+    /id="discord-notification-settings-title"[\s\S]*data-i18n-en="Discord notifications"[\s\S]*data-i18n-ko="Discord 휴대폰 알림"/,
+  );
   assert.doesNotMatch(html, /id="open-phone-notifications"|phone-notification-sidebar-status/);
   assert.match(html, /id="phone-notification-webhook"[\s\S]*type="password"/);
   assert.match(html, /id="remove-phone-notification-webhook"/);
-  assert.match(html, /연동 → 웹후크에서 웹후크를 만들고 URL 복사/);
+  assert.match(html, /data-i18n-en="2\. Under Integrations → Webhooks[\s\S]*data-i18n-ko="2\. 연동 → 웹후크에서 웹후크를 만들고 URL 복사/);
   assert.match(
     html,
-    /프로젝트명, CLI 이름, 완료\/오류 상태만 전송합니다[\s\S]*경로, PID, 프롬프트, 답변과 원문 오류는 보내지 않습니다/,
+    /data-i18n-en="Only the project name, CLI name[\s\S]*data-i18n-ko="프로젝트명, CLI 이름, 완료\/오류 상태만 전송합니다[\s\S]*경로, PID, 프롬프트, 답변과 원문 오류는 보내지 않습니다/,
   );
   assert.doesNotMatch(html, /비공개 토픽|phone-notification-topic/);
   assert.match(styles, /\.settings-button\s*\{[\s\S]*grid-template-columns/);
@@ -963,6 +1034,7 @@ test("Discord phone notifications keep webhooks private and bind display names e
   assert.match(backgroundSend, /while \(!this\.disposed\)[\s\S]*deliveryQueue\.shift\(\)[\s\S]*await this\.deliverWithRetry\(delivery\)/);
   assert.match(backgroundSend, /projectName:\s*delivery\.labels\.projectName/);
   assert.match(backgroundSend, /terminalName:\s*delivery\.labels\.terminalName/);
+  assert.match(backgroundSend, /language:\s*getAppLanguage\(\)/);
   assert.match(backgroundSend, /PHONE_NOTIFICATION_RETRY_DELAYS_MS\[attempt\]/);
   assert.match(main, /PHONE_NOTIFICATION_RETRY_DELAYS_MS = \[1_500, 4_000\]/);
   assert.match(main, /dispose\(\)[\s\S]*deliveryQueue\.length = 0[\s\S]*retryWaiters/);
@@ -1000,7 +1072,7 @@ test("Discord phone notifications keep webhooks private and bind display names e
   );
   assert.match(
     main,
-    /exit\.exitCode !== null && exit\.exitCode !== 0[\s\S]*this\.notifyPhoneErrorOnce\(\)[\s\S]*this\.setState\("exited"/,
+    /exit\.exitCode !== null && exit\.exitCode !== 0[\s\S]*this\.notifyPhoneErrorOnce\(\)[\s\S]*this\.setState\([\s\S]*"exited"/,
   );
   assert.match(main, /if \(this\.disposed \|\| this\.phoneErrorNotifiedEpoch === this\.lifecycleEpoch\) return/);
   assert.match(main, /return `\$\{prefix\}:\$\{Date\.now\(\)\}:\$\{phoneNotificationEventSequence\}`/);
@@ -1010,6 +1082,7 @@ test("Discord phone notifications keep webhooks private and bind display names e
   assert.match(backend, /Only official Discord webhook hosts are supported/);
   assert.match(backend, /project_name:\s*String/);
   assert.match(backend, /terminal_name:\s*String/);
+  assert.match(backend, /language:\s*Option<String>/);
   assert.match(backend, /"allowed_mentions": \{ "parse": \[\] \}/);
   assert.doesNotMatch(backend, /WinHttpQueryDataAvailable|WinHttpReadData/);
   assert.doesNotMatch(backend, /request\.(prompt|output|path|conversation|token|error_message)/i);

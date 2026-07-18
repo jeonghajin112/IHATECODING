@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="ko">
+<html lang="en">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -9,7 +9,12 @@
   </head>
   <body>
     <main id="app" class="shell" data-workspace-view="empty">
-      <aside class="project-sidebar" aria-label="프로젝트">
+      <aside
+        class="project-sidebar"
+        aria-label="Projects"
+        data-i18n-aria-label-en="Projects"
+        data-i18n-aria-label-ko="프로젝트"
+      >
         <div class="project-section-heading">
           <button
             id="toggle-project-list"
@@ -17,24 +22,38 @@
             type="button"
             aria-controls="project-list"
             aria-expanded="true"
-            aria-label="프로젝트 목록 접기"
-            title="프로젝트 목록 접기"
+            aria-label="Collapse project list"
+            title="Collapse project list"
+            data-i18n-aria-label-en="Collapse project list"
+            data-i18n-aria-label-ko="프로젝트 목록 접기"
+            data-i18n-title-en="Collapse project list"
+            data-i18n-title-ko="프로젝트 목록 접기"
           >
             <span class="project-list-chevron" aria-hidden="true">›</span>
-            <span>프로젝트</span>
+            <span data-i18n-en="Projects" data-i18n-ko="프로젝트">Projects</span>
           </button>
           <button
             id="create-project"
             class="create-project"
             type="button"
-            title="새 프로젝트"
-            aria-label="새 프로젝트"
+            title="New project"
+            aria-label="New project"
+            data-i18n-title-en="New project"
+            data-i18n-title-ko="새 프로젝트"
+            data-i18n-aria-label-en="New project"
+            data-i18n-aria-label-ko="새 프로젝트"
             disabled
           >
             ＋
           </button>
         </div>
-        <nav id="project-list" class="project-list" aria-label="저장된 프로젝트"></nav>
+        <nav
+          id="project-list"
+          class="project-list"
+          aria-label="Saved projects"
+          data-i18n-aria-label-en="Saved projects"
+          data-i18n-aria-label-ko="저장된 프로젝트"
+        ></nav>
         <div class="sidebar-footer">
           <button
             id="open-settings"
@@ -42,31 +61,46 @@
             type="button"
             aria-haspopup="dialog"
             aria-controls="settings-dialog"
-            aria-label="환경설정 열기"
-            title="환경설정"
+            aria-label="Open settings"
+            title="Settings"
+            data-i18n-aria-label-en="Open settings"
+            data-i18n-aria-label-ko="환경설정 열기"
+            data-i18n-title-en="Settings"
+            data-i18n-title-ko="환경설정"
             disabled
           >
             <svg viewBox="0 0 16 16" aria-hidden="true" fill="none">
               <path d="M6.7 1.6h2.6l.42 1.45c.35.13.69.33.99.57l1.48-.36 1.3 2.25-1.05 1.1c.03.2.05.4.05.59s-.02.39-.05.59l1.05 1.1-1.3 2.25-1.48-.36c-.3.24-.64.44-.99.57L9.3 12.8H6.7l-.42-1.45a4.3 4.3 0 0 1-.99-.57l-1.48.36-1.3-2.25 1.05-1.1a3.8 3.8 0 0 1 0-1.18l-1.05-1.1 1.3-2.25 1.48.36c.3-.24.64-.44.99-.57L6.7 1.6Z" />
               <circle cx="8" cy="7.2" r="1.65" />
             </svg>
-            <span>환경설정</span>
+            <span data-i18n-en="Settings" data-i18n-ko="환경설정">Settings</span>
           </button>
           <button id="open-phase3-upgrade" class="compatibility-recovery" type="button" hidden>
-            이전 작업 복구
+            <span data-i18n-en="Recover previous workspace" data-i18n-ko="이전 작업 복구">
+              Recover previous workspace
+            </span>
           </button>
         </div>
       </aside>
 
       <section class="main-shell">
-        <nav class="workspace-tabs" aria-label="작업 탭">
+        <nav
+          class="workspace-tabs"
+          aria-label="Workspace tabs"
+          data-i18n-aria-label-en="Workspace tabs"
+          data-i18n-aria-label-ko="작업 탭"
+        >
           <div id="workspace-tab-list" class="workspace-tab-list"></div>
           <button
             id="add-workspace-tab"
             class="add-workspace-tab"
             type="button"
-            title="빈 탭 열기"
-            aria-label="빈 탭 열기"
+            title="Open blank tab"
+            aria-label="Open blank tab"
+            data-i18n-title-en="Open blank tab"
+            data-i18n-title-ko="빈 탭 열기"
+            data-i18n-aria-label-en="Open blank tab"
+            data-i18n-aria-label-ko="빈 탭 열기"
             disabled
           >
             ＋
@@ -83,17 +117,23 @@
               aria-expanded="false"
               disabled
             >
-              <span>＋ 추가</span>
+              <span data-i18n-en="＋ Add" data-i18n-ko="＋ 추가">＋ Add</span>
               <span class="pane-launcher-chevron" aria-hidden="true">⌄</span>
             </button>
             <div id="pane-launcher-menu" class="pane-launcher-menu" role="menu" hidden>
               <button id="add-powershell-pane" type="button" role="menuitem">
                 <span class="pane-launcher-icon" aria-hidden="true">&gt;_</span>
-                <span><strong>PowerShell</strong><small>새 터미널</small></span>
+                <span>
+                  <strong>PowerShell</strong>
+                  <small data-i18n-en="New terminal" data-i18n-ko="새 터미널">New terminal</small>
+                </span>
               </button>
               <button id="add-browser-pane" type="button" role="menuitem">
                 <span class="pane-launcher-icon" aria-hidden="true">◎</span>
-                <span><strong>웹 브라우저</strong><small>분할 화면</small></span>
+                <span>
+                  <strong data-i18n-en="Web browser" data-i18n-ko="웹 브라우저">Web browser</strong>
+                  <small data-i18n-en="Split pane" data-i18n-ko="분할 화면">Split pane</small>
+                </span>
               </button>
             </div>
           </div>
@@ -101,34 +141,58 @@
         </header>
 
         <section id="workspace-stage" class="workspace-stage">
-          <section id="blank-tab-surface" class="blank-tab-surface" aria-label="빈 작업 탭">
+          <section
+            id="blank-tab-surface"
+            class="blank-tab-surface"
+            aria-label="Blank workspace tab"
+            data-i18n-aria-label-en="Blank workspace tab"
+            data-i18n-aria-label-ko="빈 작업 탭"
+          >
             <span class="empty-glyph">＋</span>
-            <strong>빈 탭입니다</strong>
-            <span>왼쪽에서 프로젝트를 선택하면 이 탭에 프로젝트가 열립니다.</span>
+            <strong data-i18n-en="This tab is empty" data-i18n-ko="빈 탭입니다">This tab is empty</strong>
+            <span
+              data-i18n-en="Select a project on the left to open it in this tab."
+              data-i18n-ko="왼쪽에서 프로젝트를 선택하면 이 탭에 프로젝트가 열립니다."
+            >Select a project on the left to open it in this tab.</span>
           </section>
 
           <section
             id="terminal-surface"
             class="terminal-grid"
-            aria-label="프로젝트 분할 작업 공간"
+            aria-label="Project split workspace"
+            data-i18n-aria-label-en="Project split workspace"
+            data-i18n-aria-label-ko="프로젝트 분할 작업 공간"
           >
             <div id="empty-workspace" class="empty-workspace">
               <span class="empty-glyph">&gt;_</span>
-              <strong>열려 있는 PowerShell이 없습니다</strong>
-              <span>＋ 추가에서 PowerShell이나 웹 브라우저를 선택하세요.</span>
+              <strong
+                data-i18n-en="No PowerShell panes are open"
+                data-i18n-ko="열려 있는 PowerShell이 없습니다"
+              >No PowerShell panes are open</strong>
+              <span
+                data-i18n-en="Choose PowerShell or Web browser from ＋ Add."
+                data-i18n-ko="＋ 추가에서 PowerShell이나 웹 브라우저를 선택하세요."
+              >Choose PowerShell or Web browser from ＋ Add.</span>
             </div>
           </section>
 
         </section>
 
         <footer class="statusbar">
-          <section class="provider-usage" aria-label="AI 남은 사용량">
+          <section
+            class="provider-usage"
+            aria-label="Remaining AI usage"
+            data-i18n-aria-label-en="Remaining AI usage"
+            data-i18n-aria-label-ko="AI 남은 사용량"
+          >
             <button
               id="codex-usage-trigger"
               class="provider-usage-item"
               data-provider="codex"
               type="button"
-              aria-label="Codex 남은 한도 상세 보기"
+              aria-label="View Codex remaining limits"
+              data-i18n-aria-label-en="View Codex remaining limits"
+              data-i18n-aria-label-ko="Codex 남은 한도 상세 보기"
               aria-haspopup="dialog"
               aria-controls="provider-usage-popover"
               aria-expanded="false"
@@ -138,14 +202,30 @@
               </svg>
               <span class="provider-name">CODEX</span>
               <span id="codex-five-hour-usage" class="usage-limit" data-available="false">
-                <span class="usage-label">5시간</span>
-                <progress class="usage-meter" max="100" value="0" aria-label="Codex 5시간 남은 한도" hidden></progress>
+                <span class="usage-label" data-i18n-en="5-hour" data-i18n-ko="5시간">5-hour</span>
+                <progress
+                  class="usage-meter"
+                  max="100"
+                  value="0"
+                  aria-label="Codex 5-hour remaining limit"
+                  data-i18n-aria-label-en="Codex 5-hour remaining limit"
+                  data-i18n-aria-label-ko="Codex 5시간 남은 한도"
+                  hidden
+                ></progress>
                 <span id="codex-five-hour-remaining" class="usage-value">--</span>
                 <span class="usage-reset" hidden></span>
               </span>
               <span id="codex-weekly-usage" class="usage-limit" data-available="false">
-                <span class="usage-label">주간</span>
-                <progress class="usage-meter" max="100" value="0" aria-label="Codex 주간 남은 한도" hidden></progress>
+                <span class="usage-label" data-i18n-en="Weekly" data-i18n-ko="주간">Weekly</span>
+                <progress
+                  class="usage-meter"
+                  max="100"
+                  value="0"
+                  aria-label="Codex weekly remaining limit"
+                  data-i18n-aria-label-en="Codex weekly remaining limit"
+                  data-i18n-aria-label-ko="Codex 주간 남은 한도"
+                  hidden
+                ></progress>
                 <span id="codex-weekly-remaining" class="usage-value">--</span>
                 <span class="usage-reset" hidden></span>
               </span>
@@ -155,7 +235,9 @@
               class="provider-usage-item"
               data-provider="grok"
               type="button"
-              aria-label="Grok 남은 한도 상세 보기"
+              aria-label="View Grok remaining limit"
+              data-i18n-aria-label-en="View Grok remaining limit"
+              data-i18n-aria-label-ko="Grok 남은 한도 상세 보기"
               aria-haspopup="dialog"
               aria-controls="provider-usage-popover"
               aria-expanded="false"
@@ -165,8 +247,16 @@
               </svg>
               <span class="provider-name">GROK</span>
               <span id="grok-weekly-usage" class="usage-limit" data-available="false">
-                <span class="usage-label">주간</span>
-                <progress class="usage-meter" max="100" value="0" aria-label="Grok 주간 남은 한도" hidden></progress>
+                <span class="usage-label" data-i18n-en="Weekly" data-i18n-ko="주간">Weekly</span>
+                <progress
+                  class="usage-meter"
+                  max="100"
+                  value="0"
+                  aria-label="Grok weekly remaining limit"
+                  data-i18n-aria-label-en="Grok weekly remaining limit"
+                  data-i18n-aria-label-ko="Grok 주간 남은 한도"
+                  hidden
+                ></progress>
                 <span id="grok-remaining" class="usage-value">--</span>
                 <span class="usage-reset" hidden></span>
               </span>
@@ -187,56 +277,85 @@
                 id="close-provider-usage"
                 class="provider-usage-popover-close"
                 type="button"
-                aria-label="사용량 상세 닫기"
-                title="닫기"
+                aria-label="Close usage details"
+                title="Close"
+                data-i18n-aria-label-en="Close usage details"
+                data-i18n-aria-label-ko="사용량 상세 닫기"
+                data-i18n-title-en="Close"
+                data-i18n-title-ko="닫기"
               >
                 ×
               </button>
             </header>
 
-            <div class="provider-usage-detail-limits" aria-label="남은 사용량">
+            <div
+              class="provider-usage-detail-limits"
+              aria-label="Remaining usage"
+              data-i18n-aria-label-en="Remaining usage"
+              data-i18n-aria-label-ko="남은 사용량"
+            >
               <article id="provider-usage-detail-five-hour" class="provider-usage-detail-limit">
                 <div class="provider-usage-detail-limit-heading">
-                  <span>5시간 한도</span>
+                  <span data-i18n-en="5-hour limit" data-i18n-ko="5시간 한도">5-hour limit</span>
                   <strong class="provider-usage-detail-remaining">--</strong>
                 </div>
                 <progress
                   class="provider-usage-detail-meter"
                   max="100"
                   value="0"
-                  aria-label="5시간 남은 한도"
+                  aria-label="5-hour remaining limit"
+                  data-i18n-aria-label-en="5-hour remaining limit"
+                  data-i18n-aria-label-ko="5시간 남은 한도"
                 ></progress>
                 <p class="provider-usage-detail-reset-row">
-                  <span>초기화</span>
+                  <span data-i18n-en="Resets" data-i18n-ko="초기화">Resets</span>
                   <time class="provider-usage-detail-reset">--</time>
                 </p>
               </article>
 
               <article id="provider-usage-detail-weekly" class="provider-usage-detail-limit">
                 <div class="provider-usage-detail-limit-heading">
-                  <span>주간 한도</span>
+                  <span data-i18n-en="Weekly limit" data-i18n-ko="주간 한도">Weekly limit</span>
                   <strong class="provider-usage-detail-remaining">--</strong>
                 </div>
                 <progress
                   class="provider-usage-detail-meter"
                   max="100"
                   value="0"
-                  aria-label="주간 남은 한도"
+                  aria-label="Weekly remaining limit"
+                  data-i18n-aria-label-en="Weekly remaining limit"
+                  data-i18n-aria-label-ko="주간 남은 한도"
                 ></progress>
                 <p class="provider-usage-detail-reset-row">
-                  <span>초기화</span>
+                  <span data-i18n-en="Resets" data-i18n-ko="초기화">Resets</span>
                   <time class="provider-usage-detail-reset">--</time>
                 </p>
               </article>
             </div>
 
             <section class="provider-account-detail" aria-labelledby="provider-account-detail-title">
-              <span id="provider-account-detail-title" class="provider-account-label">계정</span>
+              <span
+                id="provider-account-detail-title"
+                class="provider-account-label"
+                data-i18n-en="Account"
+                data-i18n-ko="계정"
+              >Account</span>
               <div class="provider-account-controls">
-                <select id="provider-account-select" aria-label="CLI 계정 선택" disabled>
-                  <option>확인 중</option>
+                <select
+                  id="provider-account-select"
+                  aria-label="Select CLI account"
+                  data-i18n-aria-label-en="Select CLI account"
+                  data-i18n-aria-label-ko="CLI 계정 선택"
+                  disabled
+                >
+                  <option data-i18n-en="Checking…" data-i18n-ko="확인 중">Checking…</option>
                 </select>
-                <button id="add-provider-account" type="button">+ 추가</button>
+                <button
+                  id="add-provider-account"
+                  type="button"
+                  data-i18n-en="+ Add"
+                  data-i18n-ko="+ 추가"
+                >+ Add</button>
               </div>
               <p id="provider-account-state" class="provider-detail-state" role="status" aria-live="polite"></p>
             </section>
@@ -249,34 +368,50 @@
       <dialog id="project-dialog" class="project-dialog" aria-labelledby="project-dialog-title">
         <form id="project-form" method="dialog">
           <div class="dialog-heading">
-            <strong id="project-dialog-title">새 프로젝트</strong>
-            <span>프로젝트 이름과 작업할 폴더를 선택하세요.</span>
+            <strong id="project-dialog-title" data-i18n-en="New project" data-i18n-ko="새 프로젝트">
+              New project
+            </strong>
+            <span
+              data-i18n-en="Choose a project name and working folder."
+              data-i18n-ko="프로젝트 이름과 작업할 폴더를 선택하세요."
+            >Choose a project name and working folder.</span>
           </div>
           <label>
-            <span>이름</span>
+            <span data-i18n-en="Name" data-i18n-ko="이름">Name</span>
             <input id="project-name" name="project-name" maxlength="50" autocomplete="off" required />
           </label>
           <div class="project-path-field">
-            <label for="project-path">폴더 경로</label>
+            <label for="project-path" data-i18n-en="Folder path" data-i18n-ko="폴더 경로">
+              Folder path
+            </label>
             <div class="project-path-row">
               <input
                 id="project-path"
                 name="project-path"
-                placeholder="폴더를 선택하세요"
+                placeholder="Choose a folder"
+                data-i18n-placeholder-en="Choose a folder"
+                data-i18n-placeholder-ko="폴더를 선택하세요"
                 autocomplete="off"
                 spellcheck="false"
                 readonly
                 required
               />
               <button id="select-project-folder" class="folder-picker-button" type="button">
-                폴더 선택
+                <span data-i18n-en="Choose folder" data-i18n-ko="폴더 선택">Choose folder</span>
               </button>
             </div>
           </div>
           <p id="project-form-error" class="project-form-error" role="alert"></p>
           <div class="dialog-actions">
-            <button id="cancel-project" type="button">취소</button>
-            <button class="dialog-submit" type="submit">프로젝트 만들기</button>
+            <button id="cancel-project" type="button" data-i18n-en="Cancel" data-i18n-ko="취소">
+              Cancel
+            </button>
+            <button
+              class="dialog-submit"
+              type="submit"
+              data-i18n-en="Create project"
+              data-i18n-ko="프로젝트 만들기"
+            >Create project</button>
           </div>
         </form>
       </dialog>
@@ -288,73 +423,205 @@
       >
         <form id="settings-form">
           <div class="dialog-heading">
-            <strong id="settings-title">환경설정</strong>
-            <span>IHATECODING의 알림과 동작 방식을 관리합니다.</span>
+            <strong id="settings-title" data-i18n-en="Settings" data-i18n-ko="환경설정">
+              Settings
+            </strong>
+            <span
+              data-i18n-en="Manage the language, notifications, and behavior of IHATECODING."
+              data-i18n-ko="IHATECODING의 언어, 알림과 동작 방식을 관리합니다."
+            >Manage the language, notifications, and behavior of IHATECODING.</span>
           </div>
 
-          <section class="settings-section" aria-labelledby="discord-notification-settings-title">
-            <div class="settings-section-heading">
-              <strong id="discord-notification-settings-title">Discord 휴대폰 알림</strong>
-              <span>CLI 작업 완료와 오류를 Discord 채널로 알려줍니다.</span>
+          <div class="settings-layout">
+            <nav
+              class="settings-tabs"
+              role="tablist"
+              aria-label="Settings sections"
+              data-i18n-aria-label-en="Settings sections"
+              data-i18n-aria-label-ko="환경설정 섹션"
+            >
+              <button
+                id="settings-general-tab"
+                type="button"
+                role="tab"
+                aria-controls="settings-general-panel"
+                aria-selected="true"
+                tabindex="0"
+                data-i18n-en="General"
+                data-i18n-ko="일반"
+              >General</button>
+              <button
+                id="settings-notifications-tab"
+                type="button"
+                role="tab"
+                aria-controls="settings-notifications-panel"
+                aria-selected="false"
+                tabindex="-1"
+                data-i18n-en="Notifications"
+                data-i18n-ko="알림"
+              >Notifications</button>
+            </nav>
+
+            <div class="settings-panels">
+              <section
+                id="settings-general-panel"
+                class="settings-panel"
+                role="tabpanel"
+                aria-labelledby="settings-general-tab"
+                tabindex="0"
+              >
+                <section class="settings-section" aria-labelledby="language-settings-title">
+                  <div class="settings-section-heading">
+                    <strong id="language-settings-title" data-i18n-en="Language" data-i18n-ko="언어">
+                      Language
+                    </strong>
+                    <span
+                      data-i18n-en="Choose the language used by the application interface."
+                      data-i18n-ko="프로그램 화면에 사용할 언어를 선택합니다."
+                    >Choose the language used by the application interface.</span>
+                  </div>
+
+                  <label class="settings-language-field" for="app-language">
+                    <span data-i18n-en="Application language" data-i18n-ko="프로그램 언어">
+                      Application language
+                    </span>
+                    <select id="app-language" name="app-language">
+                      <option value="en">English</option>
+                      <option value="ko">한국어</option>
+                    </select>
+                  </label>
+                  <small
+                    class="settings-language-hint"
+                    data-i18n-en="Korean is selected automatically on Korean-language PCs. English is the default everywhere else."
+                    data-i18n-ko="한국어로 설정된 PC에서는 한국어가 자동 선택되며, 그 외 환경에서는 영어가 기본값입니다."
+                  >Korean is selected automatically on Korean-language PCs. English is the default everywhere else.</small>
+                </section>
+              </section>
+
+              <section
+                id="settings-notifications-panel"
+                class="settings-panel"
+                role="tabpanel"
+                aria-labelledby="settings-notifications-tab"
+                tabindex="0"
+                hidden
+              >
+                <section class="settings-section" aria-labelledby="discord-notification-settings-title">
+                  <div class="settings-section-heading">
+                    <strong
+                      id="discord-notification-settings-title"
+                      data-i18n-en="Discord notifications"
+                      data-i18n-ko="Discord 휴대폰 알림"
+                    >Discord notifications</strong>
+                    <span
+                      data-i18n-en="Send CLI completion and error notifications to a Discord channel."
+                      data-i18n-ko="CLI 작업 완료와 오류를 Discord 채널로 알려줍니다."
+                    >Send CLI completion and error notifications to a Discord channel.</span>
+                  </div>
+
+                  <label class="phone-notification-toggle phone-notification-master">
+                    <input id="phone-notification-enabled" type="checkbox" />
+                    <span data-i18n-en="Enable mobile notifications" data-i18n-ko="휴대폰 알림 사용">
+                      Enable mobile notifications
+                    </span>
+                  </label>
+
+                  <div class="phone-notification-webhook-field">
+                    <div class="phone-notification-webhook-heading">
+                      <label
+                        for="phone-notification-webhook"
+                        data-i18n-en="Discord webhook URL"
+                        data-i18n-ko="Discord 웹훅 URL"
+                      >Discord webhook URL</label>
+                      <span
+                        id="phone-notification-webhook-state"
+                        data-i18n-en="Not configured"
+                        data-i18n-ko="등록 안 됨"
+                      >Not configured</span>
+                    </div>
+                    <div class="phone-notification-webhook-row">
+                      <input
+                        id="phone-notification-webhook"
+                        type="password"
+                        inputmode="url"
+                        autocomplete="new-password"
+                        autocapitalize="off"
+                        spellcheck="false"
+                        aria-describedby="phone-notification-webhook-help"
+                        placeholder="Enter a new webhook URL"
+                        data-i18n-placeholder-en="Enter a new webhook URL"
+                        data-i18n-placeholder-ko="새 웹훅 URL을 입력하세요"
+                      />
+                      <button
+                        id="remove-phone-notification-webhook"
+                        type="button"
+                        data-i18n-en="Remove"
+                        data-i18n-ko="제거"
+                      >Remove</button>
+                    </div>
+                    <small
+                      id="phone-notification-webhook-help"
+                      data-i18n-en="Saved URLs are never displayed again. Leave this blank to keep the existing URL."
+                      data-i18n-ko="저장된 URL은 다시 표시하지 않습니다. 비워두면 기존 URL을 유지합니다."
+                    >Saved URLs are never displayed again. Leave this blank to keep the existing URL.</small>
+                  </div>
+
+                  <div class="phone-notification-guide">
+                    <span
+                      data-i18n-en="1. Open the settings for the Discord channel that will receive notifications."
+                      data-i18n-ko="1. Discord 서버에서 알림을 받을 채널의 설정을 엽니다."
+                    >1. Open the settings for the Discord channel that will receive notifications.</span>
+                    <span
+                      data-i18n-en="2. Under Integrations → Webhooks, create a webhook and choose Copy Webhook URL."
+                      data-i18n-ko="2. 연동 → 웹후크에서 웹후크를 만들고 URL 복사를 누릅니다."
+                    >2. Under Integrations → Webhooks, create a webhook and choose Copy Webhook URL.</span>
+                    <span
+                      data-i18n-en="3. Paste the copied URL above, then save your settings."
+                      data-i18n-ko="3. 복사한 URL을 위 입력란에 붙여넣고 저장합니다."
+                    >3. Paste the copied URL above, then save your settings.</span>
+                    <small
+                      data-i18n-en="Only the project name, CLI name, and completion or error state are sent. Paths, PIDs, prompts, responses, and raw errors are never sent."
+                      data-i18n-ko="프로젝트명, CLI 이름, 완료/오류 상태만 전송합니다. 경로, PID, 프롬프트, 답변과 원문 오류는 보내지 않습니다."
+                    >Only the project name, CLI name, and completion or error state are sent. Paths, PIDs, prompts, responses, and raw errors are never sent.</small>
+                  </div>
+
+                  <fieldset class="phone-notification-kinds">
+                    <legend data-i18n-en="Notify me when" data-i18n-ko="알림 받을 때">Notify me when</legend>
+                    <label class="phone-notification-toggle">
+                      <input id="phone-notification-success" type="checkbox" />
+                      <span data-i18n-en="Work completes" data-i18n-ko="작업 완료">Work completes</span>
+                    </label>
+                    <label class="phone-notification-toggle">
+                      <input id="phone-notification-error" type="checkbox" />
+                      <span data-i18n-en="An error occurs" data-i18n-ko="작업 오류">An error occurs</span>
+                    </label>
+                  </fieldset>
+
+                  <p
+                    id="phone-notification-status"
+                    class="phone-notification-status"
+                    role="status"
+                    aria-live="polite"
+                  ></p>
+                </section>
+              </section>
             </div>
-
-            <label class="phone-notification-toggle phone-notification-master">
-              <input id="phone-notification-enabled" type="checkbox" />
-              <span>휴대폰 알림 사용</span>
-            </label>
-
-            <div class="phone-notification-webhook-field">
-              <div class="phone-notification-webhook-heading">
-                <label for="phone-notification-webhook">Discord 웹훅 URL</label>
-                <span id="phone-notification-webhook-state">등록 안 됨</span>
-              </div>
-              <div class="phone-notification-webhook-row">
-                <input
-                  id="phone-notification-webhook"
-                  type="password"
-                  inputmode="url"
-                  autocomplete="new-password"
-                  autocapitalize="off"
-                  spellcheck="false"
-                  aria-describedby="phone-notification-webhook-help"
-                  placeholder="새 웹훅 URL을 입력하세요"
-                />
-                <button id="remove-phone-notification-webhook" type="button">제거</button>
-              </div>
-              <small id="phone-notification-webhook-help">저장된 URL은 다시 표시하지 않습니다. 비워두면 기존 URL을 유지합니다.</small>
-            </div>
-
-            <div class="phone-notification-guide">
-              <span>1. Discord 서버에서 알림을 받을 채널의 설정을 엽니다.</span>
-              <span>2. 연동 → 웹후크에서 웹후크를 만들고 URL 복사를 누릅니다.</span>
-              <span>3. 복사한 URL을 위 입력란에 붙여넣고 저장합니다.</span>
-              <small>프로젝트명, CLI 이름, 완료/오류 상태만 전송합니다. 경로, PID, 프롬프트, 답변과 원문 오류는 보내지 않습니다.</small>
-            </div>
-
-            <fieldset class="phone-notification-kinds">
-              <legend>알림 받을 때</legend>
-              <label class="phone-notification-toggle">
-                <input id="phone-notification-success" type="checkbox" />
-                <span>작업 완료</span>
-              </label>
-              <label class="phone-notification-toggle">
-                <input id="phone-notification-error" type="checkbox" />
-                <span>작업 오류</span>
-              </label>
-            </fieldset>
-
-            <p
-              id="phone-notification-status"
-              class="phone-notification-status"
-              role="status"
-              aria-live="polite"
-            ></p>
-          </section>
+          </div>
 
           <div class="dialog-actions">
-            <button id="close-settings" type="button">닫기</button>
-            <button id="test-phone-notifications" type="button">테스트</button>
-            <button class="dialog-submit" type="submit">저장</button>
+            <button id="close-settings" type="button" data-i18n-en="Close" data-i18n-ko="닫기">
+              Close
+            </button>
+            <button
+              id="test-phone-notifications"
+              type="button"
+              hidden
+              data-i18n-en="Test"
+              data-i18n-ko="테스트"
+            >Test</button>
+            <button class="dialog-submit" type="submit" data-i18n-en="Save" data-i18n-ko="저장" hidden>
+              Save
+            </button>
           </div>
         </form>
       </dialog>
@@ -366,14 +633,25 @@
       >
         <section class="phase3-upgrade-content">
           <div class="dialog-heading">
-            <strong id="phase3-upgrade-title">이전 작업 복구</strong>
-            <span>
-              이전 버전에서 저장한 작업이 발견됐습니다. 원본은 그대로 보존하고 안전한 복사본만
-              현재 작업 공간에 반영합니다. Codex/Grok 대화는 자동으로 실행하거나 재개하지 않습니다.
+            <strong
+              id="phase3-upgrade-title"
+              data-i18n-en="Recover previous workspace"
+              data-i18n-ko="이전 작업 복구"
+            >Recover previous workspace</strong>
+            <span
+              data-i18n-en="Workspace data from an earlier version was found. The original remains untouched while a safe copy is imported into the current workspace. Codex and Grok conversations will not be started or resumed automatically."
+              data-i18n-ko="이전 버전에서 저장한 작업이 발견됐습니다. 원본은 그대로 보존하고 안전한 복사본만 현재 작업 공간에 반영합니다. Codex/Grok 대화는 자동으로 실행하거나 재개하지 않습니다."
+            >
+              Workspace data from an earlier version was found. The original remains untouched while a
+              safe copy is imported into the current workspace. Codex and Grok conversations will not be
+              started or resumed automatically.
             </span>
           </div>
           <div class="legacy-inspection-counts">
-            <span><strong id="phase3-upgrade-project-count">0</strong> 프로젝트</span>
+            <span>
+              <strong id="phase3-upgrade-project-count">0</strong>
+              <span data-i18n-en="projects" data-i18n-ko="프로젝트">projects</span>
+            </span>
             <span><strong id="phase3-upgrade-terminal-count">0</strong> PowerShell</span>
           </div>
           <dl class="legacy-inspection-meta">
@@ -384,9 +662,21 @@
           </dl>
           <p id="phase3-upgrade-error" class="project-form-error" role="alert"></p>
           <div class="dialog-actions migration-dialog-actions">
-            <button id="close-phase3-upgrade" type="button">나중에</button>
-            <button id="commit-phase3-upgrade" class="dialog-submit" type="button" disabled>
-              안전하게 복사
+            <button
+              id="close-phase3-upgrade"
+              type="button"
+              data-i18n-en="Later"
+              data-i18n-ko="나중에"
+            >Later</button>
+            <button
+              id="commit-phase3-upgrade"
+              class="dialog-submit"
+              type="button"
+              data-i18n-en="Import safe copy"
+              data-i18n-ko="안전하게 복사"
+              disabled
+            >
+              Import safe copy
             </button>
           </div>
         </section>

@@ -4,6 +4,11 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import * as esbuild from "esbuild";
 
+Object.defineProperty(globalThis, "navigator", {
+  configurable: true,
+  value: { language: "en-US", languages: ["en-US"] },
+});
+
 const bundle = await esbuild.build({
   entryPoints: [fileURLToPath(new URL("../src/phase5-core.ts", import.meta.url))],
   bundle: true,
@@ -417,6 +422,66 @@ test("correlation history remains bounded under long-running sessions", () => {
   assert.match(state.settledTurnKeys[0], /turn-25$/);
 });
 
+test("rectangle overlap detects a shared positive-area region", () => {
+  const first = { left: 0, top: 0, right: 100, bottom: 80 };
+  const second = { left: 75, top: 50, right: 150, bottom: 120 };
+
+  assert.equal(core.rectanglesOverlap(first, second), true);
+  assert.equal(core.rectanglesOverlap(second, first), true);
+  assert.equal(
+    core.rectanglesOverlap(first, { left: 20, top: 10, right: 40, bottom: 30 }),
+    true,
+  );
+});
+
+test("rectangle overlap keeps separated browser and popover regions visible", () => {
+  const browser = { left: 900, top: 40, right: 1_600, bottom: 900 };
+
+  assert.equal(
+    core.rectanglesOverlap(browser, { left: 12, top: 700, right: 380, bottom: 890 }),
+    false,
+  );
+  assert.equal(
+    core.rectanglesOverlap(browser, { left: 950, top: 920, right: 1_200, bottom: 980 }),
+    false,
+  );
+});
+
+test("rectangle overlap treats edge and corner contact as non-overlap", () => {
+  const first = { left: 10, top: 10, right: 50, bottom: 50 };
+
+  assert.equal(
+    core.rectanglesOverlap(first, { left: 50, top: 20, right: 80, bottom: 40 }),
+    false,
+  );
+  assert.equal(
+    core.rectanglesOverlap(first, { left: 20, top: 50, right: 40, bottom: 80 }),
+    false,
+  );
+  assert.equal(
+    core.rectanglesOverlap(first, { left: 50, top: 50, right: 80, bottom: 80 }),
+    false,
+  );
+});
+
+test("rectangle overlap rejects degenerate, inverted, and non-finite bounds", () => {
+  const valid = { left: 0, top: 0, right: 100, bottom: 100 };
+  const invalid = [
+    { left: 20, top: 10, right: 20, bottom: 40 },
+    { left: 30, top: 10, right: 20, bottom: 40 },
+    { left: 10, top: 20, right: 40, bottom: 20 },
+    { left: 10, top: 30, right: 40, bottom: 20 },
+    { left: Number.NaN, top: 0, right: 40, bottom: 40 },
+    { left: 0, top: Number.POSITIVE_INFINITY, right: 40, bottom: 40 },
+    { left: 0, top: 0, right: Number.NEGATIVE_INFINITY, bottom: 40 },
+  ];
+
+  for (const bounds of invalid) {
+    assert.equal(core.rectanglesOverlap(valid, bounds), false);
+    assert.equal(core.rectanglesOverlap(bounds, valid), false);
+  }
+});
+
 test("usage normalization computes remaining percentages and clamps provider drift", () => {
   const raw = {
     codex: {
@@ -461,29 +526,48 @@ test("reset countdown matches the compact legacy day, hour, minute, and expiry f
   const now = Date.parse("2026-07-17T00:00:00Z");
   assert.equal(
     core.formatProviderResetCountdown("2026-07-23T10:59:59Z", now),
-    "6일 10시간",
+    "6d 10h",
   );
   assert.equal(
     core.formatProviderResetCountdown("2026-07-17T03:02:59Z", now),
-    "3시간 2분",
+    "3h 2m",
   );
-  assert.equal(core.formatProviderResetCountdown("2026-07-17T00:00:30Z", now), "1분");
-  assert.equal(core.formatProviderResetCountdown("2026-07-17T00:00:00Z", now), "곧 초기화");
-  assert.equal(core.formatProviderResetCountdown("2026-07-16T23:00:00Z", now), "곧 초기화");
+  assert.equal(core.formatProviderResetCountdown("2026-07-17T00:00:30Z", now), "1m");
+  assert.equal(core.formatProviderResetCountdown("2026-07-17T00:00:00Z", now), "Resetting soon");
+  assert.equal(core.formatProviderResetCountdown("2026-07-16T23:00:00Z", now), "Resetting soon");
 });
 
 test("reset countdown honors timezone offsets, advances with time, and rejects bad inputs", () => {
   const first = Date.parse("2026-07-17T00:00:00Z");
   assert.equal(
     core.formatProviderResetCountdown("2026-07-17T12:30:00+09:00", first),
-    "3시간 30분",
+    "3h 30m",
   );
   assert.equal(
     core.formatProviderResetCountdown("2026-07-17T12:30:00+09:00", first + 60_000),
-    "3시간 29분",
+    "3h 29m",
   );
   assert.throws(() => core.formatProviderResetCountdown("invalid", first));
   assert.throws(() => core.formatProviderResetCountdown("2026-07-17T01:00:00Z", NaN));
+});
+
+test("reset countdown follows a Korean system locale", async () => {
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    value: { language: "ko-KR", languages: ["ko-KR"] },
+  });
+  try {
+    const koreanCore = await import(`${moduleUrl}#ko-countdown`);
+    const now = Date.parse("2026-07-17T00:00:00Z");
+    assert.equal(koreanCore.formatProviderResetCountdown("2026-07-23T10:59:59Z", now), "6일 10시간");
+    assert.equal(koreanCore.formatProviderResetCountdown("2026-07-17T00:00:30Z", now), "1분");
+    assert.equal(koreanCore.formatProviderResetCountdown("2026-07-17T00:00:00Z", now), "곧 초기화");
+  } finally {
+    Object.defineProperty(globalThis, "navigator", {
+      configurable: true,
+      value: { language: "en-US", languages: ["en-US"] },
+    });
+  }
 });
 
 test("next usage reset delay selects the nearest future limit across providers", () => {

@@ -10,6 +10,7 @@ import {
   type WorkspaceTab,
   type WorkspaceTerminal,
 } from "./phase3b-core";
+import { tr } from "./i18n";
 
 export const DEFAULT_MIN_PANE_WIDTH_PX = 160;
 export const DEFAULT_INSERTION_HYSTERESIS_PX = 14;
@@ -168,7 +169,7 @@ export function migrateLegacyAutomaticProjectTabsToManual(
 export function addBlankWorkspaceTab(
   state: WorkspaceState,
   tabId: string,
-  title = "새 탭",
+  title = tr("New tab", "새 탭"),
 ): WorkspaceState {
   const next = editableClone(state);
   if (next.tabs.length >= MAX_WORKSPACE_TABS) {
@@ -270,7 +271,7 @@ export function closeWorkspaceTab(
     next.tabs.push({
       id: replacementTabId,
       kind: "empty",
-      title: "새 탭",
+      title: tr("New tab", "새 탭"),
       projectId: null,
       browser: null,
       output: null,
@@ -621,12 +622,19 @@ export function validateWorkspaceProjectDraft(
 ): WorkspaceProjectDraft {
   const normalizedName = name.trim();
   const normalizedFolder = normalizeWindowsFolder(folderPath);
-  if (!normalizedName) throw new Error("프로젝트 이름을 입력하세요.");
+  if (!normalizedName) throw new Error(tr("Enter a project name.", "프로젝트 이름을 입력하세요."));
   if (normalizedName.length > 50) {
-    throw new Error("프로젝트 이름은 50자 이하여야 합니다.");
+    throw new Error(
+      tr("Project names must be 50 characters or fewer.", "프로젝트 이름은 50자 이하여야 합니다."),
+    );
   }
   if (!isAbsoluteWindowsPath(normalizedFolder)) {
-    throw new Error("드라이브 또는 UNC로 시작하는 절대 폴더 경로를 입력하세요.");
+    throw new Error(
+      tr(
+        "Enter an absolute folder path that starts with a drive letter or UNC path.",
+        "드라이브 또는 UNC로 시작하는 절대 폴더 경로를 입력하세요.",
+      ),
+    );
   }
   return { name: normalizedName, folderPath: normalizedFolder };
 }
@@ -635,11 +643,11 @@ export function validateWorkspaceProjectDraft(
 export function suggestWorkspaceProjectName(folderPath: string): string {
   const withoutTrailingSeparators = folderPath.trim().replace(/[\\/]+$/, "");
   if (!withoutTrailingSeparators || /^[a-z]:$/i.test(withoutTrailingSeparators)) {
-    return "새 프로젝트";
+    return tr("New project", "새 프로젝트");
   }
   const segments = withoutTrailingSeparators.split(/[\\/]/);
   const finalSegment = segments[segments.length - 1]?.trim();
-  return finalSegment || "새 프로젝트";
+  return finalSegment || tr("New project", "새 프로젝트");
 }
 
 export function findWorkspaceProjectByFolder(

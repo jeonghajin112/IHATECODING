@@ -63,6 +63,7 @@ pub(crate) struct SendPhoneNotificationRequest {
     pub(crate) event_id: String,
     pub(crate) project_name: String,
     pub(crate) terminal_name: String,
+    pub(crate) language: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -239,7 +240,12 @@ impl PhoneNotificationService {
             "Discord notifications are enabled without a configured webhook.".to_owned()
         })?;
         // Build everything that can fail locally before durably reserving the event.
-        let payload = notification_payload(request.kind, &project_name, &terminal_name)?;
+        let payload = notification_payload(
+            request.kind,
+            &project_name,
+            &terminal_name,
+            request.language.as_deref(),
+        )?;
         if request.kind != PhoneNotificationKind::Test && !self.reserve_event(&request.event_id)? {
             return Ok(PhoneNotificationResult { sent: false });
         }
@@ -639,11 +645,16 @@ fn notification_payload(
     kind: PhoneNotificationKind,
     project_name: &str,
     terminal_name: &str,
+    language: Option<&str>,
 ) -> Result<Vec<u8>, String> {
-    let (icon, status) = match kind {
-        PhoneNotificationKind::Success => ("✅", "작업 완료"),
-        PhoneNotificationKind::Error => ("⚠️", "오류 발생"),
-        PhoneNotificationKind::Test => ("🔔", "Discord 알림 테스트"),
+    let korean = language.is_some_and(|value| value.eq_ignore_ascii_case("ko"));
+    let (icon, status) = match (kind, korean) {
+        (PhoneNotificationKind::Success, false) => ("✅", "completed"),
+        (PhoneNotificationKind::Error, false) => ("⚠️", "error"),
+        (PhoneNotificationKind::Test, false) => ("🔔", "Discord notification test"),
+        (PhoneNotificationKind::Success, true) => ("✅", "작업 완료"),
+        (PhoneNotificationKind::Error, true) => ("⚠️", "오류 발생"),
+        (PhoneNotificationKind::Test, true) => ("🔔", "Discord 알림 테스트"),
     };
     let content = format!(
         "{icon} [{}] {} {status}",
@@ -972,6 +983,7 @@ mod tests {
             event_id: event_id.to_owned(),
             project_name: "IHATECODING".to_owned(),
             terminal_name: "MAIN".to_owned(),
+            language: Some("en".to_owned()),
         }
     }
 
@@ -1042,6 +1054,7 @@ mod tests {
             PhoneNotificationKind::Success,
             "프로젝트 [A] @everyone",
             "CLI `백엔드`",
+            Some("ko"),
         )
         .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&payload).unwrap();
@@ -1054,6 +1067,26 @@ mod tests {
         assert!(content.contains("\\`백엔드\\`"));
         assert!(!content.contains("event"));
         assert!(!content.contains("C:\\"));
+    }
+
+    #[test]
+    fn notification_payload_uses_the_requested_app_language() {
+        let english = notification_payload(
+            PhoneNotificationKind::Success,
+            "IHATECODING",
+            "MAIN",
+            Some("en"),
+        )
+        .unwrap();
+        let korean = notification_payload(
+            PhoneNotificationKind::Success,
+            "IHATECODING",
+            "MAIN",
+            Some("ko"),
+        )
+        .unwrap();
+        assert!(String::from_utf8(english).unwrap().contains("completed"));
+        assert!(String::from_utf8(korean).unwrap().contains("작업 완료"));
     }
 
     #[test]
@@ -1120,6 +1153,7 @@ mod tests {
                     event_id: "turn:1".to_owned(),
                     project_name: "IHATECODING".to_owned(),
                     terminal_name: "MAIN".to_owned(),
+                    language: Some("en".to_owned()),
                 })
                 .unwrap()
                 .sent

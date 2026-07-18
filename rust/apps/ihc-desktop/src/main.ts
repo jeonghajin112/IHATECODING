@@ -50,6 +50,7 @@ import {
   millisecondsUntilNextProviderUsageReset,
   normalizeProviderAccountListResponse,
   normalizeProviderUsageResponse,
+  rectanglesOverlap,
   selectDroppedFilePaths,
   selectClipboardImageSequence,
   shouldManuallySendTerminalInterrupt,
@@ -60,8 +61,22 @@ import {
   type ProviderAccountListResponse,
   type ProviderLimitUsage,
   type ProviderUsageResponse,
+  type RectangleBounds,
   type SafeResumePlan,
 } from "./phase5-core";
+import {
+  appLocale,
+  formatAppNumber,
+  getAppLanguage,
+  initializeAppLanguage,
+  localizeBackendMessage,
+  setAppLanguage,
+  subscribeAppLanguage,
+  tr,
+  type AppLanguage,
+} from "./i18n";
+
+initializeAppLanguage();
 
 type StartTerminalResponse = {
   sessionId: string;
@@ -237,7 +252,7 @@ class TerminalPane {
   private unboundOutputBytes = 0;
   private eventChannel: Channel<unknown> | null = null;
   private paneState: PaneState = "queued";
-  private statusMessage = "시작 대기 중";
+  private statusMessage = tr("Waiting to start", "시작 대기 중");
   private statusTone: StatusTone = "normal";
   private lifecycleEpoch = 0;
   private phoneErrorNotifiedEpoch = -1;
@@ -387,12 +402,12 @@ class TerminalPane {
     this.titleElement = document.createElement("span");
     this.titleElement.className = "terminal-title";
     this.titleElement.textContent = this.title;
-    this.titleElement.title = "더블 클릭하여 이름 변경";
+    this.titleElement.title = tr("Double-click to rename", "더블 클릭하여 이름 변경");
     this.titleEditor = document.createElement("input");
     this.titleEditor.className = "terminal-title-editor";
     this.titleEditor.maxLength = 80;
     this.titleEditor.hidden = true;
-    this.titleEditor.setAttribute("aria-label", "PowerShell 이름");
+    this.titleEditor.setAttribute("aria-label", tr("PowerShell name", "PowerShell 이름"));
     this.stateLabel = document.createElement("span");
     this.stateLabel.className = "terminal-state-label";
     this.stateLabel.textContent = this.statusMessage;
@@ -412,21 +427,27 @@ class TerminalPane {
     this.copyButton.className = "terminal-window-action terminal-copy";
     this.copyButton.type = "button";
     this.copyButton.hidden = true;
-    this.copyButton.title = "선택한 답변 복사";
-    this.copyButton.setAttribute("aria-label", "선택한 답변 복사");
+    this.copyButton.title = tr("Copy selected response", "선택한 답변 복사");
+    this.copyButton.setAttribute(
+      "aria-label",
+      tr("Copy selected response", "선택한 답변 복사"),
+    );
     this.maximizeButton = document.createElement("button");
     this.maximizeButton.className = "terminal-window-action terminal-maximize";
     this.maximizeButton.type = "button";
     this.maximizeButton.textContent = "□";
-    this.maximizeButton.title = `${this.title} 확대`;
-    this.maximizeButton.setAttribute("aria-label", `${this.title} 확대`);
+    this.maximizeButton.title = tr(`Maximize ${this.title}`, `${this.title} 확대`);
+    this.maximizeButton.setAttribute(
+      "aria-label",
+      tr(`Maximize ${this.title}`, `${this.title} 확대`),
+    );
     this.maximizeButton.setAttribute("aria-pressed", "false");
     this.closeButton = document.createElement("button");
     this.closeButton.className = "terminal-window-action terminal-close";
     this.closeButton.type = "button";
     this.closeButton.textContent = "×";
-    this.closeButton.title = `${this.title} 닫기`;
-    this.closeButton.setAttribute("aria-label", `${this.title} 닫기`);
+    this.closeButton.title = tr(`Close ${this.title}`, `${this.title} 닫기`);
+    this.closeButton.setAttribute("aria-label", tr(`Close ${this.title}`, `${this.title} 닫기`));
     actions.append(this.copyButton, this.maximizeButton, this.closeButton);
     header.append(stateDot, heading, actions);
 
@@ -440,14 +461,17 @@ class TerminalPane {
     this.resizeHandle.tabIndex = -1;
     this.resizeHandle.setAttribute("role", "separator");
     this.resizeHandle.setAttribute("aria-orientation", "vertical");
-    this.resizeHandle.setAttribute("aria-label", `${this.title} 너비 조절`);
+    this.resizeHandle.setAttribute(
+      "aria-label",
+      tr(`Resize ${this.title} width`, `${this.title} 너비 조절`),
+    );
     this.fileDropOverlay = document.createElement("div");
     this.fileDropOverlay.className = "terminal-file-drop-overlay";
     this.fileDropOverlay.setAttribute("aria-hidden", "true");
     const fileDropTitle = document.createElement("strong");
-    fileDropTitle.textContent = "파일을 놓아 첨부";
+    fileDropTitle.textContent = tr("Drop files to attach", "파일을 놓아 첨부");
     this.fileDropCount = document.createElement("span");
-    this.fileDropCount.textContent = "1개 파일";
+    this.fileDropCount.textContent = tr("1 file", "1개 파일");
     this.fileDropOverlay.append(fileDropTitle, this.fileDropCount);
     this.element.append(
       header,
@@ -638,8 +662,12 @@ class TerminalPane {
     const providerName = provider === "codex" ? "Codex" : "Grok";
     this.contextLabel.textContent = `Context ${remainingPercent}%`;
     this.contextLabel.title =
-      `${providerName} 컨텍스트 ${usedTokens.toLocaleString("ko-KR")} / ` +
-      `${windowTokens.toLocaleString("ko-KR")} 토큰 사용 · ${remainingPercent}% 남음`;
+      tr(
+        `${providerName} context: ${formatAppNumber(usedTokens)} of ` +
+          `${formatAppNumber(windowTokens)} tokens used · ${remainingPercent}% remaining`,
+        `${providerName} 컨텍스트 ${formatAppNumber(usedTokens)} / ` +
+          `${formatAppNumber(windowTokens)} 토큰 사용 · ${remainingPercent}% 남음`,
+      );
     this.contextLabel.dataset.low = String(remainingPercent <= 20);
     this.contextLabel.hidden = false;
     return true;
@@ -659,14 +687,14 @@ class TerminalPane {
 
   private async start() {
     const epoch = ++this.lifecycleEpoch;
-    this.setState("queued", "시작 대기 중");
+    this.setState("queued", tr("Waiting to start", "시작 대기 중"));
 
     try {
       await this.scheduler.run(async (signal) => {
         if (signal?.aborted || this.disposed || epoch !== this.lifecycleEpoch) {
           throw new CancelledStart();
         }
-        this.setState("starting", "PowerShell 시작 중…");
+        this.setState("starting", tr("Starting PowerShell…", "PowerShell 시작 중…"));
         await nextAnimationFrame();
         if (signal?.aborted || this.disposed || epoch !== this.lifecycleEpoch) {
           throw new CancelledStart();
@@ -680,7 +708,13 @@ class TerminalPane {
           try {
             message = normalizeTerminalEvent(rawMessage);
           } catch (error) {
-            this.failProtocol(`이벤트 계약 위반: ${String(error)}`, []);
+            this.failProtocol(
+              tr(
+                `Event contract violation: ${String(error)}`,
+                `이벤트 계약 위반: ${String(error)}`,
+              ),
+              [],
+            );
             return;
           }
           this.handleTerminalEvent(message, epoch);
@@ -742,7 +776,11 @@ class TerminalPane {
   setFileDropTarget(active: boolean, fileCount = 0) {
     this.element.dataset.fileDropTarget = String(active);
     if (active) {
-      this.fileDropCount.textContent = `${Math.max(1, fileCount)}개 파일`;
+      const count = Math.max(1, fileCount);
+      this.fileDropCount.textContent = tr(
+        `${formatAppNumber(count)} ${count === 1 ? "file" : "files"}`,
+        `${formatAppNumber(count)}개 파일`,
+      );
     }
   }
 
@@ -781,12 +819,17 @@ class TerminalPane {
     this.title = title;
     this.titleElement.textContent = title;
     this.element.setAttribute("aria-label", title);
-    this.closeButton.title = `${title} 닫기`;
-    this.closeButton.setAttribute("aria-label", `${title} 닫기`);
-    const maximizeAction = this.element.dataset.maximized === "true" ? "복원" : "확대";
-    this.maximizeButton.title = `${title} ${maximizeAction}`;
-    this.maximizeButton.setAttribute("aria-label", `${title} ${maximizeAction}`);
-    this.resizeHandle.setAttribute("aria-label", `${title} 너비 조절`);
+    this.closeButton.title = tr(`Close ${title}`, `${title} 닫기`);
+    this.closeButton.setAttribute("aria-label", tr(`Close ${title}`, `${title} 닫기`));
+    const maximized = this.element.dataset.maximized === "true";
+    this.maximizeButton.title = maximized
+      ? tr(`Restore ${title}`, `${title} 복원`)
+      : tr(`Maximize ${title}`, `${title} 확대`);
+    this.maximizeButton.setAttribute("aria-label", this.maximizeButton.title);
+    this.resizeHandle.setAttribute(
+      "aria-label",
+      tr(`Resize ${title} width`, `${title} 너비 조절`),
+    );
   }
 
   setCompletionPending(completionPending: boolean) {
@@ -857,10 +900,12 @@ class TerminalPane {
   setMaximized(maximized: boolean) {
     this.element.dataset.maximized = String(maximized);
     this.maximizeButton.textContent = maximized ? "▣" : "□";
-    this.maximizeButton.title = `${this.title} ${maximized ? "복원" : "확대"}`;
+    this.maximizeButton.title = maximized
+      ? tr(`Restore ${this.title}`, `${this.title} 복원`)
+      : tr(`Maximize ${this.title}`, `${this.title} 확대`);
     this.maximizeButton.setAttribute(
       "aria-label",
-      `${this.title} ${maximized ? "복원" : "확대"}`,
+      this.maximizeButton.title,
     );
     this.maximizeButton.setAttribute("aria-pressed", String(maximized));
   }
@@ -887,7 +932,7 @@ class TerminalPane {
     this.disposed = true;
     this.startAbortController.abort();
     this.lifecycleEpoch += 1;
-    this.setState("stopping", "종료 중…");
+    this.setState("stopping", tr("Stopping…", "종료 중…"));
     window.clearTimeout(this.fitTimer);
     window.clearTimeout(this.launchProbeExpiryTimer);
     window.clearTimeout(this.launchPaintWatchdogTimer);
@@ -1525,7 +1570,7 @@ class TerminalPane {
 
       case "output": {
         if (this.outputSequencer.hasObservedExit) {
-          this.failProtocol("Exited 이후 출력 이벤트가 도착했습니다.", [
+          this.failProtocol(tr("An output event arrived after Exited.", "Exited 이후 출력 이벤트가 도착했습니다."), [
             message.data.sessionId,
           ]);
           return;
@@ -1535,7 +1580,7 @@ class TerminalPane {
           return;
         }
         if (message.data.sessionId !== this.sessionId) {
-          this.failProtocol("바인딩된 패널에 다른 세션 출력이 전달되었습니다.", [
+          this.failProtocol(tr("Output from another session was delivered to the bound pane.", "바인딩된 패널에 다른 세션 출력이 전달되었습니다."), [
             message.data.sessionId,
           ]);
           return;
@@ -1546,7 +1591,7 @@ class TerminalPane {
 
       case "error":
         if (this.sessionId && message.data.sessionId !== this.sessionId) {
-          this.failProtocol("바인딩된 패널에 다른 세션 오류가 전달되었습니다.", [
+          this.failProtocol(tr("An error from another session was delivered to the bound pane.", "바인딩된 패널에 다른 세션 오류가 전달되었습니다."), [
             message.data.sessionId,
           ]);
           return;
@@ -1557,7 +1602,7 @@ class TerminalPane {
       case "exited": {
         this.terminatedSessionIds.add(message.data.sessionId);
         if (this.sessionId && message.data.sessionId !== this.sessionId) {
-          this.failProtocol("바인딩된 패널에 다른 세션 종료가 전달되었습니다.", [
+          this.failProtocol(tr("An exit from another session was delivered to the bound pane.", "바인딩된 패널에 다른 세션 종료가 전달되었습니다."), [
             message.data.sessionId,
           ]);
           return;
@@ -1575,7 +1620,7 @@ class TerminalPane {
           lastSequence: message.data.lastSequence,
           epoch,
         };
-        this.setState("stopping", "마지막 출력 정리 중…");
+        this.setState("stopping", tr("Finalizing output…", "마지막 출력 정리 중…"));
         if (this.outputSequencer.isFinalReady) this.scheduleExitBarrier();
         else this.scheduleExitGapTimeout();
         break;
@@ -1587,20 +1632,20 @@ class TerminalPane {
     if (this.disposed || this.terminalFailed) return false;
     if (this.sessionId) {
       if (this.sessionId === targetSessionId) return true;
-      this.failProtocol("다른 세션 이벤트가 이 패널에 전달되었습니다.", [
+      this.failProtocol(tr("An event from another session was delivered to this pane.", "다른 세션 이벤트가 이 패널에 전달되었습니다."), [
         targetSessionId,
       ]);
       return false;
     }
     if (this.unboundSessionId && this.unboundSessionId !== targetSessionId) {
-      this.failProtocol("바인딩 전 출력 세션과 시작 세션이 다릅니다.", [
+      this.failProtocol(tr("The pre-bind output session does not match the started session.", "바인딩 전 출력 세션과 시작 세션이 다릅니다."), [
         this.unboundSessionId,
         targetSessionId,
       ]);
       return false;
     }
     if (!this.workspace.claimSession(targetSessionId, this.id)) {
-      this.failProtocol("중복된 세션 ID를 거부했습니다.", [targetSessionId]);
+      this.failProtocol(tr("A duplicate session ID was rejected.", "중복된 세션 ID를 거부했습니다."), [targetSessionId]);
       return false;
     }
     this.sessionId = targetSessionId;
@@ -1610,7 +1655,7 @@ class TerminalPane {
 
   private bufferUnboundOutput(batch: OutputBatch) {
     if (this.unboundSessionId && this.unboundSessionId !== batch.sessionId) {
-      this.failProtocol("바인딩 전 출력에 둘 이상의 세션 ID가 포함되었습니다.", [
+      this.failProtocol(tr("Pre-bind output contained more than one session ID.", "바인딩 전 출력에 둘 이상의 세션 ID가 포함되었습니다."), [
         this.unboundSessionId,
         batch.sessionId,
       ]);
@@ -1622,7 +1667,7 @@ class TerminalPane {
       this.unboundOutput.length + 1 > UNBOUND_OUTPUT_MAX_BATCHES ||
       this.unboundOutputBytes + byteLength > UNBOUND_OUTPUT_MAX_BYTES
     ) {
-      this.failProtocol("바인딩 전 출력 버퍼 상한을 초과했습니다.", [batch.sessionId]);
+      this.failProtocol(tr("The pre-bind output buffer limit was exceeded.", "바인딩 전 출력 버퍼 상한을 초과했습니다."), [batch.sessionId]);
       return;
     }
 
@@ -1636,7 +1681,7 @@ class TerminalPane {
           !this.sessionId &&
           this.unboundSessionId === batch.sessionId
         ) {
-          this.failProtocol("바인딩 전 출력 대기 시간이 초과되었습니다.", [batch.sessionId]);
+          this.failProtocol(tr("Timed out waiting for pre-bind output.", "바인딩 전 출력 대기 시간이 초과되었습니다."), [batch.sessionId]);
         }
       }, UNBOUND_OUTPUT_MAX_AGE_MS);
     }
@@ -1647,7 +1692,7 @@ class TerminalPane {
   private flushUnboundOutput(targetSessionId: string) {
     window.clearTimeout(this.unboundOutputTimer);
     if (this.unboundSessionId && this.unboundSessionId !== targetSessionId) {
-      this.failProtocol("다른 세션의 바인딩 전 출력을 거부했습니다.", [
+      this.failProtocol(tr("Pre-bind output from another session was rejected.", "다른 세션의 바인딩 전 출력을 거부했습니다."), [
         this.unboundSessionId,
         targetSessionId,
       ]);
@@ -1708,7 +1753,7 @@ class TerminalPane {
       const failed = [...rendering, ...this.pendingRenderBatches];
       this.pendingRenderBatches.length = 0;
       this.failTerminal(
-        `출력 렌더링 실패: ${String(error)}`,
+        tr(`Failed to render output: ${String(error)}`, `출력 렌더링 실패: ${String(error)}`),
         [...new Set(failed.map((item) => item.sessionId))],
       );
     } finally {
@@ -1799,7 +1844,10 @@ class TerminalPane {
       }
     }
     this.failTerminal(
-      `출력 ACK ${ACK_MAX_ATTEMPTS}회 실패: ${String(lastError)}`,
+      tr(
+        `Output ACK failed after ${ACK_MAX_ATTEMPTS} attempts: ${String(lastError)}`,
+        `출력 ACK ${ACK_MAX_ATTEMPTS}회 실패: ${String(lastError)}`,
+      ),
       [targetSessionId],
     );
   }
@@ -1851,7 +1899,10 @@ class TerminalPane {
       })
       .catch((error) => {
         if (!this.disposed && this.sessionId === targetSession) {
-          this.setStatusOnly(`입력 전송 실패: ${String(error)}`, "error");
+          this.setStatusOnly(
+            tr(`Failed to send input: ${String(error)}`, `입력 전송 실패: ${String(error)}`),
+            "error",
+          );
         }
       });
     return (input: TerminalInput | null) => {
@@ -1887,7 +1938,10 @@ class TerminalPane {
           });
         } catch (error) {
           if (!this.disposed && this.sessionId === resize.sessionId) {
-            this.setStatusOnly(`크기 변경 실패: ${String(error)}`, "error");
+            this.setStatusOnly(
+              tr(`Failed to resize: ${String(error)}`, `크기 변경 실패: ${String(error)}`),
+              "error",
+            );
           }
         }
       }
@@ -1968,7 +2022,10 @@ class TerminalPane {
         return true;
       } catch {
         if (clipboardEventSucceeded) return true;
-        this.setStatusOnly(`복사 실패: ${String(nativeError)}`, "error");
+        this.setStatusOnly(
+          tr(`Copy failed: ${String(nativeError)}`, `복사 실패: ${String(nativeError)}`),
+          "error",
+        );
         return false;
       }
     }
@@ -2001,7 +2058,7 @@ class TerminalPane {
     const clipboardRead = Promise.race([
       this.readClipboardInput(),
       delay(CLIPBOARD_READ_TIMEOUT_MS).then(() => {
-        throw new Error("클립보드 응답 시간이 초과되었습니다.");
+        throw new Error(tr("The clipboard request timed out.", "클립보드 응답 시간이 초과되었습니다."));
       }),
     ]);
     const inputReady = clipboardRead.then(
@@ -2020,7 +2077,10 @@ class TerminalPane {
         }
         commit(input);
         if (error && !this.disposed) {
-          this.setStatusOnly(`붙여넣기 실패: ${String(error)}`, "error");
+          this.setStatusOnly(
+            tr(`Paste failed: ${String(error)}`, `붙여넣기 실패: ${String(error)}`),
+            "error",
+          );
         }
       });
     }, 0);
@@ -2087,8 +2147,11 @@ class TerminalPane {
     this.resumeHealthMisses = 0;
     this.setStatusOnly(
       detectedProvider
-        ? "실행 중인 CLI 대화를 다시 연결하는 중"
-        : "자동 대화 복구가 끝나 PowerShell 상태로 전환됨",
+        ? tr("Reconnecting the active CLI conversation", "실행 중인 CLI 대화를 다시 연결하는 중")
+        : tr(
+            "Conversation recovery finished; returned to PowerShell",
+            "자동 대화 복구가 끝나 PowerShell 상태로 전환됨",
+          ),
       "normal",
     );
     this.scheduleAgentDiscovery(true);
@@ -2215,7 +2278,12 @@ class TerminalPane {
           (!Number.isSafeInteger(completionObservedAtUnixMs) ||
             completionObservedAtUnixMs < 0))
       ) {
-        throw new Error("에이전트 대화 검색 응답이 올바르지 않습니다.");
+        throw new Error(
+          tr(
+            "The agent conversation discovery response is invalid.",
+            "에이전트 대화 검색 응답이 올바르지 않습니다.",
+          ),
+        );
       }
 
       if (
@@ -2246,7 +2314,13 @@ class TerminalPane {
     } catch (error) {
       retry = true;
       if (!this.disposed && this.sessionId === sessionId) {
-        this.setStatusOnly(`대화 자동 연결 재시도 중: ${String(error)}`, "error");
+        this.setStatusOnly(
+          tr(
+            `Retrying automatic conversation reconnect: ${String(error)}`,
+            `대화 자동 연결 재시도 중: ${String(error)}`,
+          ),
+          "error",
+        );
       }
     } finally {
       this.agentDiscoveryPending = false;
@@ -2373,7 +2447,10 @@ class TerminalPane {
       const sequence = selectClipboardImageSequence(provider);
       if (!sequence) {
         this.setStatusOnly(
-          "이미지를 붙여넣으려면 이 PowerShell에서 Codex 또는 Grok을 먼저 실행하세요.",
+          tr(
+            "Start Codex or Grok in this PowerShell before pasting an image.",
+            "이미지를 붙여넣으려면 이 PowerShell에서 Codex 또는 Grok을 먼저 실행하세요.",
+          ),
           "error",
         );
         return null;
@@ -2433,10 +2510,19 @@ class TerminalPane {
         if (exit.exitCode !== null && exit.exitCode !== 0) {
           this.notifyPhoneErrorOnce();
         }
-        this.setState("exited", `종료됨 · code ${exit.exitCode ?? "?"}`);
+        this.setState(
+          "exited",
+          tr(`Exited · code ${exit.exitCode ?? "?"}`, `종료됨 · code ${exit.exitCode ?? "?"}`),
+        );
       })
       .catch((error) => {
-        this.failTerminal(`종료 렌더 장벽 실패: ${String(error)}`, [exit.sessionId]);
+        this.failTerminal(
+          tr(
+            `Exit render barrier failed: ${String(error)}`,
+            `종료 렌더 장벽 실패: ${String(error)}`,
+          ),
+          [exit.sessionId],
+        );
       });
   }
 
@@ -2454,14 +2540,17 @@ class TerminalPane {
         return;
       }
       this.failProtocol(
-        `최종 출력 sequence gap timeout: ${this.outputSequencer.describeFinalGap()}`,
+        tr(
+          `Final output sequence gap timed out: ${this.outputSequencer.describeFinalGap()}`,
+          `최종 출력 sequence gap timeout: ${this.outputSequencer.describeFinalGap()}`,
+        ),
         [exit.sessionId],
       );
     }, EXIT_GAP_TIMEOUT_MS);
   }
 
   private failProtocol(message: string, sessionIds: Iterable<string>) {
-    this.failTerminal(`터미널 프로토콜 오류: ${message}`, sessionIds);
+    this.failTerminal(tr(`Terminal protocol error: ${message}`, `터미널 프로토콜 오류: ${message}`), sessionIds);
   }
 
   private failTerminal(message: string, sessionIds: Iterable<string>) {
@@ -2580,7 +2669,7 @@ class BrowserPane {
   private interactionSuspended = false;
   private catalogWritable = true;
   private currentUrl: string;
-  private statusMessage = "브라우저 준비 중";
+  private statusMessage = tr("Browser ready", "브라우저 준비 중");
   private statusTone: StatusTone = "normal";
   private operationQueue: Promise<void> = Promise.resolve();
   private boundsQueue: Promise<void> = Promise.resolve();
@@ -2615,12 +2704,12 @@ class BrowserPane {
     this.titleElement = document.createElement("span");
     this.titleElement.className = "terminal-title";
     this.titleElement.textContent = this.title;
-    this.titleElement.title = "더블 클릭하여 이름 변경";
+    this.titleElement.title = tr("Double-click to rename", "더블 클릭하여 이름 변경");
     this.titleEditor = document.createElement("input");
     this.titleEditor.className = "terminal-title-editor";
     this.titleEditor.maxLength = 80;
     this.titleEditor.hidden = true;
-    this.titleEditor.setAttribute("aria-label", "웹 패널 이름");
+    this.titleEditor.setAttribute("aria-label", tr("Web pane name", "웹 패널 이름"));
     this.stateLabel = document.createElement("span");
     this.stateLabel.className = "terminal-state-label";
     this.stateLabel.textContent = this.statusMessage;
@@ -2631,8 +2720,8 @@ class BrowserPane {
     this.closeButton.className = "terminal-window-action terminal-close";
     this.closeButton.type = "button";
     this.closeButton.textContent = "×";
-    this.closeButton.title = `${this.title} 닫기`;
-    this.closeButton.setAttribute("aria-label", `${this.title} 닫기`);
+    this.closeButton.title = tr(`Close ${this.title}`, `${this.title} 닫기`);
+    this.closeButton.setAttribute("aria-label", tr(`Close ${this.title}`, `${this.title} 닫기`));
     actions.append(this.closeButton);
     header.append(stateDot, heading, actions);
 
@@ -2644,20 +2733,20 @@ class BrowserPane {
     this.address.value = this.currentUrl;
     this.address.spellcheck = false;
     this.address.autocomplete = "off";
-    this.address.setAttribute("aria-label", "웹 주소");
+    this.address.setAttribute("aria-label", tr("Web address", "웹 주소"));
     const go = document.createElement("button");
     go.className = "browser-go";
     go.type = "submit";
     go.textContent = "→";
-    go.title = "이동";
-    go.setAttribute("aria-label", "주소로 이동");
+    go.title = tr("Go", "이동");
+    go.setAttribute("aria-label", tr("Go to address", "주소로 이동"));
     navigation.append(this.address, go);
 
     this.viewport = document.createElement("div");
     this.viewport.className = "browser-viewport";
     const placeholder = document.createElement("div");
     placeholder.className = "browser-placeholder";
-    placeholder.textContent = "브라우저를 불러오는 중입니다.";
+    placeholder.textContent = tr("Loading browser…", "브라우저를 불러오는 중입니다.");
     this.viewport.append(placeholder);
 
     this.resizeHandle = document.createElement("div");
@@ -2667,7 +2756,10 @@ class BrowserPane {
     this.resizeHandle.tabIndex = -1;
     this.resizeHandle.setAttribute("role", "separator");
     this.resizeHandle.setAttribute("aria-orientation", "vertical");
-    this.resizeHandle.setAttribute("aria-label", `${this.title} 너비 조절`);
+    this.resizeHandle.setAttribute(
+      "aria-label",
+      tr(`Resize ${this.title} width`, `${this.title} 너비 조절`),
+    );
     this.element.append(header, navigation, this.viewport, this.resizeHandle);
 
     this.closeButton.addEventListener("click", (event) => {
@@ -2738,9 +2830,12 @@ class BrowserPane {
     this.title = title;
     this.titleElement.textContent = title;
     this.element.setAttribute("aria-label", title);
-    this.closeButton.title = `${title} 닫기`;
-    this.closeButton.setAttribute("aria-label", `${title} 닫기`);
-    this.resizeHandle.setAttribute("aria-label", `${title} 너비 조절`);
+    this.closeButton.title = tr(`Close ${title}`, `${title} 닫기`);
+    this.closeButton.setAttribute("aria-label", tr(`Close ${title}`, `${title} 닫기`));
+    this.resizeHandle.setAttribute(
+      "aria-label",
+      tr(`Resize ${title} width`, `${title} 너비 조절`),
+    );
   }
 
   setCatalogWritable(writable: boolean) {
@@ -2776,6 +2871,18 @@ class BrowserPane {
       return;
     }
     this.scheduleFit(0);
+  }
+
+  overlapsNativeOverlay(bounds: RectangleBounds) {
+    if (
+      this.disposed ||
+      !this.layoutVisible ||
+      this.element.hidden ||
+      !this.element.isConnected
+    ) {
+      return false;
+    }
+    return rectanglesOverlap(this.viewport.getBoundingClientRect(), bounds);
   }
 
   scheduleFit(delay = 35) {
@@ -2850,7 +2957,16 @@ class BrowserPane {
         await this.replaceWebview(url);
       })
       .catch((error) => {
-        if (!this.disposed) this.setState("error", `브라우저 열기 실패: ${errorMessage(error)}`, "error");
+        if (!this.disposed) {
+          this.setState(
+            "error",
+            tr(
+              `Failed to open browser: ${errorMessage(error)}`,
+              `브라우저 열기 실패: ${errorMessage(error)}`,
+            ),
+            "error",
+          );
+        }
       });
   }
 
@@ -2858,7 +2974,7 @@ class BrowserPane {
     const generation = ++this.generation;
     const previous = this.webview;
     this.webview = null;
-    this.setState("starting", "페이지 불러오는 중");
+    this.setState("starting", tr("Loading page", "페이지 불러오는 중"));
     if (previous) {
       await previous.hide().catch(() => undefined);
       await previous.close().catch(() => undefined);
@@ -2892,7 +3008,7 @@ class BrowserPane {
         await webview.close().catch(() => undefined);
         return;
       }
-      this.setState("running", "웹 브라우저");
+      this.setState("running", tr("Web browser", "웹 브라우저"));
       await this.syncBounds(generation, webview);
     } catch (error) {
       if (this.webview === webview) this.webview = null;
@@ -2914,7 +3030,14 @@ class BrowserPane {
       .then(() => this.syncBounds(generation, webview))
       .catch((error) => {
         if (!this.disposed && generation === this.generation) {
-          this.setState("error", `브라우저 배치 실패: ${errorMessage(error)}`, "error");
+          this.setState(
+            "error",
+            tr(
+              `Failed to position browser: ${errorMessage(error)}`,
+              `브라우저 배치 실패: ${errorMessage(error)}`,
+            ),
+            "error",
+          );
         }
       });
   }
@@ -3053,6 +3176,7 @@ class TerminalWorkspace {
   private readonly insertionLine = document.createElement("div");
   private readonly snapGuide = document.createElement("div");
   private readonly browserSuspensionReasons = new Set<string>();
+  private providerUsageOverlayBounds: RectangleBounds | null = null;
   private activePaneId: string | null = null;
   private activeProjectId: string | null = null;
   private maximizedPaneId: string | null = null;
@@ -3234,7 +3358,13 @@ class TerminalWorkspace {
       })
       .catch((error) => {
         if (!this.disposed) {
-          this.setFooterStatus(`파일 드롭 초기화 실패: ${errorMessage(error)}`, "error");
+          this.setFooterStatus(
+            tr(
+              `Failed to initialize file drop: ${errorMessage(error)}`,
+              `파일 드롭 초기화 실패: ${errorMessage(error)}`,
+            ),
+            "error",
+          );
         }
       });
     void appWindow
@@ -3272,11 +3402,20 @@ class TerminalWorkspace {
     const pane = this.terminalPaneAtNativeDropPosition(payload.position);
     this.clearNativeFileDropTarget();
     if (!pane) {
-      this.setFooterStatus("파일을 첨부할 PowerShell 창 위에 놓아주세요.", "error");
+      this.setFooterStatus(
+        tr(
+          "Drop the files over the PowerShell pane where you want to attach them.",
+          "파일을 첨부할 PowerShell 창 위에 놓아주세요.",
+        ),
+        "error",
+      );
       return;
     }
     if (selection.paths.length === 0) {
-      this.setFooterStatus("첨부할 수 있는 파일 경로가 없습니다.", "error");
+      this.setFooterStatus(
+        tr("No attachable file paths were found.", "첨부할 수 있는 파일 경로가 없습니다."),
+        "error",
+      );
       return;
     }
 
@@ -3284,12 +3423,27 @@ class TerminalWorkspace {
     void pane.attachDroppedFiles(selection.paths).then((attached) => {
       if (this.disposed) return;
       if (attached === 0) {
-        this.setFooterStatus("실행 중인 PowerShell 창에만 파일을 첨부할 수 있습니다.", "error");
+        this.setFooterStatus(
+          tr(
+            "Files can only be attached to a running PowerShell pane.",
+            "실행 중인 PowerShell 창에만 파일을 첨부할 수 있습니다.",
+          ),
+          "error",
+        );
         return;
       }
-      const skipped = selection.skipped > 0 ? ` · ${selection.skipped}개 제외` : "";
+      const skipped =
+        selection.skipped > 0
+          ? tr(
+              ` · ${formatAppNumber(selection.skipped)} skipped`,
+              ` · ${formatAppNumber(selection.skipped)}개 제외`,
+            )
+          : "";
       this.setFooterStatus(
-        `${pane.title} 프롬프트에 ${attached}개 파일을 추가했습니다${skipped}.`,
+        tr(
+          `Added ${formatAppNumber(attached)} ${attached === 1 ? "file" : "files"} to the ${pane.title} prompt${skipped}.`,
+          `${pane.title} 프롬프트에 ${formatAppNumber(attached)}개 파일을 추가했습니다${skipped}.`,
+        ),
       );
     });
   }
@@ -3335,7 +3489,10 @@ class TerminalWorkspace {
     const projectPaneCount = this.projectPaneCount(projectId);
     if (projectPaneCount >= MAX_PROJECT_PANES) {
       this.setFooterStatus(
-        `PowerShell은 프로젝트마다 최대 ${MAX_PROJECT_PANES}개까지 열 수 있습니다.`,
+        tr(
+          `You can open up to ${MAX_PROJECT_PANES} PowerShell panes per project.`,
+          `PowerShell은 프로젝트마다 최대 ${MAX_PROJECT_PANES}개까지 열 수 있습니다.`,
+        ),
         "error",
       );
       return null;
@@ -3389,14 +3546,17 @@ class TerminalWorkspace {
     if (existing) return existing;
     if (this.projectPaneCount(projectId) >= MAX_PROJECT_PANES) {
       this.setFooterStatus(
-        `터미널과 브라우저는 프로젝트마다 최대 ${MAX_PROJECT_PANES}개까지 열 수 있습니다.`,
+        tr(
+          `You can open up to ${MAX_PROJECT_PANES} terminal and browser panes per project.`,
+          `터미널과 브라우저는 프로젝트마다 최대 ${MAX_PROJECT_PANES}개까지 열 수 있습니다.`,
+        ),
         "error",
       );
       return null;
     }
     const pane = new BrowserPane(this, projectId, savedState, ++this.browserSequence);
     pane.setCatalogWritable(this.catalogWritable);
-    pane.setInteractionSuspended(this.browserSuspensionReasons.size > 0);
+    this.applyBrowserSuspension(pane);
     this.browserPanes.set(pane.id, pane);
     const order = this.projectOrders.get(projectId) ?? [];
     if (!order.includes(pane.id)) this.projectOrders.set(projectId, [...order, pane.id]);
@@ -3518,8 +3678,12 @@ class TerminalWorkspace {
     const capacity = this.restoreCapacity(project);
     if (!capacity.allowed) {
       this.setFooterStatus(
-        `${project.name}을 열려면 PowerShell ${capacity.incoming}개 슬롯이 필요하지만 ` +
-          `${capacity.available}개만 남았습니다. 이 프로젝트의 PowerShell 수를 줄이고 다시 시도하세요.`,
+        tr(
+          `Opening ${project.name} requires ${capacity.incoming} PowerShell slots, but only ` +
+            `${capacity.available} remain. Reduce this project's PowerShell pane count and try again.`,
+          `${project.name}을 열려면 PowerShell ${capacity.incoming}개 슬롯이 필요하지만 ` +
+            `${capacity.available}개만 남았습니다. 이 프로젝트의 PowerShell 수를 줄이고 다시 시도하세요.`,
+        ),
         "error",
       );
       return false;
@@ -3538,14 +3702,26 @@ class TerminalWorkspace {
           // Capacity was checked before any pane was created. A different failure
           // rolls the whole runtime project back instead of leaving a partial restore.
           void this.unloadProject(project.id);
-          this.setFooterStatus(`${project.name} PowerShell 복원을 완료하지 못했습니다.`, "error");
+          this.setFooterStatus(
+            tr(
+              `Could not restore PowerShell panes for ${project.name}.`,
+              `${project.name} PowerShell 복원을 완료하지 못했습니다.`,
+            ),
+            "error",
+          );
           return false;
         }
       }
       for (const browser of projectBrowserPanes(project)) {
         if (!this.addBrowserPane(project.id, browser, false)) {
           void this.unloadProject(project.id);
-          this.setFooterStatus(`${project.name} 웹 패널 복원을 완료하지 못했습니다.`, "error");
+          this.setFooterStatus(
+            tr(
+              `Could not restore web panes for ${project.name}.`,
+              `${project.name} 웹 패널 복원을 완료하지 못했습니다.`,
+            ),
+            "error",
+          );
           return false;
         }
       }
@@ -3577,7 +3753,7 @@ class TerminalWorkspace {
     this.workspaceView = "empty";
     this.app.dataset.workspaceView = "empty";
     this.updateLayout();
-    this.setFooterStatus("왼쪽에서 프로젝트를 선택하세요.");
+    this.setFooterStatus(tr("Select a project on the left.", "왼쪽에서 프로젝트를 선택하세요."));
   }
 
   setCatalogWritable(writable: boolean) {
@@ -3878,7 +4054,12 @@ class TerminalWorkspace {
       await invoke("unbind_agent_session", { sessionId: runtimeSessionId }).catch(
         () => undefined,
       );
-      throw new Error("저장된 에이전트 대화를 실행 세션에 연결하지 못했습니다.");
+      throw new Error(
+        tr(
+          "Could not connect the saved agent conversation to the running session.",
+          "저장된 에이전트 대화를 실행 세션에 연결하지 못했습니다.",
+        ),
+      );
     }
 
     pane.setAgentConversation(provider, conversationId);
@@ -4415,7 +4596,13 @@ class TerminalWorkspace {
         this.snapGuide.hidden = false;
       }
     } catch (error) {
-      this.setFooterStatus(`너비를 조절할 수 없습니다: ${errorMessage(error)}`, "error");
+      this.setFooterStatus(
+        tr(
+          `Unable to resize the pane: ${errorMessage(error)}`,
+          `너비를 조절할 수 없습니다: ${errorMessage(error)}`,
+        ),
+        "error",
+      );
     }
   }
 
@@ -4578,6 +4765,7 @@ class TerminalWorkspace {
     }
 
     this.terminalSurface.dataset.empty = String(allVisible.length === 0);
+    this.refreshBrowserSuspensions();
     this.updateControls();
     requestAnimationFrame(() => {
       for (const pane of visible) pane.scheduleFit(0);
@@ -4620,8 +4808,8 @@ class TerminalWorkspace {
     if (!pane) {
       this.setFooterStatus(
         this.visiblePanes().length > 0
-          ? "상태를 볼 PowerShell을 선택하세요."
-          : "＋ PowerShell을 눌러 새 터미널을 여세요.",
+          ? tr("Select a PowerShell pane to view its status.", "상태를 볼 PowerShell을 선택하세요.")
+          : tr("Select + PowerShell to open a new terminal.", "＋ PowerShell을 눌러 새 터미널을 여세요."),
       );
       return;
     }
@@ -4661,8 +4849,9 @@ class TerminalWorkspace {
     return this.panes.get(paneId) ?? this.browserPanes.get(paneId);
   }
 
-  setNativeOverlayOpen(open: boolean) {
-    this.setBrowserSuspensionReason("provider-usage", open);
+  setNativeOverlayOpen(bounds: RectangleBounds | null) {
+    this.providerUsageOverlayBounds = bounds;
+    this.refreshBrowserSuspensions();
   }
 
   setModalOverlayOpen(reason: string, open: boolean) {
@@ -4679,10 +4868,21 @@ class TerminalWorkspace {
     } else {
       this.browserSuspensionReasons.delete(reason);
     }
-    const shouldSuspend = this.browserSuspensionReasons.size > 0;
+    this.refreshBrowserSuspensions();
+  }
+
+  private refreshBrowserSuspensions() {
     for (const pane of this.browserPanes.values()) {
-      pane.setInteractionSuspended(shouldSuspend);
+      this.applyBrowserSuspension(pane);
     }
+  }
+
+  private applyBrowserSuspension(pane: BrowserPane) {
+    const globallySuspended = this.browserSuspensionReasons.size > 0;
+    const overlapsProviderUsage = this.providerUsageOverlayBounds
+      ? pane.overlapsNativeOverlay(this.providerUsageOverlayBounds)
+      : false;
+    pane.setInteractionSuspended(globallySuspended || overlapsProviderUsage);
   }
 
   private appendStopBarrier(stop: Promise<void>) {
@@ -4754,9 +4954,11 @@ class BrowserController {
     this.state = "opening";
     this.label = label;
     this.button.disabled = true;
-    this.button.textContent = "브라우저 여는 중…";
+    this.button.textContent = tr("Opening browser…", "브라우저 여는 중…");
     this.workspace.showBrowserView();
-    this.workspace.setFooterStatus("격리된 child WebView를 준비하는 중…");
+    this.workspace.setFooterStatus(
+      tr("Preparing an isolated child WebView…", "격리된 child WebView를 준비하는 중…"),
+    );
     let webview: Webview | null = null;
     let removeCreatedListener: () => void = () => undefined;
     let removeErrorListener: () => void = () => undefined;
@@ -4797,24 +4999,29 @@ class BrowserController {
       }
 
       this.state = "open";
-      this.button.textContent = "브라우저 닫기";
+      this.button.textContent = tr("Close browser", "브라우저 닫기");
       await this.syncBounds(generation, webview);
       this.workspace.setFooterStatus(
-        "브라우저 PoC · 터미널 세션은 뒤에서 계속 실행 중",
+        tr(
+          "Browser PoC · terminal sessions continue running in the background",
+          "브라우저 PoC · 터미널 세션은 뒤에서 계속 실행 중",
+        ),
       );
     } catch (error) {
       if (generation === this.generation) {
         this.webview = null;
         this.label = null;
         this.state = "closed";
-        this.button.textContent = "브라우저 PoC";
+        this.button.textContent = tr("Browser PoC", "브라우저 PoC");
         this.workspace.showTerminalView();
       }
       if (webview) {
         await webview.hide().catch(() => undefined);
         await webview.close().catch(() => undefined);
       }
-      throw new Error(`브라우저 생성 실패: ${String(error)}`);
+      throw new Error(
+        tr(`Failed to create browser: ${String(error)}`, `브라우저 생성 실패: ${String(error)}`),
+      );
     } finally {
       removeCreatedListener();
       removeErrorListener();
@@ -4834,7 +5041,7 @@ class BrowserController {
     const generation = ++this.generation;
     this.state = "closing";
     this.button.disabled = true;
-    this.button.textContent = "브라우저 닫는 중…";
+    this.button.textContent = tr("Closing browser…", "브라우저 닫는 중…");
     try {
       // A native child WebView must be hidden before terminal DOM is revealed.
       await webview.hide();
@@ -4850,10 +5057,12 @@ class BrowserController {
       }
       this.state = "open";
       this.webview = stillExists;
-      this.button.textContent = "브라우저 닫기";
+      this.button.textContent = tr("Close browser", "브라우저 닫기");
       this.workspace.showBrowserView();
       await stillExists.show().catch(() => undefined);
-      throw new Error(`브라우저 종료 실패: ${String(error)}`);
+      throw new Error(
+        tr(`Failed to close browser: ${String(error)}`, `브라우저 종료 실패: ${String(error)}`),
+      );
     } finally {
       if (generation === this.generation && !this.shuttingDown) {
         this.button.disabled = false;
@@ -4866,7 +5075,7 @@ class BrowserController {
     this.label = null;
     this.state = "closed";
     this.button.disabled = this.shuttingDown;
-    this.button.textContent = "브라우저 PoC";
+    this.button.textContent = tr("Browser PoC", "브라우저 PoC");
     this.workspace.showTerminalView();
   }
 
@@ -4882,7 +5091,13 @@ class BrowserController {
         .then(() => this.syncBounds(generation, webview))
         .catch((error) => {
           if (generation === this.generation && this.webview === webview) {
-            this.workspace.setFooterStatus(`브라우저 배치 실패: ${String(error)}`, "error");
+            this.workspace.setFooterStatus(
+              tr(
+                `Failed to position browser: ${String(error)}`,
+                `브라우저 배치 실패: ${String(error)}`,
+              ),
+              "error",
+            );
           }
         });
     });
@@ -5005,6 +5220,7 @@ class ProviderUsageController {
   private pendingAccountAdd: Promise<void> | null = null;
   private accountRequestSequence = 0;
   private readonly listeners = new AbortController();
+  private readonly detailResizeObserver: ResizeObserver;
 
   constructor(
     private readonly codexTrigger: HTMLButtonElement,
@@ -5013,12 +5229,14 @@ class ProviderUsageController {
     private readonly codexWeekly: ProviderUsageLimitElements,
     private readonly grokWeekly: ProviderUsageLimitElements,
     private readonly detail: ProviderUsageDetailElements,
-    private readonly setNativeOverlayOpen: (open: boolean) => void,
+    private readonly setNativeOverlayOpen: (bounds: RectangleBounds | null) => void,
     private readonly ensureAccountSwitchReady: () => Promise<void>,
     private readonly restartForAccountSwitch: (provider: AgentProvider) => Promise<void>,
     private readonly rollbackAccountSwitchRestart: () => Promise<void>,
   ) {
     const signal = this.listeners.signal;
+    this.detailResizeObserver = new ResizeObserver(() => this.syncNativeOverlayBounds());
+    this.detailResizeObserver.observe(this.detail.popover);
     this.codexTrigger.addEventListener(
       "click",
       () => this.toggleDetail("codex", this.codexTrigger),
@@ -5044,6 +5262,9 @@ class ProviderUsageController {
     });
     window.addEventListener("keydown", (event) => this.onWindowKeyDown(event), { signal });
     window.addEventListener("resize", () => this.positionDetail(), { signal });
+    this.detail.popover.addEventListener("animationend", () => this.syncNativeOverlayBounds(), {
+      signal,
+    });
   }
 
   start() {
@@ -5054,18 +5275,24 @@ class ProviderUsageController {
     }, 15_000);
   }
 
+  refreshLocalizedUi() {
+    this.setUsageStale(this.usageStale);
+    this.renderLatestUsage();
+  }
+
   dispose() {
     this.disposed = true;
     window.clearInterval(this.timer);
     window.clearTimeout(this.resetTimer);
     this.accountRequestSequence += 1;
     this.listeners.abort();
+    this.detailResizeObserver.disconnect();
     this.codexTrigger.setAttribute("aria-expanded", "false");
     this.grokTrigger.setAttribute("aria-expanded", "false");
     this.detailOpener = null;
     this.activeDetailProvider = null;
     this.detail.popover.hidden = true;
-    this.setNativeOverlayOpen(false);
+    this.setNativeOverlayOpen(null);
   }
 
   blocksAppClose() {
@@ -5119,7 +5346,10 @@ class ProviderUsageController {
   private setUsageStale(stale: boolean) {
     this.usageStale = stale;
     const title = stale
-      ? "사용량 갱신에 실패했습니다. 마지막으로 확인한 값을 표시합니다."
+      ? tr(
+          "Usage refresh failed. Showing the last known values.",
+          "사용량 갱신에 실패했습니다. 마지막으로 확인한 값을 표시합니다.",
+        )
       : "";
     for (const trigger of [this.codexTrigger, this.grokTrigger]) {
       trigger.dataset.stale = String(stale);
@@ -5131,9 +5361,9 @@ class ProviderUsageController {
   private renderLatestUsage() {
     const usage = this.latestUsage;
     if (!usage) return;
-    this.renderLimit(this.codexFiveHour, usage.codex.fiveHour, "Codex 5시간");
-    this.renderLimit(this.codexWeekly, usage.codex.weekly, "Codex 주간");
-    this.renderLimit(this.grokWeekly, usage.grok.weekly, "Grok 주간");
+    this.renderLimit(this.codexFiveHour, usage.codex.fiveHour, tr("Codex 5-hour", "Codex 5시간"));
+    this.renderLimit(this.codexWeekly, usage.codex.weekly, tr("Codex weekly", "Codex 주간"));
+    this.renderLimit(this.grokWeekly, usage.grok.weekly, tr("Grok weekly", "Grok 주간"));
     this.renderDetail();
   }
 
@@ -5144,7 +5374,10 @@ class ProviderUsageController {
   ) {
     if (!limit) {
       elements.root.dataset.available = "false";
-      elements.root.setAttribute("aria-label", `${label} 남은 한도 정보 없음`);
+      elements.root.setAttribute(
+        "aria-label",
+        tr(`${label} remaining limit unavailable`, `${label} 남은 한도 정보 없음`),
+      );
       elements.meter.hidden = true;
       elements.meter.value = 0;
       elements.value.textContent = "--";
@@ -5155,10 +5388,13 @@ class ProviderUsageController {
     const rounded = Math.round(limit.remainingPercent);
     const reset = formatProviderResetCountdown(limit.resetsAt);
     elements.root.dataset.available = "true";
-    elements.root.setAttribute("aria-label", `${label}, ${rounded}% 남음, ${reset}`);
+    elements.root.setAttribute(
+      "aria-label",
+      tr(`${label}, ${rounded}% remaining, ${reset}`, `${label}, ${rounded}% 남음, ${reset}`),
+    );
     elements.meter.hidden = false;
     elements.meter.value = limit.remainingPercent;
-    elements.value.textContent = `${rounded}% 남음`;
+    elements.value.textContent = tr(`${rounded}% remaining`, `${rounded}% 남음`);
     elements.reset.hidden = true;
     elements.reset.textContent = "";
   }
@@ -5176,15 +5412,18 @@ class ProviderUsageController {
     this.grokTrigger.setAttribute("aria-expanded", String(provider === "grok"));
     this.codexTrigger.setAttribute(
       "aria-label",
-      provider === "codex" ? "Codex 남은 한도 상세 닫기" : "Codex 남은 한도 상세 보기",
+      provider === "codex"
+        ? tr("Close Codex usage details", "Codex 남은 한도 상세 닫기")
+        : tr("View Codex usage details", "Codex 남은 한도 상세 보기"),
     );
     this.grokTrigger.setAttribute(
       "aria-label",
-      provider === "grok" ? "Grok 남은 한도 상세 닫기" : "Grok 남은 한도 상세 보기",
+      provider === "grok"
+        ? tr("Close Grok usage details", "Grok 남은 한도 상세 닫기")
+        : tr("View Grok usage details", "Grok 남은 한도 상세 보기"),
     );
     this.detailAccounts = undefined;
     this.detail.popover.hidden = false;
-    this.setNativeOverlayOpen(true);
     this.positionDetail();
     this.renderDetail();
     void this.refresh();
@@ -5197,12 +5436,18 @@ class ProviderUsageController {
     this.detail.popover.hidden = true;
     this.codexTrigger.setAttribute("aria-expanded", "false");
     this.grokTrigger.setAttribute("aria-expanded", "false");
-    this.codexTrigger.setAttribute("aria-label", "Codex 남은 한도 상세 보기");
-    this.grokTrigger.setAttribute("aria-label", "Grok 남은 한도 상세 보기");
+    this.codexTrigger.setAttribute(
+      "aria-label",
+      tr("View Codex usage details", "Codex 남은 한도 상세 보기"),
+    );
+    this.grokTrigger.setAttribute(
+      "aria-label",
+      tr("View Grok usage details", "Grok 남은 한도 상세 보기"),
+    );
     this.detailOpener = null;
     this.activeDetailProvider = null;
     this.accountRequestSequence += 1;
-    this.setNativeOverlayOpen(false);
+    this.setNativeOverlayOpen(null);
     if (restoreFocus && !this.disposed && opener?.isConnected) opener.focus();
   }
 
@@ -5222,7 +5467,10 @@ class ProviderUsageController {
     const pendingAdd = this.pendingAccountAdd;
     this.accountOperation = "cancelling";
     this.accountRequestSequence += 1;
-    this.detail.accountState.textContent = "계정 추가를 취소하는 중";
+    this.detail.accountState.textContent = tr(
+      "Cancelling account addition",
+      "계정 추가를 취소하는 중",
+    );
     this.renderDetailAccount();
     try {
       await invoke<boolean>("cancel_provider_account_login", { provider });
@@ -5235,7 +5483,10 @@ class ProviderUsageController {
     } catch (error) {
       if (this.disposed) return;
       this.accountOperation = "adding";
-      this.detail.accountState.textContent = `계정 추가 취소 실패: ${errorMessage(error)}`;
+      this.detail.accountState.textContent = tr(
+        `Failed to cancel account addition: ${errorMessage(error)}`,
+        `계정 추가 취소 실패: ${errorMessage(error)}`,
+      );
       this.renderDetailAccount();
     }
   }
@@ -5271,6 +5522,13 @@ class ProviderUsageController {
     const desired = openerRect.left - footerRect.left;
     const maximum = Math.max(8, footerRect.width - width - 8);
     this.detail.popover.style.left = `${Math.max(8, Math.min(desired, maximum))}px`;
+    this.syncNativeOverlayBounds();
+  }
+
+  private syncNativeOverlayBounds() {
+    this.setNativeOverlayOpen(
+      this.detail.popover.hidden ? null : this.detail.popover.getBoundingClientRect(),
+    );
   }
 
   private async refreshAccount(provider: AgentProvider) {
@@ -5289,7 +5547,9 @@ class ProviderUsageController {
       ) {
         return;
       }
-      if (accounts.provider !== provider) throw new Error("계정 제공자가 일치하지 않습니다.");
+      if (accounts.provider !== provider) {
+        throw new Error(tr("The account provider does not match.", "계정 제공자가 일치하지 않습니다."));
+      }
       this.detailAccounts = accounts;
     } catch {
       if (
@@ -5329,10 +5589,16 @@ class ProviderUsageController {
     if (
       !confirmed &&
       !window.confirm(
-        `${providerName} 계정을 전환하면 모든 PowerShell·CLI와 내장 브라우저가 종료되고 ` +
-          "앱이 다시 시작됩니다. 재시작 후 새로 실행하는 CLI부터 선택한 계정이 적용되며, " +
-          "진행 중인 입력과 브라우저 상태는 사라지고 이전 계정의 대화는 자동으로 이어지지 않습니다. " +
-          "계속할까요?",
+        tr(
+          `Switching the ${providerName} account will close all PowerShell and CLI sessions and ` +
+            "embedded browsers, then restart the app. The selected account will apply to newly " +
+            "started CLI sessions after restart. In-progress input and browser state will be lost, " +
+            "and conversations from the previous account will not resume automatically. Continue?",
+          `${providerName} 계정을 전환하면 모든 PowerShell·CLI와 내장 브라우저가 종료되고 ` +
+            "앱이 다시 시작됩니다. 재시작 후 새로 실행하는 CLI부터 선택한 계정이 적용되며, " +
+            "진행 중인 입력과 브라우저 상태는 사라지고 이전 계정의 대화는 자동으로 이어지지 않습니다. " +
+            "계속할까요?",
+        ),
       )
     ) {
       this.detail.accountSelect.value = accounts.activeAccountId;
@@ -5342,19 +5608,26 @@ class ProviderUsageController {
     const sequence = ++this.accountRequestSequence;
     this.accountBusy = true;
     this.accountOperation = "switching";
-    this.detail.accountState.textContent = "작업 공간 상태를 확인하는 중";
+    this.detail.accountState.textContent = tr(
+      "Checking workspace state",
+      "작업 공간 상태를 확인하는 중",
+    );
     this.renderDetailAccount();
     let registrySwitched = false;
     try {
       await this.ensureAccountSwitchReady();
       if (!this.isCurrentAccountOperation(sequence, provider)) return;
-      this.detail.accountState.textContent = "계정을 전환하는 중";
+      this.detail.accountState.textContent = tr("Switching account", "계정을 전환하는 중");
       const response = normalizeProviderAccountListResponse(
         await invoke<unknown>("switch_provider_account", { provider, accountId }),
       );
-      if (response.provider !== provider) throw new Error("계정 제공자가 일치하지 않습니다.");
+      if (response.provider !== provider) {
+        throw new Error(tr("The account provider does not match.", "계정 제공자가 일치하지 않습니다."));
+      }
       if (response.activeAccountId !== accountId) {
-        throw new Error("선택한 계정이 활성화되지 않았습니다.");
+        throw new Error(
+          tr("The selected account was not activated.", "선택한 계정이 활성화되지 않았습니다."),
+        );
       }
       registrySwitched = true;
       if (!this.isCurrentAccountOperation(sequence, provider)) {
@@ -5369,7 +5642,9 @@ class ProviderUsageController {
             restored.provider !== provider ||
             restored.activeAccountId !== accounts.activeAccountId
           ) {
-            throw new Error("이전 계정이 복구되지 않았습니다.");
+            throw new Error(
+              tr("The previous account was not restored.", "이전 계정이 복구되지 않았습니다."),
+            );
           }
         } catch {
           console.error("Provider account rollback after disposal failed");
@@ -5380,11 +5655,11 @@ class ProviderUsageController {
       if (!response.restartRequired) {
         this.accountBusy = false;
         this.accountOperation = "idle";
-        this.detail.accountState.textContent = "계정을 전환했습니다.";
+        this.detail.accountState.textContent = tr("Account switched.", "계정을 전환했습니다.");
         this.renderDetailAccount();
         return;
       }
-      this.detail.accountState.textContent = "CLI를 다시 시작하는 중";
+      this.detail.accountState.textContent = tr("Restarting CLI sessions", "CLI를 다시 시작하는 중");
       await this.restartForAccountSwitch(provider);
     } catch (error) {
       this.accountBusy = false;
@@ -5403,7 +5678,9 @@ class ProviderUsageController {
             restored.provider !== provider ||
             restored.activeAccountId !== accounts.activeAccountId
           ) {
-            throw new Error("이전 계정이 복구되지 않았습니다.");
+            throw new Error(
+              tr("The previous account was not restored.", "이전 계정이 복구되지 않았습니다."),
+            );
           }
           this.detailAccounts = restored;
         } catch {
@@ -5419,10 +5696,16 @@ class ProviderUsageController {
       }
       if (this.disposed || sequence !== this.accountRequestSequence) return;
       this.detail.accountState.textContent = registryRollbackFailed
-        ? `전환 복구 실패: ${errorMessage(error)} · 새 계정 상태를 안전하게 확인하려면 앱을 직접 다시 시작해 주세요.`
+        ? tr(
+            `Switch recovery failed: ${errorMessage(error)} · Restart the app manually to safely verify the new account state.`,
+            `전환 복구 실패: ${errorMessage(error)} · 새 계정 상태를 안전하게 확인하려면 앱을 직접 다시 시작해 주세요.`,
+          )
         : workspaceRollbackFailed
-          ? `전환 실패: ${errorMessage(error)} · 이전 대화의 자동 재개 차단은 유지됩니다.`
-          : `전환 실패: ${errorMessage(error)}`;
+          ? tr(
+              `Switch failed: ${errorMessage(error)} · Automatic resume for previous conversations remains blocked.`,
+              `전환 실패: ${errorMessage(error)} · 이전 대화의 자동 재개 차단은 유지됩니다.`,
+            )
+          : tr(`Switch failed: ${errorMessage(error)}`, `전환 실패: ${errorMessage(error)}`);
       this.renderDetailAccount();
     }
   }
@@ -5437,7 +5720,10 @@ class ProviderUsageController {
     const sequence = ++this.accountRequestSequence;
     this.accountBusy = true;
     this.accountOperation = "adding";
-    this.detail.accountState.textContent = "계정 추가 가능 상태를 확인하는 중";
+    this.detail.accountState.textContent = tr(
+      "Checking whether an account can be added",
+      "계정 추가 가능 상태를 확인하는 중",
+    );
     this.renderDetailAccount();
     let settleAccountAdd!: () => void;
     const pendingAdd = new Promise<void>((resolve) => {
@@ -5447,38 +5733,60 @@ class ProviderUsageController {
     try {
       await this.ensureAccountSwitchReady();
       if (!this.isCurrentAccountOperation(sequence, provider)) return;
-      this.detail.accountState.textContent = `${providerName} 브라우저 로그인을 기다리는 중`;
+      this.detail.accountState.textContent = tr(
+        `Waiting for ${providerName} browser sign-in`,
+        `${providerName} 브라우저 로그인을 기다리는 중`,
+      );
       const response = normalizeProviderAccountListResponse(
         await invoke<unknown>("add_provider_account", { provider }),
       );
-      if (response.provider !== provider) throw new Error("계정 제공자가 일치하지 않습니다.");
+      if (response.provider !== provider) {
+        throw new Error(tr("The account provider does not match.", "계정 제공자가 일치하지 않습니다."));
+      }
       if (response.activeAccountId !== previousAccountId) {
-        throw new Error("계정 추가 중 현재 계정이 변경되었습니다.");
+        throw new Error(
+          tr(
+            "The active account changed while adding an account.",
+            "계정 추가 중 현재 계정이 변경되었습니다.",
+          ),
+        );
       }
       if (!this.isCurrentAccountOperation(sequence, provider)) return;
       const addedAccounts = response.accounts.filter(
         (account) => !existingAccountIds.has(account.id),
       );
-      if (addedAccounts.length > 1) throw new Error("계정 추가 결과가 올바르지 않습니다.");
+      if (addedAccounts.length > 1) {
+        throw new Error(tr("The account addition result is invalid.", "계정 추가 결과가 올바르지 않습니다."));
+      }
       this.detailAccounts = response;
       this.accountBusy = false;
       this.accountOperation = "idle";
       this.renderDetailAccount();
       const addedAccount = addedAccounts[0];
       if (!addedAccount) {
-        this.detail.accountState.textContent = "이미 등록된 계정입니다 · 기존 계정 유지";
+        this.detail.accountState.textContent = tr(
+          "Account already registered · keeping the current account",
+          "이미 등록된 계정입니다 · 기존 계정 유지",
+        );
         return;
       }
       if (
         window.confirm(
-          `${providerName} 계정을 추가했습니다. 이 계정으로 전환하면 모든 PowerShell·CLI와 ` +
-            "내장 브라우저가 종료되고 앱이 다시 시작됩니다. 지금 전환할까요?",
+          tr(
+            `Added a ${providerName} account. Switching to it will close all PowerShell and CLI ` +
+              "sessions and embedded browsers, then restart the app. Switch now?",
+            `${providerName} 계정을 추가했습니다. 이 계정으로 전환하면 모든 PowerShell·CLI와 ` +
+              "내장 브라우저가 종료되고 앱이 다시 시작됩니다. 지금 전환할까요?",
+          ),
         )
       ) {
         await this.switchAccount(addedAccount.id, true);
         return;
       }
-      this.detail.accountState.textContent = "계정이 추가되었습니다 · 기존 계정 유지";
+      this.detail.accountState.textContent = tr(
+        "Account added · keeping the current account",
+        "계정이 추가되었습니다 · 기존 계정 유지",
+      );
     } catch (error) {
       if (
         this.disposed ||
@@ -5489,7 +5797,10 @@ class ProviderUsageController {
       }
       this.accountBusy = false;
       this.accountOperation = "idle";
-      this.detail.accountState.textContent = `계정 추가 실패: ${errorMessage(error)}`;
+      this.detail.accountState.textContent = tr(
+        `Failed to add account: ${errorMessage(error)}`,
+        `계정 추가 실패: ${errorMessage(error)}`,
+      );
       this.renderDetailAccount();
     } finally {
       settleAccountAdd();
@@ -5510,15 +5821,26 @@ class ProviderUsageController {
     const showFiveHour = provider === "codex" || usage?.fiveHour != null;
     this.detail.fiveHour.root.hidden = !showFiveHour;
     if (showFiveHour) {
-      this.renderDetailLimit(this.detail.fiveHour, usage?.fiveHour ?? null, `${providerName} 5시간`);
+      this.renderDetailLimit(
+        this.detail.fiveHour,
+        usage?.fiveHour ?? null,
+        tr(`${providerName} 5-hour`, `${providerName} 5시간`),
+      );
     }
-    this.renderDetailLimit(this.detail.weekly, usage?.weekly ?? null, `${providerName} 주간`);
+    this.renderDetailLimit(
+      this.detail.weekly,
+      usage?.weekly ?? null,
+      tr(`${providerName} weekly`, `${providerName} 주간`),
+    );
 
     this.detail.popover.setAttribute("aria-busy", String(this.requestRunning));
     if (this.requestRunning && !this.latestUsage) {
-      this.detail.usageState.textContent = "사용량을 불러오는 중";
+      this.detail.usageState.textContent = tr("Loading usage", "사용량을 불러오는 중");
     } else if (this.usageStale) {
-      this.detail.usageState.textContent = "갱신 실패 · 마지막 확인값";
+      this.detail.usageState.textContent = tr(
+        "Refresh failed · last known values",
+        "갱신 실패 · 마지막 확인값",
+      );
     } else {
       this.detail.usageState.textContent = "";
     }
@@ -5534,35 +5856,48 @@ class ProviderUsageController {
     this.grokTrigger.disabled = switching || cancelling || (adding && provider !== "grok");
     this.detail.closeButton.disabled = switching || cancelling;
     this.detail.closeButton.title = adding
-      ? "계정 추가 취소하고 닫기"
+      ? tr("Cancel account addition and close", "계정 추가 취소하고 닫기")
       : switching || cancelling
-        ? "계정 작업이 끝난 뒤 닫을 수 있습니다."
-        : "닫기";
+        ? tr(
+            "You can close this after the account operation finishes.",
+            "계정 작업이 끝난 뒤 닫을 수 있습니다.",
+          )
+        : tr("Close", "닫기");
     this.detail.closeButton.setAttribute(
       "aria-label",
-      adding ? "계정 추가 취소하고 닫기" : "사용량 상세 닫기",
+      adding
+        ? tr("Cancel account addition and close", "계정 추가 취소하고 닫기")
+        : tr("Close usage details", "사용량 상세 닫기"),
     );
     this.detail.addAccount.disabled =
       this.accountBusy || accounts == null || accounts.accounts.length >= 32;
     this.detail.addAccount.title =
-      accounts && accounts.accounts.length >= 32 ? "계정은 최대 32개까지 등록할 수 있습니다." : "";
+      accounts && accounts.accounts.length >= 32
+        ? tr("You can register up to 32 accounts.", "계정은 최대 32개까지 등록할 수 있습니다.")
+        : "";
     if (accounts === undefined) {
-      this.setAccountOption("", "확인 중");
+      this.setAccountOption("", tr("Checking", "확인 중"));
       this.detail.accountSelect.disabled = true;
       return;
     }
     if (accounts === null) {
-      this.setAccountOption("", "계정 조회 실패");
+      this.setAccountOption("", tr("Account lookup failed", "계정 조회 실패"));
       this.detail.accountSelect.disabled = true;
       if (!this.detail.accountState.textContent) {
-        this.detail.accountState.textContent = "계정 목록을 확인할 수 없습니다.";
+        this.detail.accountState.textContent = tr(
+          "The account list is unavailable.",
+          "계정 목록을 확인할 수 없습니다.",
+        );
       }
       return;
     }
     const options = accounts.accounts.map((account) => {
       const option = document.createElement("option");
       option.value = account.id;
-      option.textContent = account.displayLabel;
+      option.textContent =
+        account.displayLabel === "로그인 안 됨"
+          ? tr("Not signed in", "로그인 안 됨")
+          : account.displayLabel;
       return option;
     });
     this.detail.accountSelect.replaceChildren(...options);
@@ -5589,9 +5924,12 @@ class ProviderUsageController {
       elements.root.dataset.available = "false";
       elements.meter.hidden = true;
       elements.meter.value = 0;
-      elements.meter.setAttribute("aria-label", `${label} 한도 정보 없음`);
+      elements.meter.setAttribute(
+        "aria-label",
+        tr(`${label} limit unavailable`, `${label} 한도 정보 없음`),
+      );
       elements.remaining.textContent = "--";
-      elements.reset.textContent = "정보 없음";
+      elements.reset.textContent = tr("No information", "정보 없음");
       return;
     }
     elements.root.dataset.available = "true";
@@ -5599,7 +5937,10 @@ class ProviderUsageController {
     elements.meter.value = limit.remainingPercent;
     elements.meter.setAttribute(
       "aria-label",
-      `${label} 한도 ${formatProviderUsagePercent(limit.remainingPercent)} 남음`,
+      tr(
+        `${label} limit: ${formatProviderUsagePercent(limit.remainingPercent)} remaining`,
+        `${label} 한도 ${formatProviderUsagePercent(limit.remainingPercent)} 남음`,
+      ),
     );
     elements.remaining.textContent = formatProviderUsagePercent(limit.remainingPercent);
     elements.reset.textContent = formatProviderUsageResetDetail(limit.resetsAt);
@@ -5614,11 +5955,19 @@ class PhoneNotificationController {
   private deliveryRunning = false;
   private busy = false;
   private disposed = false;
+  private settingsLoadError: string | null = null;
+  private activeSettingsTab: "general" | "notifications" = "general";
+  private readonly saveButton: HTMLButtonElement;
 
   constructor(
     private readonly openButton: HTMLButtonElement,
     private readonly dialog: HTMLDialogElement,
     private readonly form: HTMLFormElement,
+    private readonly generalTab: HTMLButtonElement,
+    private readonly notificationsTab: HTMLButtonElement,
+    private readonly generalPanel: HTMLElement,
+    private readonly notificationsPanel: HTMLElement,
+    private readonly languageSelect: HTMLSelectElement,
     private readonly enabledInput: HTMLInputElement,
     private readonly webhookInput: HTMLInputElement,
     private readonly webhookState: HTMLElement,
@@ -5630,8 +5979,25 @@ class PhoneNotificationController {
     private readonly status: HTMLElement,
     private readonly setModalOpen: (open: boolean) => void,
   ) {
+    const saveButton = this.form.querySelector<HTMLButtonElement>(".dialog-submit");
+    if (!saveButton) throw new Error("Missing settings save button");
+    this.saveButton = saveButton;
+    // General settings are local-only and must remain available even while
+    // the optional Discord backend is loading or unavailable.
+    this.openButton.disabled = false;
     this.openButton.addEventListener("click", () => this.open());
     this.closeButton.addEventListener("click", () => this.dialog.close());
+    this.generalTab.addEventListener("click", () => this.setActiveSettingsTab("general", true));
+    this.notificationsTab.addEventListener("click", () =>
+      this.setActiveSettingsTab("notifications", true),
+    );
+    for (const tab of [this.generalTab, this.notificationsTab]) {
+      tab.addEventListener("keydown", (event) => this.onSettingsTabKeyDown(event));
+    }
+    this.languageSelect.addEventListener("change", () => {
+      const language = this.languageSelect.value;
+      if (language === "en" || language === "ko") setAppLanguage(language);
+    });
     this.removeButton.addEventListener("click", () => void this.removeWebhook());
     this.testButton.addEventListener("click", () => void this.test());
     this.form.addEventListener("submit", (event) => {
@@ -5639,11 +6005,20 @@ class PhoneNotificationController {
       void this.save(true);
     });
     this.dialog.addEventListener("close", () => this.setModalOpen(false));
+    this.languageSelect.value = getAppLanguage();
+    this.setActiveSettingsTab("general", false);
+    this.renderButton();
   }
 
   start() {
     if (!this.loadPromise) this.loadPromise = this.load();
     return this.loadPromise;
+  }
+
+  refreshLocalizedUi() {
+    this.languageSelect.value = getAppLanguage();
+    this.renderButton();
+    this.renderWebhookState();
   }
 
   dispose() {
@@ -5700,6 +6075,7 @@ class PhoneNotificationController {
             eventId: delivery.eventId,
             projectName: delivery.labels.projectName,
             terminalName: delivery.labels.terminalName,
+            language: getAppLanguage(),
           },
         });
         return;
@@ -5730,23 +6106,39 @@ class PhoneNotificationController {
         await invoke<unknown>("load_phone_notification_settings"),
       );
       this.settings = settings;
+      this.settingsLoadError = null;
       this.openButton.disabled = false;
       this.renderButton();
     } catch (error) {
-      this.openButton.disabled = true;
-      this.openButton.title = `환경설정을 불러오지 못했습니다: ${errorMessage(error)}`;
+      this.settingsLoadError = errorMessage(error);
+      // General settings, including language selection, must remain available
+      // even when the optional Discord settings backend cannot be reached.
+      this.openButton.disabled = false;
+      this.renderButton();
     }
   }
 
   private open() {
     const settings = this.settings;
-    if (!settings || this.dialog.open) return;
-    this.enabledInput.checked = settings.enabled;
+    if (this.dialog.open) return;
+    this.languageSelect.value = getAppLanguage();
+    if (settings) {
+      this.enabledInput.checked = settings.enabled;
+      this.successInput.checked = settings.notifyOnSuccess;
+      this.errorInput.checked = settings.notifyOnError;
+    }
     this.webhookInput.value = "";
-    this.successInput.checked = settings.notifyOnSuccess;
-    this.errorInput.checked = settings.notifyOnError;
     this.renderWebhookState();
-    this.setStatus("");
+    this.setStatus(
+      this.settingsLoadError
+        ? tr(
+            `Could not load notification settings: ${this.settingsLoadError}`,
+            `알림 설정을 불러오지 못했습니다: ${this.settingsLoadError}`,
+          )
+        : "",
+      this.settingsLoadError ? "error" : "normal",
+    );
+    this.setActiveSettingsTab("general", false);
     this.setModalOpen(true);
     try {
       this.dialog.showModal();
@@ -5754,7 +6146,28 @@ class PhoneNotificationController {
       this.setModalOpen(false);
       throw error;
     }
-    this.enabledInput.focus();
+    this.generalTab.focus();
+  }
+
+  private setActiveSettingsTab(tab: "general" | "notifications", focus: boolean) {
+    this.activeSettingsTab = tab;
+    const generalActive = tab === "general";
+    this.generalTab.setAttribute("aria-selected", String(generalActive));
+    this.generalTab.tabIndex = generalActive ? 0 : -1;
+    this.notificationsTab.setAttribute("aria-selected", String(!generalActive));
+    this.notificationsTab.tabIndex = generalActive ? -1 : 0;
+    this.generalPanel.hidden = !generalActive;
+    this.notificationsPanel.hidden = generalActive;
+    this.testButton.hidden = generalActive;
+    this.saveButton.hidden = generalActive;
+    if (focus) (generalActive ? this.generalTab : this.notificationsTab).focus();
+  }
+
+  private onSettingsTabKeyDown(event: KeyboardEvent) {
+    if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+    event.preventDefault();
+    const next = this.activeSettingsTab === "general" ? "notifications" : "general";
+    this.setActiveSettingsTab(next, true);
   }
 
   private readForm(): PhoneNotificationSettingsUpdate | null {
@@ -5766,7 +6179,10 @@ class PhoneNotificationController {
       !webhookUrl &&
       this.settings?.webhookConfigured !== true
     ) {
-      this.setStatus("Discord 웹훅 URL을 먼저 입력하세요.", "error");
+      this.setStatus(
+        tr("Enter a Discord webhook URL first.", "Discord 웹훅 URL을 먼저 입력하세요."),
+        "error",
+      );
       this.webhookInput.focus();
       return null;
     }
@@ -5784,7 +6200,7 @@ class PhoneNotificationController {
     const next = this.readForm();
     if (!next) return null;
     this.busy = true;
-    this.setStatus("저장 중…");
+    this.setStatus(tr("Saving…", "저장 중…"));
     try {
       const saved = normalizePhoneNotificationSettings(
         await invoke<unknown>("save_phone_notification_settings", { settings: next }),
@@ -5793,11 +6209,17 @@ class PhoneNotificationController {
       this.webhookInput.value = "";
       this.renderButton();
       this.renderWebhookState();
-      this.setStatus("저장했습니다.");
+      this.setStatus(tr("Saved.", "저장했습니다."));
       if (closeAfterSave) this.dialog.close();
       return saved;
     } catch (error) {
-      this.setStatus(`저장하지 못했습니다: ${errorMessage(error)}`, "error");
+      this.setStatus(
+        tr(
+          `Could not save: ${errorMessage(error)}`,
+          `저장하지 못했습니다: ${errorMessage(error)}`,
+        ),
+        "error",
+      );
       return null;
     } finally {
       this.busy = false;
@@ -5807,32 +6229,50 @@ class PhoneNotificationController {
   private async test() {
     if (this.busy) return;
     if (!this.enabledInput.checked) {
-      this.setStatus("먼저 휴대폰 알림 사용을 켜세요.", "error");
+      this.setStatus(
+        tr("Enable mobile notifications first.", "먼저 휴대폰 알림 사용을 켜세요."),
+        "error",
+      );
       return;
     }
     const saved = await this.save(false);
     if (!saved) return;
     if (!saved.enabled || !saved.webhookConfigured) {
-      this.setStatus("Discord 웹훅을 등록하고 알림 사용을 켜세요.", "error");
+      this.setStatus(
+        tr(
+          "Register a Discord webhook and enable notifications.",
+          "Discord 웹훅을 등록하고 알림 사용을 켜세요.",
+        ),
+        "error",
+      );
       return;
     }
     this.busy = true;
-    this.setStatus("테스트 알림 전송 중…");
+    this.setStatus(tr("Sending test notification…", "테스트 알림 전송 중…"));
     try {
       const result = await invoke<PhoneNotificationResult>("send_phone_notification", {
         request: {
           kind: "test",
           eventId: createPhoneNotificationEventId("test"),
           projectName: "IHATECODING",
-          terminalName: "테스트 알림",
+          terminalName: tr("Test notification", "테스트 알림"),
+          language: getAppLanguage(),
         },
       });
       this.setStatus(
-        result.sent ? "테스트 알림을 보냈습니다." : "알림 설정이 꺼져 있습니다.",
+        result.sent
+          ? tr("Test notification sent.", "테스트 알림을 보냈습니다.")
+          : tr("Notifications are disabled.", "알림 설정이 꺼져 있습니다."),
         result.sent ? "normal" : "error",
       );
     } catch (error) {
-      this.setStatus(`테스트 전송에 실패했습니다: ${errorMessage(error)}`, "error");
+      this.setStatus(
+        tr(
+          `Failed to send test notification: ${errorMessage(error)}`,
+          `테스트 전송에 실패했습니다: ${errorMessage(error)}`,
+        ),
+        "error",
+      );
     } finally {
       this.busy = false;
     }
@@ -5841,7 +6281,7 @@ class PhoneNotificationController {
   private async removeWebhook() {
     if (this.busy || !this.settings?.webhookConfigured) return;
     this.busy = true;
-    this.setStatus("저장된 Discord 웹훅 제거 중…");
+    this.setStatus(tr("Removing saved Discord webhook…", "저장된 Discord 웹훅 제거 중…"));
     try {
       const saved = normalizePhoneNotificationSettings(
         await invoke<unknown>("save_phone_notification_settings", {
@@ -5859,9 +6299,15 @@ class PhoneNotificationController {
       this.webhookInput.value = "";
       this.renderButton();
       this.renderWebhookState();
-      this.setStatus("저장된 Discord 웹훅을 제거했습니다.");
+      this.setStatus(tr("Saved Discord webhook removed.", "저장된 Discord 웹훅을 제거했습니다."));
     } catch (error) {
-      this.setStatus(`웹훅을 제거하지 못했습니다: ${errorMessage(error)}`, "error");
+      this.setStatus(
+        tr(
+          `Could not remove webhook: ${errorMessage(error)}`,
+          `웹훅을 제거하지 못했습니다: ${errorMessage(error)}`,
+        ),
+        "error",
+      );
     } finally {
       this.busy = false;
     }
@@ -5869,14 +6315,21 @@ class PhoneNotificationController {
 
   private renderWebhookState() {
     const configured = this.settings?.webhookConfigured === true;
-    this.webhookState.textContent = configured ? "등록됨" : "등록 안 됨";
+    this.webhookState.textContent = configured
+      ? tr("Registered", "등록됨")
+      : tr("Not registered", "등록 안 됨");
     this.webhookState.dataset.configured = String(configured);
     this.removeButton.disabled = !configured;
   }
 
   private renderButton() {
-    this.openButton.setAttribute("aria-label", "환경설정 열기");
-    this.openButton.title = "환경설정";
+    this.openButton.setAttribute("aria-label", tr("Open settings", "환경설정 열기"));
+    this.openButton.title = this.settingsLoadError
+      ? tr(
+          `Could not load notification settings: ${this.settingsLoadError}`,
+          `알림 설정을 불러오지 못했습니다: ${this.settingsLoadError}`,
+        )
+      : tr("Settings", "환경설정");
   }
 
   private setStatus(message: string, tone: StatusTone = "normal") {
@@ -5907,7 +6360,12 @@ class AgentEventController {
       await invoke("subscribe_agent_events", { onEvent: this.channel });
     } catch (error) {
       if (!this.disposed) {
-        this.reportError(`완료 알림 연결 실패: ${errorMessage(error)}`);
+        this.reportError(
+          tr(
+            `Failed to connect completion notifications: ${errorMessage(error)}`,
+            `완료 알림 연결 실패: ${errorMessage(error)}`,
+          ),
+        );
       }
     }
   }
@@ -6254,7 +6712,9 @@ async function waitForWebview(label: string, timeoutMs: number) {
     if (await Webview.getByLabel(label)) return;
     await delay(25);
   }
-  throw new Error("child WebView 생성 시간이 초과되었습니다.");
+  throw new Error(
+    tr("Timed out creating the child WebView.", "child WebView 생성 시간이 초과되었습니다."),
+  );
 }
 
 function delay(milliseconds: number) {
@@ -6267,7 +6727,7 @@ function nextAnimationFrame() {
 
 function normalizeBrowserUrl(rawUrl: string) {
   const trimmed = rawUrl.trim();
-  if (!trimmed) throw new Error("웹 주소를 입력하세요.");
+  if (!trimmed) throw new Error(tr("Enter a web address.", "웹 주소를 입력하세요."));
   const hasScheme = /^[a-z][a-z\d+.-]*:\/\//iu.test(trimmed);
   const localAddress = /^(?:localhost|127(?:\.\d{1,3}){3}|\[::1\])(?::\d+)?(?:[/?#]|$)/iu.test(
     trimmed,
@@ -6277,10 +6737,17 @@ function normalizeBrowserUrl(rawUrl: string) {
     : `${localAddress ? "http" : "https"}://${trimmed}`;
   const parsed = new URL(candidate);
   if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-    throw new Error("http 또는 https 주소만 열 수 있습니다.");
+    throw new Error(
+      tr("Only http or https addresses can be opened.", "http 또는 https 주소만 열 수 있습니다."),
+    );
   }
   if (!parsed.hostname || parsed.username || parsed.password) {
-    throw new Error("로그인 정보가 포함되지 않은 웹 주소만 열 수 있습니다.");
+    throw new Error(
+      tr(
+        "Web addresses containing sign-in credentials cannot be opened.",
+        "로그인 정보가 포함되지 않은 웹 주소만 열 수 있습니다.",
+      ),
+    );
   }
   return parsed.href;
 }
@@ -6385,7 +6852,7 @@ function ratiosEqual(left: readonly number[], right: readonly number[]) {
 }
 
 function errorMessage(error: unknown) {
-  return error instanceof Error ? error.message : String(error);
+  return localizeBackendMessage(error instanceof Error ? error.message : String(error));
 }
 
 function normalizeAgentTurnId(value: unknown) {
@@ -6457,7 +6924,12 @@ function normalizePhoneNotificationSettings(value: unknown): PhoneNotificationSe
     typeof value.notifyOnSuccess !== "boolean" ||
     typeof value.notifyOnError !== "boolean"
   ) {
-    throw new Error("휴대폰 알림 설정 형식이 올바르지 않습니다.");
+    throw new Error(
+      tr(
+        "The mobile notification settings format is invalid.",
+        "휴대폰 알림 설정 형식이 올바르지 않습니다.",
+      ),
+    );
   }
   return {
     enabled: value.enabled,
@@ -6469,14 +6941,18 @@ function normalizePhoneNotificationSettings(value: unknown): PhoneNotificationSe
 
 function normalizeClipboardSnapshot(value: unknown): NativeClipboardSnapshot {
   if (!isRecord(value)) {
-    throw new Error("클립보드 응답 형식이 올바르지 않습니다.");
+    throw new Error(
+      tr("The clipboard response format is invalid.", "클립보드 응답 형식이 올바르지 않습니다."),
+    );
   }
   if (value.kind === "image") return { kind: "image" };
   if (value.kind === "empty") return { kind: "empty" };
   if (value.kind === "text" && typeof value.text === "string") {
     return { kind: "text", text: value.text };
   }
-  throw new Error("클립보드 응답 형식이 올바르지 않습니다.");
+  throw new Error(
+    tr("The clipboard response format is invalid.", "클립보드 응답 형식이 올바르지 않습니다."),
+  );
 }
 
 function requireElement(id: string): HTMLElement {
@@ -6545,30 +7021,25 @@ type ProviderUsageDetailElements = {
   usageState: HTMLElement;
 };
 
-const providerUsageTimestampFormatter = new Intl.DateTimeFormat("ko-KR", {
-  month: "numeric",
-  day: "numeric",
-  hour: "2-digit",
-  minute: "2-digit",
-});
-
-const providerUsagePercentFormatter = new Intl.NumberFormat("ko-KR", {
-  maximumFractionDigits: 1,
-});
 function formatProviderUsageTimestamp(value: string) {
-  return providerUsageTimestampFormatter.format(new Date(value));
+  return new Intl.DateTimeFormat(appLocale(), {
+    month: "numeric",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(new Date(value));
 }
 
 function formatProviderUsagePercent(value: number) {
-  return `${providerUsagePercentFormatter.format(value)}%`;
+  return `${new Intl.NumberFormat(appLocale(), { maximumFractionDigits: 1 }).format(value)}%`;
 }
 
 function formatProviderUsageResetDetail(resetsAt: string) {
   const timestamp = formatProviderUsageTimestamp(resetsAt);
   const countdown = formatProviderResetCountdown(resetsAt);
-  return countdown === "곧 초기화"
-    ? `${timestamp} · 곧 초기화`
-    : `${timestamp} · ${countdown} 후`;
+  return countdown === "곧 초기화" || countdown === "Resetting soon"
+    ? tr(`${timestamp} · Resetting soon`, `${timestamp} · 곧 초기화`)
+    : tr(`${timestamp} · Resets in ${countdown}`, `${timestamp} · ${countdown} 후`);
 }
 
 function requireProviderUsageLimit(id: string): ProviderUsageLimitElements {
@@ -6643,6 +7114,11 @@ const providerUsageDetail = requireProviderUsageDetail();
 const openSettingsButton = requireButton("open-settings");
 const settingsDialog = requireDialog("settings-dialog");
 const settingsForm = requireForm("settings-form");
+const settingsGeneralTab = requireButton("settings-general-tab");
+const settingsNotificationsTab = requireButton("settings-notifications-tab");
+const settingsGeneralPanel = requireElement("settings-general-panel");
+const settingsNotificationsPanel = requireElement("settings-notifications-panel");
+const appLanguageSelect = requireSelect("app-language");
 const phoneNotificationEnabled = requireInput("phone-notification-enabled");
 const phoneNotificationWebhook = requireInput("phone-notification-webhook");
 const phoneNotificationWebhookState = requireElement("phone-notification-webhook-state");
@@ -6697,6 +7173,11 @@ phoneNotifications = new PhoneNotificationController(
   openSettingsButton,
   settingsDialog,
   settingsForm,
+  settingsGeneralTab,
+  settingsNotificationsTab,
+  settingsGeneralPanel,
+  settingsNotificationsPanel,
+  appLanguageSelect,
   phoneNotificationEnabled,
   phoneNotificationWebhook,
   phoneNotificationWebhookState,
@@ -6720,12 +7201,16 @@ const providerUsage = new ProviderUsageController(
   codexWeeklyUsage,
   grokWeeklyUsage,
   providerUsageDetail,
-  (open) => workspace.setNativeOverlayOpen(open),
+  (bounds) => workspace.setNativeOverlayOpen(bounds),
   ensureProviderAccountSwitchReady,
   restartForProviderAccountSwitch,
   rollbackProviderAccountSwitchRestart,
 );
 providerUsage.start();
+const unsubscribeAppLanguage = subscribeAppLanguage((_language: AppLanguage) => {
+  phoneNotifications.refreshLocalizedUi();
+  providerUsage.refreshLocalizedUi();
+});
 controller = createPhase4WorkspaceController(workspace, {
   projectList,
   tabList,
@@ -6763,7 +7248,10 @@ void BrowserController;
 let productionMigrationError: string | null = null;
 const productionMigrationPromise = invoke("import_discovered_production_catalog").catch(
   (error) => {
-    productionMigrationError = `기존 IHATECODING 프로젝트 자동 가져오기를 건너뛰었습니다. ${errorMessage(error)}`;
+    productionMigrationError = tr(
+      `Skipped automatic import of existing IHATECODING projects. ${errorMessage(error)}`,
+      `기존 IHATECODING 프로젝트 자동 가져오기를 건너뛰었습니다. ${errorMessage(error)}`,
+    );
   },
 );
 const initializationPromise = Promise.all([productionMigrationPromise, agentEventsReady])
@@ -6778,13 +7266,17 @@ void initializationPromise;
 
 async function ensureProviderAccountSwitchReady() {
   await initializationPromise;
-  if (!controller) throw new Error("작업 공간이 아직 준비되지 않았습니다.");
+  if (!controller) {
+    throw new Error(tr("The workspace is not ready yet.", "작업 공간이 아직 준비되지 않았습니다."));
+  }
   await controller.assertProviderAccountRestartReady();
 }
 
 async function restartForProviderAccountSwitch(provider: AgentProvider) {
   await initializationPromise;
-  if (!controller) throw new Error("작업 공간이 아직 준비되지 않았습니다.");
+  if (!controller) {
+    throw new Error(tr("The workspace is not ready yet.", "작업 공간이 아직 준비되지 않았습니다."));
+  }
   await workspace.captureBrowserPaneUrls();
   await controller.prepareProviderAccountRestart(provider);
   let terminalEngineStopped = false;
@@ -6794,14 +7286,19 @@ async function restartForProviderAccountSwitch(provider: AgentProvider) {
     await invoke("restart_application");
   } catch (error) {
     const recovery = terminalEngineStopped
-      ? " 터미널 엔진이 종료되었습니다. 앱을 직접 다시 시작해 주세요."
+      ? tr(
+          " The terminal engine has stopped. Restart the app manually.",
+          " 터미널 엔진이 종료되었습니다. 앱을 직접 다시 시작해 주세요.",
+        )
       : "";
     throw new Error(`${errorMessage(error)}${recovery}`);
   }
 }
 
 async function rollbackProviderAccountSwitchRestart() {
-  if (!controller) throw new Error("작업 공간이 아직 준비되지 않았습니다.");
+  if (!controller) {
+    throw new Error(tr("The workspace is not ready yet.", "작업 공간이 아직 준비되지 않았습니다."));
+  }
   await controller.rollbackProviderAccountRestart();
 }
 
@@ -6810,7 +7307,10 @@ let closeBarrierRunning = false;
 void currentAppWindow.onCloseRequested(async (event) => {
   event.preventDefault();
   if (providerUsage.blocksAppClose()) {
-    workspace.setFooterStatus("계정 전환을 마친 뒤 앱을 종료합니다.", "error");
+    workspace.setFooterStatus(
+      tr("The app will close after the account switch finishes.", "계정 전환을 마친 뒤 앱을 종료합니다."),
+      "error",
+    );
     return;
   }
   if (closeBarrierRunning) {
@@ -6821,6 +7321,7 @@ void currentAppWindow.onCloseRequested(async (event) => {
     agentEvents.dispose();
     providerUsage.dispose();
     phoneNotifications.dispose();
+    unsubscribeAppLanguage();
     controller?.dispose();
     paneLauncher.dispose();
     void workspace.dispose();
@@ -6839,6 +7340,7 @@ void currentAppWindow.onCloseRequested(async (event) => {
     agentEvents.dispose();
     providerUsage.dispose();
     phoneNotifications.dispose();
+    unsubscribeAppLanguage();
     controller?.dispose();
     paneLauncher.dispose();
     // Use one backend-owned barrier instead of twenty pane-local stop IPCs. It
@@ -6848,7 +7350,10 @@ void currentAppWindow.onCloseRequested(async (event) => {
     await currentAppWindow.destroy();
   } catch (error) {
     workspace.setFooterStatus(
-      `정상 종료를 완료하지 못했습니다. X를 다시 누르면 강제 종료합니다: ${errorMessage(error)}`,
+      tr(
+        `Graceful shutdown did not complete. Select X again to force close: ${errorMessage(error)}`,
+        `정상 종료를 완료하지 못했습니다. X를 다시 누르면 강제 종료합니다: ${errorMessage(error)}`,
+      ),
       "error",
     );
   }
@@ -6859,6 +7364,7 @@ window.addEventListener("beforeunload", () => {
   agentEvents.dispose();
   providerUsage.dispose();
   phoneNotifications.dispose();
+  unsubscribeAppLanguage();
   controller?.dispose();
   paneLauncher.dispose();
   void workspace.dispose();

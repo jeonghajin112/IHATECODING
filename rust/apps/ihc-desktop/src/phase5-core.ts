@@ -1,6 +1,42 @@
 import { normalizeWorkspaceState } from "./phase3b-core";
+import { formatAppNumber, tr } from "./i18n";
 
 export type AgentProvider = "codex" | "grok";
+
+export type RectangleBounds = {
+  left: number;
+  top: number;
+  right: number;
+  bottom: number;
+};
+
+export function rectanglesOverlap(first: RectangleBounds, second: RectangleBounds) {
+  const edges = [
+    first.left,
+    first.top,
+    first.right,
+    first.bottom,
+    second.left,
+    second.top,
+    second.right,
+    second.bottom,
+  ];
+  if (!edges.every(Number.isFinite)) return false;
+  if (
+    first.left >= first.right ||
+    first.top >= first.bottom ||
+    second.left >= second.right ||
+    second.top >= second.bottom
+  ) {
+    return false;
+  }
+  return (
+    first.left < second.right &&
+    first.right > second.left &&
+    first.top < second.bottom &&
+    first.bottom > second.top
+  );
+}
 
 export type ResumeBlockingReason =
   | "legacyResumeBlocked"
@@ -524,17 +560,30 @@ export function formatProviderResetCountdown(
   const normalizedReset = requireRfc3339(resetsAt, "provider reset time");
   requireFiniteNumber(nowUnixMs, "current time");
   const remainingMs = Date.parse(normalizedReset) - nowUnixMs;
-  if (remainingMs <= 0) return "곧 초기화";
+  if (remainingMs <= 0) return tr("Resetting soon", "곧 초기화");
 
   const totalMinutes = Math.max(1, Math.floor(remainingMs / 60_000));
   const days = Math.floor(totalMinutes / (24 * 60));
   if (days >= 1) {
     const hours = Math.floor((totalMinutes % (24 * 60)) / 60);
-    return `${days}일 ${hours}시간`;
+    const localizedDays = formatAppNumber(days);
+    const localizedHours = formatAppNumber(hours);
+    return tr(
+      `${localizedDays}d ${localizedHours}h`,
+      `${localizedDays}일 ${localizedHours}시간`,
+    );
   }
   const hours = Math.floor(totalMinutes / 60);
-  if (hours >= 1) return `${hours}시간 ${totalMinutes % 60}분`;
-  return `${totalMinutes}분`;
+  if (hours >= 1) {
+    const localizedHours = formatAppNumber(hours);
+    const localizedMinutes = formatAppNumber(totalMinutes % 60);
+    return tr(
+      `${localizedHours}h ${localizedMinutes}m`,
+      `${localizedHours}시간 ${localizedMinutes}분`,
+    );
+  }
+  const localizedMinutes = formatAppNumber(totalMinutes);
+  return tr(`${localizedMinutes}m`, `${localizedMinutes}분`);
 }
 
 export function selectClipboardImageSequence(

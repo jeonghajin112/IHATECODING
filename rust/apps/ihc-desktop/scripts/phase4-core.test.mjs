@@ -4,6 +4,11 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import * as esbuild from "esbuild";
 
+Object.defineProperty(globalThis, "navigator", {
+  configurable: true,
+  value: { language: "en-US", languages: ["en-US"] },
+});
+
 const bundle = await esbuild.build({
   entryPoints: [fileURLToPath(new URL("../src/phase4-core.ts", import.meta.url))],
   bundle: true,
@@ -821,7 +826,7 @@ test("Windows project and terminal paths are normalized and invalid paths fail c
 test("the folder picker suggestion follows Windows folder names without overwriting intent", () => {
   assert.equal(core.suggestWorkspaceProjectName("C:\\Work\\Alpha\\"), "Alpha");
   assert.equal(core.suggestWorkspaceProjectName("\\\\server\\share\\Team"), "Team");
-  assert.equal(core.suggestWorkspaceProjectName("C:\\"), "새 프로젝트");
+  assert.equal(core.suggestWorkspaceProjectName("C:\\"), "New project");
 });
 
 test("drag insertion uses stable target identity even when its preview index is stale", () => {

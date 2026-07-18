@@ -1,3 +1,5 @@
+import { tr } from "./i18n";
+
 export const MAX_PROJECT_PANES = 20;
 
 export type SavedTerminalState = {
@@ -232,10 +234,19 @@ export function closeWorkspaceTab(
 export function validateProjectDraft(name: string, folderPath: string) {
   const normalizedName = name.trim();
   const normalizedFolder = normalizeFolderInput(folderPath);
-  if (!normalizedName) throw new Error("프로젝트 이름을 입력하세요.");
-  if (normalizedName.length > 50) throw new Error("프로젝트 이름은 50자 이하여야 합니다.");
+  if (!normalizedName) throw new Error(tr("Enter a project name.", "프로젝트 이름을 입력하세요."));
+  if (normalizedName.length > 50) {
+    throw new Error(
+      tr("Project names must be 50 characters or fewer.", "프로젝트 이름은 50자 이하여야 합니다."),
+    );
+  }
   if (!isAbsoluteWindowsPath(normalizedFolder)) {
-    throw new Error("드라이브 또는 UNC로 시작하는 절대 폴더 경로를 입력하세요.");
+    throw new Error(
+      tr(
+        "Enter an absolute folder path that starts with a drive letter or UNC path.",
+        "드라이브 또는 UNC로 시작하는 절대 폴더 경로를 입력하세요.",
+      ),
+    );
   }
   return { name: normalizedName, folderPath: normalizedFolder };
 }
@@ -264,7 +275,12 @@ export function appendTerminal(
 ): ProjectCatalog {
   return updateProject(catalog, projectId, (project) => {
     if (project.Terminals.length >= MAX_PROJECT_PANES) {
-      throw new Error(`PowerShell은 프로젝트마다 최대 ${MAX_PROJECT_PANES}개입니다.`);
+      throw new Error(
+        tr(
+          `Each project can have at most ${MAX_PROJECT_PANES} PowerShell panes.`,
+          `PowerShell은 프로젝트마다 최대 ${MAX_PROJECT_PANES}개입니다.`,
+        ),
+      );
     }
     if (project.Terminals.some((item) => item.Id === terminal.Id)) {
       throw new Error(`duplicate terminal Id: ${terminal.Id}`);
@@ -418,7 +434,7 @@ function updateProject(
 }
 
 function emptyTab(id: string): WorkspaceTab {
-  return { id, kind: "empty", title: "새 탭", projectId: null };
+  return { id, kind: "empty", title: tr("New tab", "새 탭"), projectId: null };
 }
 
 function projectTab(project: WorkspaceProject, id: string): WorkspaceTab {

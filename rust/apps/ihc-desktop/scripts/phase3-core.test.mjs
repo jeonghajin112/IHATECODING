@@ -5,6 +5,11 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import * as esbuild from "esbuild";
 
+Object.defineProperty(globalThis, "navigator", {
+  configurable: true,
+  value: { language: "en-US", languages: ["en-US"] },
+});
+
 const bundle = await esbuild.build({
   entryPoints: [fileURLToPath(new URL("../src/phase3-core.ts", import.meta.url))],
   bundle: true,
@@ -229,7 +234,7 @@ test("validateProjectDraft accepts drive and UNC paths and rejects relatives", (
     core.validateProjectDraft("Network", "\\\\server\\share\\repo").folderPath,
     "\\\\server\\share\\repo",
   );
-  assert.throws(() => core.validateProjectDraft("Alpha", ".\\Alpha"), /절대 폴더 경로/);
+  assert.throws(() => core.validateProjectDraft("Alpha", ".\\Alpha"), /absolute folder path/);
 });
 
 test("drive and UNC share roots keep their root separator", () => {
