@@ -22,7 +22,7 @@ const moduleUrl = `data:text/javascript;base64,${Buffer.from(
 ).toString("base64")}`;
 const core = await import(moduleUrl);
 
-test("layoutFor preserves the deterministic 1-20 pane grid", () => {
+test("layoutFor preserves the compact grid and grows rows without exceeding five columns", () => {
   const expected = [
     "1x1",
     "2x1",
@@ -54,9 +54,17 @@ test("layoutFor preserves the deterministic 1-20 pane grid", () => {
       `pane count ${count}`,
     );
   }
+
+  for (const [count, rows] of [
+    [21, 5],
+    [32, 7],
+    [64, 13],
+  ]) {
+    assert.deepEqual(core.layoutFor(count), { columns: 5, rows });
+  }
 });
 
-test("clampPaneCount returns an integer in the supported range", () => {
+test("clampPaneCount normalizes the lower bound without imposing a product maximum", () => {
   assert.equal(core.clampPaneCount(Number.NaN), 1);
   assert.equal(core.clampPaneCount(Number.POSITIVE_INFINITY), 1);
   assert.equal(core.clampPaneCount(-10), 1);
@@ -64,7 +72,8 @@ test("clampPaneCount returns an integer in the supported range", () => {
   assert.equal(core.clampPaneCount(1), 1);
   assert.equal(core.clampPaneCount(8.9), 8);
   assert.equal(core.clampPaneCount(20), 20);
-  assert.equal(core.clampPaneCount(21), 20);
+  assert.equal(core.clampPaneCount(21), 21);
+  assert.equal(core.clampPaneCount(64.9), 64);
 });
 
 test("binaryStringToRawBytes preserves 00/7f/80/ff", () => {

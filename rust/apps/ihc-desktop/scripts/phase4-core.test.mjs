@@ -43,6 +43,7 @@ function project(id, paneIds = ["pane-a", "pane-b", "pane-c"], overrides = {}) {
     id,
     name: id === "project-a" ? "Alpha" : "Beta",
     folderPath: id === "project-a" ? "C:\\Work\\Alpha" : "D:\\Work\\Beta",
+    lastModifiedAtUtc: null,
     terminals: paneIds.map((paneId) => pane(paneId)),
     paneWidthRatios: {
       "3x1:row-0": [1 / 3, 1 / 3, 1 / 3],
@@ -348,14 +349,14 @@ test("blank add, close, keyboard activation, reorder, and ARIA roving focus stay
   assert.equal(state.selectedProjectId, null);
 });
 
-test("each project independently permits twenty panes and rejects only its own twenty-first", () => {
+test("each project independently persists at least sixty-four terminal panes", () => {
   let state = workspace({
     projects: [project("project-a", []), project("project-b", [])],
     tabs: [projectTab("tab-alpha", "project-a")],
     activeTabId: "tab-alpha",
     selectedProjectId: "project-a",
   });
-  for (let index = 0; index < 20; index += 1) {
+  for (let index = 0; index < 64; index += 1) {
     state = core.appendProjectPane(state, "project-a", pane(`pane-a-${index}`));
     state = core.appendProjectPane(
       state,
@@ -363,24 +364,11 @@ test("each project independently permits twenty panes and rejects only its own t
       pane(`pane-b-${index}`, { startDirectory: "D:\\Work\\Beta" }),
     );
   }
-  assert.equal(state.projects[0].terminals.length, 20);
-  assert.equal(state.projects[1].terminals.length, 20);
+  assert.equal(state.projects[0].terminals.length, 64);
+  assert.equal(state.projects[1].terminals.length, 64);
   assert.equal(
     state.projects.reduce((total, item) => total + item.terminals.length, 0),
-    40,
-  );
-  assert.throws(
-    () => core.appendProjectPane(state, "project-a", pane("pane-a-20")),
-    /at most 20 panes/,
-  );
-  assert.throws(
-    () =>
-      core.appendProjectPane(
-        state,
-        "project-b",
-        pane("pane-b-20", { startDirectory: "D:\\Work\\Beta" }),
-      ),
-    /at most 20 panes/,
+    128,
   );
 });
 
@@ -429,7 +417,7 @@ test("browser panes persist in the project extension with title, URL, and close 
   assert.equal(state.projects[0].legacyExtensions.projectLegacy, "project-a");
 });
 
-test("browser pane restore ignores malformed opaque entries and enforces shared pane capacity", () => {
+test("browser pane restore ignores malformed entries and persists sixty-four mixed panes", () => {
   const malformed = project("project-a", ["pane-a"], {
     legacyExtensions: {
       projectLegacy: "project-a",
@@ -445,25 +433,19 @@ test("browser pane restore ignores malformed opaque entries and enforces shared 
   ]);
 
   let state = workspace({
-    projects: [project("project-a", Array.from({ length: 19 }, (_, index) => `pane-${index}`))],
+    projects: [project("project-a", Array.from({ length: 32 }, (_, index) => `pane-${index}`))],
   });
-  state = core.appendProjectBrowserPane(
-    state,
-    "project-a",
-    core.createWorkspaceBrowserPane("browser-final"),
-  );
-  assert.equal(core.projectBrowserPanes(state.projects[0]).length, 1);
+  for (let index = 0; index < 32; index += 1) {
+    state = core.appendProjectBrowserPane(
+      state,
+      "project-a",
+      core.createWorkspaceBrowserPane(`browser-${index}`),
+    );
+  }
+  assert.equal(state.projects[0].terminals.length, 32);
+  assert.equal(core.projectBrowserPanes(state.projects[0]).length, 32);
   assert.throws(
-    () =>
-      core.appendProjectBrowserPane(
-        state,
-        "project-a",
-        core.createWorkspaceBrowserPane("browser-overflow"),
-      ),
-    /at most 20 panes/,
-  );
-  assert.throws(
-    () => core.setProjectBrowserPaneUrl(state, "project-a", "browser-final", "javascript:1"),
+    () => core.setProjectBrowserPaneUrl(state, "project-a", "browser-31", "javascript:1"),
     /not allowed/,
   );
 });
@@ -473,11 +455,13 @@ test("project and terminal helpers create, append, rename, remove, and name dete
     "project-new",
     "  Gamma  ",
     " C:/Work/Gamma/ ",
+    "2026-07-18T03:04:05Z",
   );
   assert.deepEqual(createdProject, {
     id: "project-new",
     name: "Gamma",
     folderPath: "C:\\Work\\Gamma",
+    lastModifiedAtUtc: "2026-07-18T03:04:05Z",
     terminals: [],
     paneWidthRatios: {},
     legacyExtensions: {},
@@ -522,6 +506,138 @@ test("project and terminal helpers create, append, rename, remove, and name dete
   assert.throws(
     () => core.renameProjectPane(state, "project-new", "pane-worker-2", "   "),
     /cannot be empty/,
+  );
+});
+
+test("projects sort newest-first with terminal fallback and stable ties", () => {
+  const source = [
+    project("stable-a", [], { lastModifiedAtUtc: null }),
+    project("legacy-pane", ["pane-old", "pane-new"], {
+      lastModifiedAtUtc: null,
+      terminals: [
+        pane("pane-old", { createdAtUtc: "2026-07-18T01:00:00Z" }),
+        pane("pane-new", { createdAtUtc: "2026-07-18T03:00:00Z" }),
+      ],
+    }),
+    project("current", [], { lastModifiedAtUtc: "2026-07-18T04:00:00Z" }),
+    project("stable-b", [], { lastModifiedAtUtc: null }),
+    project("tie-a", [], { lastModifiedAtUtc: "2026-07-18T02:00:00Z" }),
+    project("tie-b", [], { lastModifiedAtUtc: "2026-07-18T02:00:00Z" }),
+  ];
+  const before = structuredClone(source);
+
+  assert.deepEqual(
+    core.sortWorkspaceProjectsByRecentModification(source).map((item) => item.id),
+    ["current", "legacy-pane", "tie-a", "tie-b", "stable-a", "stable-b"],
+  );
+  assert.deepEqual(source, before);
+});
+
+test("project mutation helpers persist an injected modification timestamp", () => {
+  const source = workspace();
+  const before = structuredClone(source);
+  let state = core.touchWorkspaceProject(
+    source,
+    "project-a",
+    "2026-07-18T00:00:00Z",
+  );
+  assert.deepEqual(source, before);
+  assert.equal(state.projects[0].lastModifiedAtUtc, "2026-07-18T00:00:00Z");
+
+  state = core.appendProjectPane(
+    state,
+    "project-a",
+    pane("pane-new"),
+    "2026-07-18T01:00:00Z",
+  );
+  assert.equal(state.projects[0].lastModifiedAtUtc, "2026-07-18T01:00:00Z");
+  state = core.renameProjectPane(
+    state,
+    "project-a",
+    "pane-new",
+    "Worker",
+    "2026-07-18T02:00:00Z",
+  );
+  assert.equal(state.projects[0].lastModifiedAtUtc, "2026-07-18T02:00:00Z");
+  state = core.removeProjectPane(
+    state,
+    "project-a",
+    "pane-new",
+    "2026-07-18T03:00:00Z",
+  );
+  assert.equal(state.projects[0].lastModifiedAtUtc, "2026-07-18T03:00:00Z");
+
+  state = core.appendProjectBrowserPane(
+    state,
+    "project-a",
+    core.createWorkspaceBrowserPane("browser-new"),
+    "2026-07-18T04:00:00Z",
+  );
+  state = core.renameProjectBrowserPane(
+    state,
+    "project-a",
+    "browser-new",
+    "Preview",
+    "2026-07-18T05:00:00Z",
+  );
+  state = core.setProjectBrowserPaneUrl(
+    state,
+    "project-a",
+    "browser-new",
+    "https://example.com/preview",
+    "2026-07-18T06:00:00Z",
+  );
+  state = core.removeProjectBrowserPane(
+    state,
+    "project-a",
+    "browser-new",
+    "2026-07-18T07:00:00Z",
+  );
+  assert.equal(state.projects[0].lastModifiedAtUtc, "2026-07-18T07:00:00Z");
+
+  state = core.setTerminalAgentConversation(
+    state,
+    "project-a",
+    "pane-a",
+    "codex",
+    "01981f62-94ac-7a3b-8c12-111111111111",
+    "2026-07-18T08:00:00Z",
+  );
+  assert.equal(state.projects[0].lastModifiedAtUtc, "2026-07-18T08:00:00Z");
+  state = core.applyProjectPaneInsertion(
+    state,
+    "project-a",
+    "pane-a",
+    { beforePaneId: "pane-c" },
+    "2026-07-18T09:00:00Z",
+  );
+  state = core.moveProjectPaneByKeyboard(
+    state,
+    "project-a",
+    "pane-a",
+    "first",
+    "2026-07-18T10:00:00Z",
+  );
+  assert.equal(state.projects[0].lastModifiedAtUtc, "2026-07-18T10:00:00Z");
+
+  const resized = core.resizeProjectPaneBoundaryHorizontal(
+    state,
+    "project-a",
+    {
+      layoutKey: "3x1:row-0",
+      rowPaneIds: ["pane-a", "pane-b", "pane-c"],
+      leftPaneId: "pane-a",
+      rightPaneId: "pane-b",
+      totalWidthPx: 900,
+      deltaX: 20,
+    },
+    "2026-07-18T11:00:00Z",
+  );
+  assert.equal(resized.state.projects[0].lastModifiedAtUtc, "2026-07-18T11:00:00Z");
+
+  assert.throws(
+    () => core.touchWorkspaceProject(state, "project-a", "not-a-timestamp"),
+    /RFC 3339/,
   );
 });
 
@@ -573,8 +689,13 @@ test("closing project tabs never deletes projects and recomputes sidebar selecti
   assert.equal(state.selectedProjectId, null);
 });
 
-test("per-project restore capacity allows its twentieth pane and rejects its overflow", () => {
-  assert.deepEqual(core.evaluateWorkspaceRestoreCapacity(18, 2), {
+test("workspace restore has no product cap while explicit safety maxima remain atomic", () => {
+  const productCapacity = core.evaluateWorkspaceRestoreCapacity(32, 32);
+  assert.equal(productCapacity.allowed, true);
+  assert.equal(productCapacity.required, 64);
+  assert.ok(productCapacity.maximum >= 64);
+
+  assert.deepEqual(core.evaluateWorkspaceRestoreCapacity(18, 2, 20), {
     allowed: true,
     current: 18,
     incoming: 2,
@@ -582,7 +703,7 @@ test("per-project restore capacity allows its twentieth pane and rejects its ove
     available: 2,
     maximum: 20,
   });
-  assert.deepEqual(core.evaluateWorkspaceRestoreCapacity(18, 3), {
+  assert.deepEqual(core.evaluateWorkspaceRestoreCapacity(18, 3, 20), {
     allowed: false,
     current: 18,
     incoming: 3,
@@ -590,7 +711,7 @@ test("per-project restore capacity allows its twentieth pane and rejects its ove
     available: 2,
     maximum: 20,
   });
-  assert.equal(core.evaluateWorkspaceRestoreCapacity(20, 0).allowed, true);
+  assert.equal(core.evaluateWorkspaceRestoreCapacity(20, 0, 20).allowed, true);
   assert.throws(() => core.evaluateWorkspaceRestoreCapacity(-1, 1), /non-negative integer/);
   assert.throws(() => core.evaluateWorkspaceRestoreCapacity(0, 0, 0), /must be positive/);
 });
@@ -694,16 +815,33 @@ test("account switching blocks selected-provider auto resume without losing conv
   });
   const before = structuredClone(source);
 
-  const codex = core.blockWorkspaceProviderResumeForAccountSwitch(source, "codex");
+  const codex = core.blockWorkspaceProviderResumeForAccountSwitch(
+    source,
+    "codex",
+    "2026-07-18T08:00:00Z",
+  );
   assert.equal(codex.projects[0].terminals[0].codexThreadId, before.projects[0].terminals[0].codexThreadId);
   assert.equal(codex.projects[0].terminals[0].grokSessionId, before.projects[0].terminals[0].grokSessionId);
   assert.equal(codex.projects[0].terminals[0].legacyExtensions.resumeBlocked, true);
+  assert.equal(codex.projects[0].lastModifiedAtUtc, "2026-07-18T08:00:00Z");
   assert.deepEqual(source, before);
 
-  const grok = core.blockWorkspaceProviderResumeForAccountSwitch(source, "grok");
+  const unchanged = core.blockWorkspaceProviderResumeForAccountSwitch(
+    codex,
+    "codex",
+    "2026-07-18T09:00:00Z",
+  );
+  assert.equal(unchanged.projects[0].lastModifiedAtUtc, "2026-07-18T08:00:00Z");
+
+  const grok = core.blockWorkspaceProviderResumeForAccountSwitch(
+    source,
+    "grok",
+    "2026-07-18T10:00:00Z",
+  );
   assert.equal(grok.projects[0].terminals[0].codexThreadId, before.projects[0].terminals[0].codexThreadId);
   assert.equal(grok.projects[0].terminals[0].grokSessionId, before.projects[0].terminals[0].grokSessionId);
   assert.equal(grok.projects[0].terminals[0].legacyExtensions.resumeBlocked, true);
+  assert.equal(grok.projects[0].lastModifiedAtUtc, "2026-07-18T10:00:00Z");
 });
 
 test("rediscovering the same agent ID still clears the durable resume blocker", () => {

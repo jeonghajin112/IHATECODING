@@ -108,8 +108,8 @@ Implemented evidence:
 - persisted blank/project/browser/output tab restoration without automatically
   navigating a browser or resuming an agent
 - active-project-only terminal startup, save-before-spawn for new terminals,
-  an independent 20-session restore gate per project, and dynamic priority for the visible
-  project's queued starts
+  no fixed per-project pane-count cap, process-wide defensive runtime
+  admission, and dynamic priority for the visible project's queued starts
 - save-before-close plus title/layout rollback on failed canonical writes, and
   unload-before-replace for import, recovery, and preview upgrade
 - header drag with an 8 px activation threshold, stable-ID insertion preview,

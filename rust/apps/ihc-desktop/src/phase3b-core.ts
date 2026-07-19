@@ -1,6 +1,5 @@
 export const WORKSPACE_SCHEMA_VERSION = 1;
 export const MAX_WORKSPACE_PROJECTS = 256;
-export const MAX_WORKSPACE_TERMINALS = 20;
 export const MAX_WORKSPACE_TABS = 128;
 export const MAX_OPAQUE_ID_BYTES = 256;
 export const MAX_OPAQUE_ID_LENGTH = MAX_OPAQUE_ID_BYTES;
@@ -35,6 +34,7 @@ export type WorkspaceProject = {
   id: string;
   name: string;
   folderPath: string;
+  lastModifiedAtUtc: string | null;
   terminals: WorkspaceTerminal[];
   paneWidthRatios: Record<string, number[]>;
   legacyExtensions: Record<string, unknown>;
@@ -632,13 +632,16 @@ export function setTerminalCompletionPending(
   projectId: string,
   terminalId: string,
   completionPending: boolean,
+  modifiedAtUtc = new Date().toISOString(),
 ): WorkspaceState {
   const next = cloneWorkspaceState(normalizeWorkspaceState(state));
   const project = next.projects.find((item) => item.id === projectId);
-  const terminal = project?.terminals.find((item) => item.id === terminalId);
+  if (!project) throw new Error("The requested workspace terminal does not exist.");
+  const terminal = project.terminals.find((item) => item.id === terminalId);
   if (!terminal) throw new Error("The requested workspace terminal does not exist.");
   terminal.completionPending = completionPending;
-  return next;
+  project.lastModifiedAtUtc = modifiedAtUtc;
+  return normalizeWorkspaceState(next);
 }
 
 export function setProjectPaneWidthRatios(
@@ -646,6 +649,7 @@ export function setProjectPaneWidthRatios(
   projectId: string,
   key: string,
   ratios: number[],
+  modifiedAtUtc = new Date().toISOString(),
 ): WorkspaceState {
   const next = cloneWorkspaceState(normalizeWorkspaceState(state));
   const project = next.projects.find((item) => item.id === projectId);
@@ -655,7 +659,8 @@ export function setProjectPaneWidthRatios(
     throw new Error("Only an applicable pane ratio key can be edited.");
   }
   project.paneWidthRatios[key] = normalizedEntry;
-  return next;
+  project.lastModifiedAtUtc = modifiedAtUtc;
+  return normalizeWorkspaceState(next);
 }
 
 export function projectUnreadCount(state: WorkspaceState, projectId: string): number {
@@ -742,9 +747,6 @@ function normalizeProject(value: unknown, index: number): WorkspaceProject {
   const pointer = `/projects/${index}`;
   const project = requireRecord(value, "project", pointer);
   const terminalsSource = requireArray(project.terminals, `${pointer}/terminals`);
-  if (terminalsSource.length > MAX_WORKSPACE_TERMINALS) {
-    fail("The project contains too many terminals.", `${pointer}/terminals`);
-  }
   const terminals = terminalsSource.map((terminal, terminalIndex) =>
     normalizeTerminal(terminal, `${pointer}/terminals/${terminalIndex}`),
   );
@@ -770,6 +772,10 @@ function normalizeProject(value: unknown, index: number): WorkspaceProject {
       project.folderPath,
       `${pointer}/folderPath`,
       MAX_WORKSPACE_PATH_BYTES,
+    ),
+    lastModifiedAtUtc: requireNullableRfc3339(
+      project.lastModifiedAtUtc === undefined ? null : project.lastModifiedAtUtc,
+      `${pointer}/lastModifiedAtUtc`,
     ),
     terminals,
     paneWidthRatios: normalizePaneWidthRatios(

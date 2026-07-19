@@ -34,11 +34,9 @@ use windows_sys::Win32::System::JobObjects::{
 #[cfg(not(windows))]
 use portable_pty::ChildKiller;
 
-pub(crate) const MAX_TERMINAL_SESSIONS: usize = 20;
-pub(crate) const MAX_TERMINAL_SESSIONS_PER_PROJECT: usize = MAX_TERMINAL_SESSIONS;
-const MAX_TERMINAL_PROJECTS: usize = 256;
-const MAX_TOTAL_TERMINAL_SESSIONS: usize =
-    MAX_TERMINAL_SESSIONS_PER_PROJECT * MAX_TERMINAL_PROJECTS;
+// This is a global defensive guard, not a user-facing or per-project pane limit.
+const MAX_TOTAL_TERMINAL_SESSIONS: usize = 5_120;
+const PREVIEW_MAX_PANES: u8 = 20;
 const LEGACY_TERMINAL_ENVIRONMENT: [(&str, &str); 3] = [
     ("TERM", "xterm-256color"),
     ("COLORTERM", "truecolor"),
@@ -345,22 +343,12 @@ enum ManagerLifecycle {
 
 enum SessionEntry {
     Starting {
-        project_id: Option<String>,
+        _project_id: Option<String>,
     },
     Active {
-        project_id: Option<String>,
+        _project_id: Option<String>,
         session: Arc<TerminalSession>,
     },
-}
-
-impl SessionEntry {
-    fn project_id(&self) -> Option<&str> {
-        match self {
-            Self::Starting { project_id } | Self::Active { project_id, .. } => {
-                project_id.as_deref()
-            }
-        }
-    }
 }
 
 struct ManagerState {
@@ -776,6 +764,24 @@ impl TerminalManager {
         }
     }
 
+    pub(crate) fn stop_and_wait(&self, session_id: &str) -> Result<(), String> {
+        // A Windows TerminateJobObject call can report an error even though
+        // closing the kill-on-close Job Object immediately takes the process
+        // down. The cleanup barrier, not that first status, is authoritative.
+        let _ = self.stop(session_id);
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        while state.sessions.contains_key(session_id) {
+            state = match self.state_changed.wait(state) {
+                Ok(state) => state,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+        }
+        Ok(())
+    }
+
     pub(crate) fn has_active_session(&self, session_id: &str) -> bool {
         let state = match self.state.lock() {
             Ok(state) => state,
@@ -962,7 +968,7 @@ impl TerminalManager {
             spawning_sessions: spawn.active,
             peak_concurrent_spawns: spawn.peak,
             worker_threads: self.worker_threads.load(Ordering::Acquire),
-            max_sessions: MAX_TERMINAL_SESSIONS,
+            max_sessions: MAX_TOTAL_TERMINAL_SESSIONS,
             max_concurrent_spawns: MAX_CONCURRENT_SPAWNS,
             accepting_sessions: lifecycle == ManagerLifecycle::Running
                 && active_sessions < MAX_TOTAL_TERMINAL_SESSIONS,
@@ -992,21 +998,11 @@ impl TerminalManager {
                 "Terminal session limit reached ({MAX_TOTAL_TERMINAL_SESSIONS})."
             ));
         }
-        let project_sessions = state
-            .sessions
-            .values()
-            .filter(|entry| entry.project_id() == project_id)
-            .count();
-        if project_sessions >= MAX_TERMINAL_SESSIONS_PER_PROJECT {
-            return Err(format!(
-                "Terminal session limit reached for this project ({MAX_TERMINAL_SESSIONS_PER_PROJECT})."
-            ));
-        }
         let session_id = Uuid::new_v4().simple().to_string();
         state.sessions.insert(
             session_id.clone(),
             SessionEntry::Starting {
-                project_id: project_id.map(str::to_owned),
+                _project_id: project_id.map(str::to_owned),
             },
         );
         drop(state);
@@ -1042,11 +1038,9 @@ impl TerminalManager {
     ) -> Result<(), String> {
         let mut state = lock(&self.state)?;
         let project_id = match state.sessions.get(session_id) {
-            Some(SessionEntry::Starting { project_id })
-                if state.lifecycle == ManagerLifecycle::Running =>
-            {
-                project_id.clone()
-            }
+            Some(SessionEntry::Starting {
+                _project_id: project_id,
+            }) if state.lifecycle == ManagerLifecycle::Running => project_id.clone(),
             _ => {
                 return Err("Terminal start was cancelled during shutdown.".to_owned());
             }
@@ -1058,7 +1052,7 @@ impl TerminalManager {
         state.sessions.insert(
             session_id.to_owned(),
             SessionEntry::Active {
-                project_id,
+                _project_id: project_id,
                 session,
             },
         );
@@ -1429,10 +1423,13 @@ fn spawn_workers(
                     ),
                 });
             }
-            remove_session(&manager_state, &manager_state_changed, &wait_id);
             agent_runtime.unbind(&wait_id);
             codex_notify::remove_route(&wait_id);
             grok_notify::remove_route(&wait_id);
+            // The session-removal notification is the public stop barrier. Keep it
+            // last so a replacement session cannot claim the same conversation
+            // before all agent ownership and notification routes are released.
+            remove_session(&manager_state, &manager_state_changed, &wait_id);
             let _ = wait_sink.send(TerminalEvent::Exited {
                 session_id: wait_id,
                 exit_code,
@@ -2248,7 +2245,7 @@ pub(crate) fn phase2_initial_panes() -> u8 {
         .ok()
         .and_then(|value| value.parse::<u8>().ok())
         .unwrap_or(1)
-        .clamp(1, MAX_TERMINAL_SESSIONS as u8)
+        .clamp(1, PREVIEW_MAX_PANES)
 }
 
 #[cfg(test)]
@@ -2262,6 +2259,8 @@ mod tests {
             mpsc,
         },
     };
+
+    const REAL_SESSION_TEST_COUNT: usize = 20;
 
     #[cfg(windows)]
     use windows_sys::Win32::{
@@ -2456,7 +2455,7 @@ mod tests {
     }
 
     #[test]
-    fn enforces_twenty_reservations_under_concurrency() {
+    fn concurrent_reservations_are_not_capped_at_twenty() {
         let manager = TerminalManager::default();
         let barrier = Arc::new(Barrier::new(65));
         let (sender, receiver) = mpsc::channel();
@@ -2482,80 +2481,32 @@ mod tests {
 
         assert_eq!(
             reservations.iter().filter(|result| result.is_ok()).count(),
-            MAX_TERMINAL_SESSIONS
+            64
         );
-        assert_eq!(manager.status().starting_sessions, MAX_TERMINAL_SESSIONS);
+        assert_eq!(manager.status().starting_sessions, 64);
         drop(reservations);
         assert_eq!(manager.status().active_sessions, 0);
     }
 
     #[test]
-    fn each_project_has_an_independent_twenty_session_pool() {
+    fn a_project_can_reserve_more_than_twenty_sessions() {
         let manager = TerminalManager::default();
-        let mut first = (0..MAX_TERMINAL_SESSIONS_PER_PROJECT)
+        let first = (0..21)
             .map(|_| {
                 manager
                     .reserve_start_for_project(Some("project-a"))
                     .unwrap()
             })
             .collect::<Vec<_>>();
-        let mut second = (0..MAX_TERMINAL_SESSIONS_PER_PROJECT)
-            .map(|_| {
-                manager
-                    .reserve_start_for_project(Some("project-b"))
-                    .unwrap()
-            })
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            manager.status().active_sessions,
-            MAX_TERMINAL_SESSIONS_PER_PROJECT * 2
-        );
-        assert!(
-            manager
-                .reserve_start_for_project(Some("project-a"))
-                .is_err()
-        );
-        assert!(
-            manager
-                .reserve_start_for_project(Some("project-b"))
-                .is_err()
-        );
-
-        drop(
-            first
-                .pop()
-                .expect("project A should have a slot to release"),
-        );
-        let first_replacement = manager
+        let twenty_second = manager
             .reserve_start_for_project(Some("project-a"))
-            .expect("releasing a project A reservation must recover its slot");
-        assert!(
-            manager
-                .reserve_start_for_project(Some("project-a"))
-                .is_err(),
-            "the replacement must restore project A to its twenty-session limit"
-        );
-
-        drop(
-            second
-                .pop()
-                .expect("project B should have a slot to release"),
-        );
-        let second_replacement = manager
-            .reserve_start_for_project(Some("project-b"))
-            .expect("releasing a project B reservation must recover its slot");
-        assert!(
-            manager
-                .reserve_start_for_project(Some("project-b"))
-                .is_err(),
-            "the replacement must restore project B to its twenty-session limit"
-        );
-        let third = manager
+            .expect("the twenty-second project session must not hit a project cap");
+        let other_project = manager
             .reserve_start_for_project(Some("project-c"))
-            .expect("a different project must retain its own capacity");
+            .expect("another project must share the global capacity");
 
-        drop((first, first_replacement, second, second_replacement, third));
+        assert_eq!(manager.status().active_sessions, 23);
+        drop((first, twenty_second, other_project));
         assert_eq!(manager.status().active_sessions, 0);
     }
 
@@ -2922,6 +2873,42 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn stop_and_wait_releases_agent_ownership_before_an_immediate_restart() {
+        let runtime = AgentRuntime::default();
+        let manager = TerminalManager::with_agent_runtime(runtime.clone());
+        let terminal_key = StableTerminalKey {
+            project_id: "sleep-project".to_owned(),
+            terminal_id: "sleep-terminal".to_owned(),
+        };
+        let resume = AgentResumeBinding {
+            provider: crate::agent_runtime::AgentProvider::Codex,
+            conversation_id: Uuid::new_v4().hyphenated().to_string(),
+        };
+
+        for _ in 0..2 {
+            let sink = Arc::new(RecordingSink::default());
+            let response = manager
+                .start_with_sink(None, 80, 24, sink)
+                .expect("PowerShell should start");
+            runtime
+                .bind(&response.session_id, terminal_key.clone(), resume.clone())
+                .expect("the saved conversation should be claimable");
+            assert_eq!(runtime.binding_count(), 1);
+
+            manager
+                .stop_and_wait(&response.session_id)
+                .expect("sleep stop should reach the cleanup barrier");
+            assert!(!manager.has_active_session(&response.session_id));
+            assert_eq!(
+                runtime.binding_count(),
+                0,
+                "the next resume must not race stale agent ownership"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn round_trips_korean_through_real_conpty() {
         let pair = native_pty_system()
             .openpty(PtySize {
@@ -3015,10 +3002,10 @@ mod tests {
     fn starts_marks_and_stops_twenty_real_sessions_without_leaks() {
         let manager = TerminalManager::default();
         let sink = Arc::new(RecordingSink::default());
-        let barrier = Arc::new(Barrier::new(MAX_TERMINAL_SESSIONS + 1));
+        let barrier = Arc::new(Barrier::new(REAL_SESSION_TEST_COUNT + 1));
         let mut starters = Vec::new();
 
-        for _ in 0..MAX_TERMINAL_SESSIONS {
+        for _ in 0..REAL_SESSION_TEST_COUNT {
             let manager = manager.clone();
             let sink: Arc<dyn TerminalEventSink> = sink.clone();
             let barrier = Arc::clone(&barrier);
@@ -3043,7 +3030,7 @@ mod tests {
             .iter()
             .map(|response| response.session_id.clone())
             .collect::<HashSet<_>>();
-        assert_eq!(ids.len(), MAX_TERMINAL_SESSIONS);
+        assert_eq!(ids.len(), REAL_SESSION_TEST_COUNT);
         for response in &responses {
             assert_eq!(
                 manager
@@ -3053,7 +3040,7 @@ mod tests {
             );
         }
         let status = manager.status();
-        assert_eq!(status.active_sessions, MAX_TERMINAL_SESSIONS);
+        assert_eq!(status.active_sessions, REAL_SESSION_TEST_COUNT);
         assert!(status.peak_concurrent_spawns <= MAX_CONCURRENT_SPAWNS);
         assert_eq!(status.peak_concurrent_spawns, MAX_CONCURRENT_SPAWNS);
 
@@ -3104,7 +3091,7 @@ mod tests {
                     })
                     .collect::<HashSet<_>>()
                     .len()
-                    == MAX_TERMINAL_SESSIONS
+                    == REAL_SESSION_TEST_COUNT
             }),
             "all sessions should emit exactly one terminal exit path"
         );
@@ -3170,13 +3157,13 @@ mod tests {
         let status = manager.status();
         assert_eq!(status.active_sessions, 3);
         assert_eq!(status.starting_sessions, 3);
-        assert_eq!(status.max_sessions, 20);
+        assert_eq!(status.max_sessions, MAX_TOTAL_TERMINAL_SESSIONS);
         drop(reservations);
     }
 
     #[test]
-    fn preview_pane_count_defaults_within_public_limit() {
-        assert!((1..=MAX_TERMINAL_SESSIONS as u8).contains(&phase2_initial_panes()));
+    fn preview_pane_count_defaults_within_benchmark_limit() {
+        assert!((1..=PREVIEW_MAX_PANES).contains(&phase2_initial_panes()));
     }
 
     #[test]

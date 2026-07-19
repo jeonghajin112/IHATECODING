@@ -23,10 +23,15 @@ must be routed to exactly one terminal pane.
   - the frontend sends it only after the corresponding xterm write callback
 - `stop_terminal({ sessionId })`
   - idempotently requests termination of the session Job Object
+- `stop_terminal_and_wait({ sessionId })`
+  - used by opt-in idle-agent sleep; requests termination and resolves only
+    after the process tree, agent ownership, and notification routes are fully
+    released, so the same saved conversation can be resumed immediately
 - `terminal_engine_status()`
   - reports lifecycle, output-budget, resize, and spawn-limit counters
 - `phase2_initial_panes()`
-  - preview-only initial pane count, clamped to `1..20`
+  - preview-only benchmark pane count, clamped to `1..20`; this hook does not
+    define production workspace capacity
 
 ## Events
 
@@ -46,7 +51,9 @@ error for that pane.
 
 ## Capacity and flow control
 
-- At most 20 reservations or active sessions exist at once.
+- No project-scoped reservation limit is imposed by this protocol. A
+  process-wide defensive reservation guard rejects unsafe aggregate load with
+  an explicit capacity error; it is not a per-project product cap.
 - At most two `openpty`/spawn/Job assignments run concurrently.
 - Output batches flush at 64 KiB or after an 8 ms window.
 - A session may have at most 32 unacknowledged batches and 1 MiB of

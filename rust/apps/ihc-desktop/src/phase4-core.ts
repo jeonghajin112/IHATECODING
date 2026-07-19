@@ -1,7 +1,6 @@
 import {
   MAX_WORKSPACE_PROJECTS,
   MAX_WORKSPACE_TABS,
-  MAX_WORKSPACE_TERMINALS,
   cloneWorkspaceState,
   normalizeWorkspaceState,
   setProjectPaneWidthRatios,
@@ -94,16 +93,22 @@ export type WorkspaceAgentProvider = "codex" | "grok";
 export function blockWorkspaceProviderResumeForAccountSwitch(
   state: WorkspaceState,
   provider: WorkspaceAgentProvider,
+  modifiedAtUtc = new Date().toISOString(),
 ): WorkspaceState {
   const next = cloneWorkspaceState(state);
   for (const project of next.projects) {
+    let projectChanged = false;
     for (const terminal of project.terminals) {
       const hasBinding =
         provider === "codex"
           ? terminal.codexThreadId !== null
           : terminal.grokSessionId !== null;
-      if (hasBinding) terminal.legacyExtensions.resumeBlocked = true;
+      if (hasBinding && terminal.legacyExtensions.resumeBlocked !== true) {
+        terminal.legacyExtensions.resumeBlocked = true;
+        projectChanged = true;
+      }
     }
+    if (projectChanged) project.lastModifiedAtUtc = modifiedAtUtc;
   }
   return normalizeWorkspaceState(next);
 }
@@ -340,24 +345,20 @@ export function describeWorkspaceTabsForAccessibility(
   }));
 }
 
-/** Add a persisted terminal/pane while enforcing the Phase 4 limit. */
+/** Add a persisted terminal/pane. Storage bytes, not pane count, bound state. */
 export function appendProjectPane(
   state: WorkspaceState,
   projectId: string,
   pane: WorkspaceTerminal,
+  modifiedAtUtc = new Date().toISOString(),
 ): WorkspaceState {
   const next = editableClone(state);
   const project = requireProject(next, projectId);
-  if (
-    project.terminals.length + projectBrowserPanes(project).length >=
-    MAX_WORKSPACE_TERMINALS
-  ) {
-    throw new Error(`A project can contain at most ${MAX_WORKSPACE_TERMINALS} panes.`);
-  }
   if (project.terminals.some((item) => item.id === pane.id)) {
     throw new Error("The pane identifier is already in use.");
   }
   project.terminals.push(pane);
+  project.lastModifiedAtUtc = modifiedAtUtc;
   return normalizeWorkspaceState(next);
 }
 
@@ -374,7 +375,7 @@ export function projectBrowserPanes(
   const panes: WorkspaceBrowserPane[] = [];
   const ids = new Set<string>();
   for (const entry of source) {
-    if (panes.length >= MAX_WORKSPACE_TERMINALS || !isRecord(entry)) continue;
+    if (!isRecord(entry)) continue;
     try {
       const id = String(entry.id ?? "");
       assertOpaqueLocalId(id, "browser pane");
@@ -408,13 +409,11 @@ export function appendProjectBrowserPane(
   state: WorkspaceState,
   projectId: string,
   pane: WorkspaceBrowserPane,
+  modifiedAtUtc = new Date().toISOString(),
 ): WorkspaceState {
   const next = editableClone(state);
   const project = requireProject(next, projectId);
   const browsers = projectBrowserPanes(project);
-  if (project.terminals.length + browsers.length >= MAX_WORKSPACE_TERMINALS) {
-    throw new Error(`A project can contain at most ${MAX_WORKSPACE_TERMINALS} panes.`);
-  }
   const normalized = createWorkspaceBrowserPane(pane.id, pane.title, pane.url);
   if (
     project.terminals.some((item) => item.id === normalized.id) ||
@@ -424,6 +423,7 @@ export function appendProjectBrowserPane(
   }
   browsers.push({ ...structuredClone(pane), ...normalized });
   project.legacyExtensions[PROJECT_BROWSER_PANES_EXTENSION] = browsers;
+  project.lastModifiedAtUtc = modifiedAtUtc;
   return normalizeWorkspaceState(next);
 }
 
@@ -431,6 +431,7 @@ export function removeProjectBrowserPane(
   state: WorkspaceState,
   projectId: string,
   paneId: string,
+  modifiedAtUtc = new Date().toISOString(),
 ): WorkspaceState {
   const next = editableClone(state);
   const project = requireProject(next, projectId);
@@ -439,6 +440,7 @@ export function removeProjectBrowserPane(
   if (index < 0) throw new Error("The requested browser pane does not exist.");
   browsers.splice(index, 1);
   project.legacyExtensions[PROJECT_BROWSER_PANES_EXTENSION] = browsers;
+  project.lastModifiedAtUtc = modifiedAtUtc;
   return normalizeWorkspaceState(next);
 }
 
@@ -447,10 +449,11 @@ export function renameProjectBrowserPane(
   projectId: string,
   paneId: string,
   title: string,
+  modifiedAtUtc = new Date().toISOString(),
 ): WorkspaceState {
   return updateProjectBrowserPane(state, projectId, paneId, (pane) => {
     pane.title = normalizeBrowserPaneTitle(title);
-  });
+  }, modifiedAtUtc);
 }
 
 export function setProjectBrowserPaneUrl(
@@ -458,10 +461,11 @@ export function setProjectBrowserPaneUrl(
   projectId: string,
   paneId: string,
   url: string,
+  modifiedAtUtc = new Date().toISOString(),
 ): WorkspaceState {
   return updateProjectBrowserPane(state, projectId, paneId, (pane) => {
     pane.url = normalizePersistedBrowserPaneUrl(url);
-  });
+  }, modifiedAtUtc);
 }
 
 /** Append a canonical project without creating hidden runtime state. */
@@ -483,16 +487,30 @@ export function appendWorkspaceProject(
   return normalizeWorkspaceState(next);
 }
 
+/** Stamp one project without mutating the caller's workspace snapshot. */
+export function touchWorkspaceProject(
+  state: WorkspaceState,
+  projectId: string,
+  modifiedAtUtc = new Date().toISOString(),
+): WorkspaceState {
+  const next = editableClone(state);
+  const project = requireProject(next, projectId);
+  project.lastModifiedAtUtc = modifiedAtUtc;
+  return normalizeWorkspaceState(next);
+}
+
 export function removeProjectPane(
   state: WorkspaceState,
   projectId: string,
   paneId: string,
+  modifiedAtUtc = new Date().toISOString(),
 ): WorkspaceState {
   const next = editableClone(state);
   const project = requireProject(next, projectId);
   const index = project.terminals.findIndex((pane) => pane.id === paneId);
   if (index < 0) throw new Error("The requested pane does not exist.");
   project.terminals.splice(index, 1);
+  project.lastModifiedAtUtc = modifiedAtUtc;
   return normalizeWorkspaceState(next);
 }
 
@@ -501,6 +519,7 @@ export function renameProjectPane(
   projectId: string,
   paneId: string,
   title: string,
+  modifiedAtUtc = new Date().toISOString(),
 ): WorkspaceState {
   const next = editableClone(state);
   const project = requireProject(next, projectId);
@@ -509,6 +528,7 @@ export function renameProjectPane(
   const normalized = title.trim();
   if (!normalized) throw new Error("A pane title cannot be empty.");
   pane.name = normalized;
+  project.lastModifiedAtUtc = modifiedAtUtc;
   return normalizeWorkspaceState(next);
 }
 
@@ -523,6 +543,7 @@ export function setTerminalAgentConversation(
   terminalId: string,
   provider: WorkspaceAgentProvider,
   conversationId: string,
+  modifiedAtUtc = new Date().toISOString(),
 ): WorkspaceState {
   if (provider !== "codex" && provider !== "grok") {
     throw new Error("The agent provider is invalid.");
@@ -553,6 +574,7 @@ export function setTerminalAgentConversation(
   if (terminal.legacyExtensions.resumeBlocked === true) {
     delete terminal.legacyExtensions.resumeBlocked;
   }
+  project.lastModifiedAtUtc = modifiedAtUtc;
   return normalizeWorkspaceState(next);
 }
 
@@ -578,6 +600,7 @@ export function createWorkspaceProject(
   id: string,
   name: string,
   folderPath: string,
+  lastModifiedAtUtc: string,
 ): WorkspaceProject {
   assertOpaqueLocalId(id, "project");
   const draft = validateWorkspaceProjectDraft(name, folderPath);
@@ -585,6 +608,7 @@ export function createWorkspaceProject(
     id,
     name: draft.name,
     folderPath: draft.folderPath,
+    lastModifiedAtUtc,
     terminals: [],
     paneWidthRatios: {},
     legacyExtensions: {},
@@ -658,6 +682,29 @@ export function findWorkspaceProjectByFolder(
   return projects.find((project) => windowsPathKey(project.folderPath) === key) ?? null;
 }
 
+/**
+ * Return projects newest-first without changing the canonical persisted order.
+ * Legacy projects without their own timestamp fall back to their newest pane,
+ * and exact ties retain the caller's original order.
+ */
+export function sortWorkspaceProjectsByRecentModification(
+  projects: readonly WorkspaceProject[],
+): WorkspaceProject[] {
+  return projects
+    .map((project, index) => ({
+      project,
+      index,
+      timestamp: recentProjectTimestamp(project),
+    }))
+    .sort((left, right) => {
+      if (left.timestamp !== right.timestamp) {
+        return left.timestamp > right.timestamp ? -1 : 1;
+      }
+      return left.index - right.index;
+    })
+    .map(({ project }) => project);
+}
+
 export function uniqueWorkspaceProjectName(
   projects: readonly WorkspaceProject[],
   requested: string,
@@ -681,7 +728,7 @@ export function nextWorkspacePaneName(project: WorkspaceProject): string {
 export function evaluateWorkspaceRestoreCapacity(
   current: number,
   incoming: number,
-  maximum = MAX_WORKSPACE_TERMINALS,
+  maximum = Number.MAX_SAFE_INTEGER,
 ): RestoreCapacityDecision {
   for (const [label, value] of [
     ["current", current],
@@ -710,6 +757,7 @@ export function applyProjectPaneInsertion(
   projectId: string,
   draggedPaneId: string,
   target: Pick<PaneInsertionTarget, "beforePaneId">,
+  modifiedAtUtc = new Date().toISOString(),
 ): WorkspaceState {
   const next = editableClone(state);
   const project = requireProject(next, projectId);
@@ -725,7 +773,8 @@ export function applyProjectPaneInsertion(
       : project.terminals.findIndex((pane) => pane.id === target.beforePaneId);
   if (insertionIndex < 0) throw new Error("The insertion target no longer exists.");
   project.terminals.splice(insertionIndex, 0, dragged);
-  return next;
+  project.lastModifiedAtUtc = modifiedAtUtc;
+  return normalizeWorkspaceState(next);
 }
 
 /** Reorder one pane from the keyboard without relying on screen coordinates. */
@@ -734,6 +783,7 @@ export function moveProjectPaneByKeyboard(
   projectId: string,
   paneId: string,
   command: LinearMoveCommand,
+  modifiedAtUtc = new Date().toISOString(),
 ): WorkspaceState {
   const next = editableClone(state);
   const project = requireProject(next, projectId);
@@ -741,7 +791,8 @@ export function moveProjectPaneByKeyboard(
   if (index < 0) throw new Error("The requested pane does not exist.");
   const target = linearTarget(index, project.terminals.length, command, false);
   moveArrayItem(project.terminals, index, target);
-  return next;
+  project.lastModifiedAtUtc = modifiedAtUtc;
+  return normalizeWorkspaceState(next);
 }
 
 /**
@@ -893,6 +944,7 @@ export function resizeProjectPaneBoundaryHorizontal(
   state: WorkspaceState,
   projectId: string,
   request: ProjectPaneResizeRequest,
+  modifiedAtUtc = new Date().toISOString(),
 ): { state: WorkspaceState; resize: HorizontalResizeResult } {
   const normalized = normalizeWorkspaceState(state);
   const project = requireProject(normalized, projectId);
@@ -927,6 +979,7 @@ export function resizeProjectPaneBoundaryHorizontal(
       projectId,
       request.layoutKey,
       resize.ratios,
+      modifiedAtUtc,
     ),
     resize,
   };
@@ -939,12 +992,13 @@ export function resizeProjectPaneBoundaryByKeyboard(
   request: Omit<ProjectPaneResizeRequest, "deltaX">,
   command: KeyboardResizeCommand,
   stepPx = 16,
+  modifiedAtUtc = new Date().toISOString(),
 ): { state: WorkspaceState; resize: HorizontalResizeResult } {
   requirePositiveFinite(stepPx, "keyboard resize step");
   return resizeProjectPaneBoundaryHorizontal(state, projectId, {
     ...request,
     deltaX: command === "grow-left" ? stepPx : -stepPx,
-  });
+  }, modifiedAtUtc);
 }
 
 function editableClone(state: WorkspaceState): WorkspaceState {
@@ -956,6 +1010,7 @@ function updateProjectBrowserPane(
   projectId: string,
   paneId: string,
   update: (pane: WorkspaceBrowserPane) => void,
+  modifiedAtUtc: string,
 ): WorkspaceState {
   const next = editableClone(state);
   const project = requireProject(next, projectId);
@@ -964,6 +1019,7 @@ function updateProjectBrowserPane(
   if (!pane) throw new Error("The requested browser pane does not exist.");
   update(pane);
   project.legacyExtensions[PROJECT_BROWSER_PANES_EXTENSION] = browsers;
+  project.lastModifiedAtUtc = modifiedAtUtc;
   return normalizeWorkspaceState(next);
 }
 
@@ -1038,6 +1094,29 @@ function normalizeConversationId(value: string): string {
   return normalized;
 }
 
+function recentProjectTimestamp(project: WorkspaceProject): number {
+  const projectTimestamp = parseTimestamp(project.lastModifiedAtUtc);
+  if (projectTimestamp !== null) return projectTimestamp;
+
+  let newestTerminalTimestamp: number | null = null;
+  for (const terminal of project.terminals) {
+    const terminalTimestamp = parseTimestamp(terminal.createdAtUtc);
+    if (
+      terminalTimestamp !== null &&
+      (newestTerminalTimestamp === null || terminalTimestamp > newestTerminalTimestamp)
+    ) {
+      newestTerminalTimestamp = terminalTimestamp;
+    }
+  }
+  return newestTerminalTimestamp ?? Number.NEGATIVE_INFINITY;
+}
+
+function parseTimestamp(value: string | null | undefined): number | null {
+  if (value === null || value === undefined) return null;
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) ? timestamp : null;
+}
+
 function linearTarget(
   index: number,
   length: number,
@@ -1063,8 +1142,8 @@ function moveArrayItem<T>(items: T[], from: number, to: number): void {
 }
 
 function validatePaneGeometry(geometry: readonly PaneGeometry[]): void {
-  if (geometry.length === 0 || geometry.length > MAX_WORKSPACE_TERMINALS) {
-    throw new Error(`Measured pane geometry must contain 1 to ${MAX_WORKSPACE_TERMINALS} panes.`);
+  if (geometry.length === 0) {
+    throw new Error("Measured pane geometry must contain at least one pane.");
   }
   const ids = new Set<string>();
   for (const pane of geometry) {

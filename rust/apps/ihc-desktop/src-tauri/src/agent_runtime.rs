@@ -954,7 +954,7 @@ impl AgentRuntime {
     }
 
     #[cfg(test)]
-    fn binding_count(&self) -> usize {
+    pub(crate) fn binding_count(&self) -> usize {
         match self.inner.state.lock() {
             Ok(state) => state.bindings.len(),
             Err(poisoned) => poisoned.into_inner().bindings.len(),

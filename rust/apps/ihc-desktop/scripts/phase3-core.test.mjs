@@ -174,17 +174,25 @@ test("closing the final tab always creates one blank replacement", () => {
   assert.equal(closed.activeTabId, closed.tabs[0].id);
 });
 
-test("restore capacity is atomic at a project's twenty-pane boundary", () => {
-  assert.deepEqual(core.evaluateRestoreCapacity(12, 8), {
-    allowed: true,
-    current: 12,
-    incoming: 8,
-    required: 20,
-    available: 8,
-    maximum: 20,
+test("legacy catalog normalization and restore accept at least sixty-four panes", () => {
+  const normalized = core.normalizeProjectCatalog({
+    Projects: [
+      project(
+        "project-a",
+        Array.from({ length: 64 }, (_, index) => terminal(`terminal-${index}`)),
+      ),
+    ],
+    SelectedProjectId: "project-a",
   });
-  assert.equal(core.evaluateRestoreCapacity(12, 9).allowed, false);
-  assert.equal(core.evaluateRestoreCapacity(20, 0).allowed, true);
+  assert.equal(normalized.Projects[0].Terminals.length, 64);
+
+  const capacity = core.evaluateRestoreCapacity(32, 32);
+  assert.equal(capacity.allowed, true);
+  assert.equal(capacity.required, 64);
+  assert.ok(capacity.maximum >= 64);
+
+  assert.equal(core.evaluateRestoreCapacity(12, 8, 20).allowed, true);
+  assert.equal(core.evaluateRestoreCapacity(12, 9, 20).allowed, false);
   assert.throws(() => core.evaluateRestoreCapacity(-1, 1), /non-negative integer/);
 });
 

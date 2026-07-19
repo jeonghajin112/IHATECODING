@@ -1,7 +1,5 @@
 import { tr } from "./i18n";
 
-export const MAX_PROJECT_PANES = 20;
-
 export type SavedTerminalState = {
   [key: string]: unknown;
   Id: string;
@@ -90,7 +88,7 @@ export function catalogMutationsAllowed(state: CatalogMutationGateState): boolea
 export function evaluateRestoreCapacity(
   current: number,
   incoming: number,
-  maximum = MAX_PROJECT_PANES,
+  maximum = Number.MAX_SAFE_INTEGER,
 ): RestoreCapacityDecision {
   for (const [label, value] of [
     ["current", current],
@@ -274,14 +272,6 @@ export function appendTerminal(
   terminal: SavedTerminalState,
 ): ProjectCatalog {
   return updateProject(catalog, projectId, (project) => {
-    if (project.Terminals.length >= MAX_PROJECT_PANES) {
-      throw new Error(
-        tr(
-          `Each project can have at most ${MAX_PROJECT_PANES} PowerShell panes.`,
-          `PowerShell은 프로젝트마다 최대 ${MAX_PROJECT_PANES}개입니다.`,
-        ),
-      );
-    }
     if (project.Terminals.some((item) => item.Id === terminal.Id)) {
       throw new Error(`duplicate terminal Id: ${terminal.Id}`);
     }
@@ -367,9 +357,6 @@ function normalizeProject(value: unknown): WorkspaceProject {
   const project = requireRecord(value, "project");
   const folderPath = requireNonEmptyString(project.FolderPath, "project.FolderPath");
   if (!Array.isArray(project.Terminals)) throw new Error("project.Terminals must be an array");
-  if (project.Terminals.length > MAX_PROJECT_PANES) {
-    throw new Error(`project.Terminals exceeds ${MAX_PROJECT_PANES}`);
-  }
   const terminals = project.Terminals.map(normalizeTerminal);
   if (new Set(terminals.map((terminal) => terminal.Id)).size !== terminals.length) {
     throw new Error("duplicate terminal Id in project");

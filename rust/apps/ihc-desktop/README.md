@@ -24,9 +24,17 @@ At first startup, when canonical state is absent, the backend can discover the C
 
 ## Runtime guarantees
 
-- At most 20 PowerShell sessions and at most two simultaneous spawns.
+- No fixed per-project PowerShell-session cap; starts remain bounded to at most
+  two simultaneously, and a process-wide defensive resource guard rejects
+  unsafe aggregate load.
 - Backend-owned Job Object cleanup and a single graceful shutdown barrier.
 - Exact provider-bound Codex/Grok resume ownership; duplicate bindings fail closed.
+- Optional inactive-session sleep is off by default and never unloads the
+  visible project, working or input-active agents, or plain PowerShell. It
+  resumes only durably bound Codex/Grok conversations and restores browser
+  panes from their last saved addresses when a project is reopened. Turning
+  the option off immediately restores sleeping panes behind their per-pane
+  cleanup barriers without delaying unrelated terminals.
 - Completion events come from provider session records, not terminal-output text heuristics.
 - Completion acknowledgement is persisted before the visual alert disappears.
 - Provider usage reads are bounded and do not expose transcript contents.

@@ -153,6 +153,7 @@ test("canonical v1 load preserves unknown fields, order, layout, and clone isola
   const state = loaded.snapshot.state;
 
   assert.deepEqual(state.projects.map((item) => item.id), ["project-a"]);
+  assert.equal(state.projects[0].lastModifiedAtUtc, null);
   assert.deepEqual(state.tabs.map((item) => item.id), [
     "tab-project",
     "tab-empty",
@@ -181,6 +182,31 @@ test("canonical v1 load preserves unknown fields, order, layout, and clone isola
   cloned.extensions.futureRoot.values.push(4);
   assert.deepEqual(state.extensions.futureRoot.values, [1, 2, 3]);
   assert.deepEqual(core.normalizeWorkspaceState(state), state);
+});
+
+test("project modification timestamps normalize legacy absence and reject invalid values", () => {
+  const legacy = core.normalizeWorkspaceState(workspace());
+  assert.equal(legacy.projects[0].lastModifiedAtUtc, null);
+
+  const timestamp = "2026-07-18T08:09:10.123+09:00";
+  const current = core.normalizeWorkspaceState(
+    workspace({
+      projects: [project("project-a", { lastModifiedAtUtc: timestamp })],
+    }),
+  );
+  assert.equal(current.projects[0].lastModifiedAtUtc, timestamp);
+
+  assert.throws(
+    () =>
+      core.normalizeWorkspaceState(
+        workspace({
+          projects: [project("project-a", { lastModifiedAtUtc: "yesterday" })],
+        }),
+      ),
+    (error) =>
+      error instanceof core.WorkspaceValidationError &&
+      error.jsonPointer === "/projects/0/lastModifiedAtUtc",
+  );
 });
 
 test("Phase 3 preview upgrade provenance remains a supported canonical source", () => {
@@ -321,16 +347,19 @@ test("project and terminal bounds, references, UUIDs, and timestamps are validat
   });
   assert.throws(() => core.normalizeWorkspaceState(tooManyProjects), /too many projects/);
 
-  const tooManyTerminals = workspace({
+  const manyTerminals = workspace({
     projects: [
       project("project-a", {
-        terminals: Array.from({ length: 21 }, (_, index) =>
+        terminals: Array.from({ length: 64 }, (_, index) =>
           terminal(`terminal-${index}`, { codexThreadId: null }),
         ),
       }),
     ],
   });
-  assert.throws(() => core.normalizeWorkspaceState(tooManyTerminals), /too many terminals/);
+  assert.equal(
+    core.normalizeWorkspaceState(manyTerminals).projects[0].terminals.length,
+    64,
+  );
 
   const invalidUuid = workspace({
     projects: [project("project-a", { terminals: [terminal("t", { codexThreadId: "not-uuid" })] })],
@@ -476,24 +505,28 @@ test("alerts and pane layout mutations preserve unknown data and do not mutate t
     "project-a",
     "terminal-a",
     true,
+    "2026-07-18T01:00:00Z",
   );
   assert.equal(original.projects[0].terminals[0].completionPending, false);
   assert.equal(alerted.projects[0].terminals[0].completionPending, true);
   assert.equal(core.projectUnreadCount(alerted, "project-a"), 1);
   assert.deepEqual(core.workspaceUnreadCounts(alerted), { "project-a": 1 });
   assert.deepEqual(alerted.futureRootProperty, original.futureRootProperty);
+  assert.equal(alerted.projects[0].lastModifiedAtUtc, "2026-07-18T01:00:00Z");
 
   const resized = core.setProjectPaneWidthRatios(
     alerted,
     "project-a",
     "2x1:row-0",
     [1, 3],
+    "2026-07-18T02:00:00Z",
   );
   assert.deepEqual(resized.projects[0].paneWidthRatios["2x1:row-0"], [0.25, 0.75]);
   assert.deepEqual(
     resized.projects[0].paneWidthRatios["legacy:grid-key"],
     original.projects[0].paneWidthRatios["legacy:grid-key"],
   );
+  assert.equal(resized.projects[0].lastModifiedAtUtc, "2026-07-18T02:00:00Z");
   assert.throws(
     () => core.setProjectPaneWidthRatios(resized, "project-a", "2x1:row-3", [1, 1]),
     /applicable/,

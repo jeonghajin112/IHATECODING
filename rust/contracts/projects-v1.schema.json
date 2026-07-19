@@ -24,7 +24,7 @@
         "FolderPath": { "type": "string", "minLength": 1 },
         "Terminals": {
           "type": "array",
-          "maxItems": 20,
+          "description": "Pane count has no product-level per-project cap; storage payload and runtime resource guards are enforced separately.",
           "items": { "$ref": "#/$defs/terminal" }
         },
         "PaneWidthRatios": {

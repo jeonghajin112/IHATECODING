@@ -25,7 +25,6 @@ const MAX_JSON_VALUES: usize = 200_000;
 const MAX_OBJECT_MEMBERS: usize = 4_096;
 const MAX_TOTAL_STRING_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PROJECTS: usize = 256;
-const MAX_TERMINALS_PER_PROJECT: usize = 20;
 const MAX_PENDING_INSPECTIONS: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -1413,17 +1412,7 @@ fn analyze_catalog(
                 continue;
             }
         };
-        if raw_terminals.len() > MAX_TERMINALS_PER_PROJECT {
-            warnings.push(ImportDiagnostic::new(
-                "terminalOverflow",
-                format!("{pointer}/Terminals"),
-            ));
-        }
-        for (terminal_index, raw_terminal) in raw_terminals
-            .iter()
-            .take(MAX_TERMINALS_PER_PROJECT)
-            .enumerate()
-        {
+        for (terminal_index, raw_terminal) in raw_terminals.iter().enumerate() {
             let terminal_pointer = format!("{pointer}/Terminals/{terminal_index}");
             let Some(terminal) = raw_terminal.as_object() else {
                 blocking.push(ImportDiagnostic::new("invalidTerminal", terminal_pointer));
@@ -2592,6 +2581,48 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["t-3", "t-4"]
         );
+    }
+
+    #[test]
+    fn phase3_import_preserves_terminals_after_the_twentieth_entry() {
+        let terminals = (0..21)
+            .map(|index| {
+                terminal(
+                    &format!("terminal-{index}"),
+                    &format!("Terminal {index}"),
+                    r"C:\Fixture\Many",
+                    None,
+                    None,
+                    None,
+                    false,
+                )
+            })
+            .collect();
+        let bytes = catalog(
+            vec![project(
+                "many-terminals",
+                "Many terminals",
+                r"C:\Fixture\Many",
+                terminals,
+                json!({"1x1:row-0": [1]}),
+            )],
+            Some("many-terminals"),
+        );
+        let directory = TestDirectory::new();
+        let layout = test_layout(&directory, &bytes);
+        let inspection = inspect(&layout.service, &layout.detached);
+        assert!(inspection.blocking_errors.is_empty());
+        assert_eq!(inspection.terminal_count, 21);
+        assert!(
+            inspection
+                .recoverable_warnings
+                .iter()
+                .all(|warning| warning.code != "terminalOverflow")
+        );
+
+        let prepared = commit(&layout.service, &layout.detached, &inspection);
+        assert_eq!(prepared.draft.projects[0].terminals.len(), 21);
+        assert_eq!(prepared.draft.projects[0].terminals[20].id, "terminal-20");
     }
 
     #[test]

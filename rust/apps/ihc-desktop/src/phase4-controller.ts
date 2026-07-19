@@ -27,19 +27,18 @@ import {
   createWorkspaceBrowserPane,
   createWorkspaceProject,
   createWorkspaceTerminal,
-  evaluateWorkspaceRestoreCapacity,
   findWorkspaceProjectByFolder,
   moveWorkspaceTabByKeyboard,
   migrateLegacyAutomaticProjectTabsToManual,
   nextWorkspacePaneName,
   openProjectWorkspaceTab,
-  projectBrowserPanes,
   removeProjectBrowserPane,
   removeProjectPane,
   renameProjectBrowserPane,
   renameProjectPane,
   setProjectBrowserPaneUrl,
   setTerminalAgentConversation,
+  sortWorkspaceProjectsByRecentModification,
   suggestWorkspaceProjectName,
   terminalAgentBindingChanged,
   uniqueWorkspaceProjectName,
@@ -860,7 +859,7 @@ export class Phase4WorkspaceController {
     this.elements.projectList.replaceChildren();
     if (!state) return;
     const enabled = this.mutationsEnabled();
-    for (const project of state.projects) {
+    for (const project of sortWorkspaceProjectsByRecentModification(state.projects)) {
       const button = document.createElement("button");
       button.className = "project-item";
       button.type = "button";
@@ -1056,6 +1055,7 @@ export class Phase4WorkspaceController {
       this.idFactory(),
       uniqueWorkspaceProjectName(state.projects, draft.name),
       draft.folderPath,
+      new Date().toISOString(),
     );
     const withProject = appendWorkspaceProject(state, project);
     const next = openProjectWorkspaceTab(withProject, project.id, this.idFactory());
@@ -1075,22 +1075,8 @@ export class Phase4WorkspaceController {
     if (!this.runtime.canAddPane(project.id)) {
       this.runtime.setFooterStatus(
         tr(
-          "This project can have at most 20 split panes.",
-          "이 프로젝트의 분할 화면은 최대 20개까지 열 수 있습니다.",
-        ),
-        "error",
-      );
-      return;
-    }
-    const capacity = evaluateWorkspaceRestoreCapacity(
-      project.terminals.length + projectBrowserPanes(project).length,
-      1,
-    );
-    if (!capacity.allowed) {
-      this.runtime.setFooterStatus(
-        tr(
-          `Each project can run at most ${capacity.maximum} PowerShell panes.`,
-          `PowerShell은 프로젝트마다 최대 ${capacity.maximum}개까지 실행할 수 있습니다.`,
+          "A PowerShell pane cannot be added right now.",
+          "지금은 PowerShell 화면을 추가할 수 없습니다.",
         ),
         "error",
       );
@@ -1130,8 +1116,8 @@ export class Phase4WorkspaceController {
     if (!this.runtime.canAddPane(project.id)) {
       this.runtime.setFooterStatus(
         tr(
-          "This project can have at most 20 split panes.",
-          "이 프로젝트의 분할 화면은 최대 20개까지 열 수 있습니다.",
+          "A web pane cannot be added right now.",
+          "지금은 웹 화면을 추가할 수 없습니다.",
         ),
         "error",
       );
@@ -1141,6 +1127,56 @@ export class Phase4WorkspaceController {
     const next = appendProjectBrowserPane(state, project.id, browser);
     if (
       !(await this.persist(next, tr("Could not save the web pane state", "웹 패널 상태를 저장하지 못했습니다")))
+    ) {
+      return;
+    }
+    if (!this.runtime.addBrowserPane(project.id, browser, true)) {
+      this.runtime.setFooterStatus(
+        tr(
+          "The web pane state was saved, but no runtime slot could be reserved.",
+          "웹 패널 상태는 저장했지만 실행 슬롯을 확보하지 못했습니다.",
+        ),
+        "error",
+      );
+    }
+  }
+
+  async addBrowserPaneFromLink(projectId: string, url: string): Promise<void> {
+    const state = this.currentState();
+    if (!state || !this.canMutate()) return;
+    const project = state.projects.find((item) => item.id === projectId);
+    const activeTab = state.tabs.find((item) => item.id === state.activeTabId);
+    if (!project || activeTab?.kind !== "project" || activeTab.projectId !== projectId) {
+      return;
+    }
+    if (!this.runtime.canAddPane(project.id)) {
+      this.runtime.setFooterStatus(
+        tr(
+          "A web pane cannot be added right now.",
+          "지금은 웹 화면을 추가할 수 없습니다.",
+        ),
+        "error",
+      );
+      return;
+    }
+
+    let browser: WorkspaceBrowserPane;
+    try {
+      browser = createWorkspaceBrowserPane(this.idFactory(), "WEB", url);
+    } catch {
+      this.runtime.setFooterStatus(
+        tr("The selected link cannot be opened.", "선택한 링크를 열 수 없습니다."),
+        "error",
+      );
+      return;
+    }
+
+    const next = appendProjectBrowserPane(state, project.id, browser);
+    if (
+      !(await this.persist(
+        next,
+        tr("Could not save the web pane state", "웹 패널 상태를 저장하지 못했습니다"),
+      ))
     ) {
       return;
     }

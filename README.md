@@ -1,6 +1,6 @@
 # IHATECODING
 
-IHATECODING is a lightweight Windows desktop workspace for managing multiple PowerShell terminals, Codex CLI sessions, Grok CLI sessions, and web panels in one window. It is built with Rust, Tauri, and Windows ConPTY, and can restore up to 20 terminal panes per project.
+The AI Workspace for autonomous development.
 
 ## Features
 

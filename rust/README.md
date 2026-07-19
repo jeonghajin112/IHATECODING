@@ -4,7 +4,8 @@ The staged C# to Rust migration is implemented through Phase 6. The production d
 
 Implemented production slices include:
 
-1. Up to 20 PowerShell panes with bounded two-at-a-time startup and Job Object cleanup.
+1. No fixed per-project PowerShell pane cap, with bounded two-at-a-time startup,
+   a process-wide defensive resource guard, and Job Object cleanup.
 2. Canonical `workspace-v1` state with compare-and-swap saves, writer ownership, verified backups, recovery, and unknown-field preservation.
 3. Project and workspace tabs, drag reorder, horizontal resize, and alignment snapping.
 4. Codex and Grok session ownership, safe resume, exact provider completion events, durable unread alerts, and usage summaries.

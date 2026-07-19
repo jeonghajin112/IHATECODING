@@ -29,8 +29,12 @@
             data-i18n-title-en="Collapse project list"
             data-i18n-title-ko="프로젝트 목록 접기"
           >
-            <span class="project-list-chevron" aria-hidden="true">›</span>
-            <span data-i18n-en="Projects" data-i18n-ko="프로젝트">Projects</span>
+            <span class="project-list-label" data-i18n-en="Projects" data-i18n-ko="프로젝트">Projects</span>
+            <span class="project-list-chevron" aria-hidden="true">
+              <svg viewBox="0 0 8 8" focusable="false">
+                <path d="m2.25 1.25 3 2.75-3 2.75"></path>
+              </svg>
+            </span>
           </button>
           <button
             id="create-project"
@@ -427,9 +431,9 @@
               Settings
             </strong>
             <span
-              data-i18n-en="Manage the language, notifications, and behavior of IHATECODING."
-              data-i18n-ko="IHATECODING의 언어, 알림과 동작 방식을 관리합니다."
-            >Manage the language, notifications, and behavior of IHATECODING.</span>
+              data-i18n-en="Manage the language, optimization, and notifications of IHATECODING."
+              data-i18n-ko="IHATECODING의 언어, 최적화와 알림을 관리합니다."
+            >Manage the language, optimization, and notifications of IHATECODING.</span>
           </div>
 
           <div class="settings-layout">
@@ -450,6 +454,16 @@
                 data-i18n-en="General"
                 data-i18n-ko="일반"
               >General</button>
+              <button
+                id="settings-optimization-tab"
+                type="button"
+                role="tab"
+                aria-controls="settings-optimization-panel"
+                aria-selected="false"
+                tabindex="-1"
+                data-i18n-en="Optimization"
+                data-i18n-ko="최적화"
+              >Optimization</button>
               <button
                 id="settings-notifications-tab"
                 type="button"
@@ -499,6 +513,56 @@
               </section>
 
               <section
+                id="settings-optimization-panel"
+                class="settings-panel"
+                role="tabpanel"
+                aria-labelledby="settings-optimization-tab"
+                tabindex="0"
+                hidden
+              >
+                <section class="settings-section" aria-labelledby="session-optimization-title">
+                  <div class="settings-section-heading">
+                    <strong
+                      id="session-optimization-title"
+                      data-i18n-en="Session optimization"
+                      data-i18n-ko="세션 최적화"
+                    >Session optimization</strong>
+                    <span
+                      data-i18n-en="Reduce resources used by inactive CLI and browser sessions in projects you are not viewing."
+                      data-i18n-ko="현재 보고 있지 않은 프로젝트의 비활성 CLI와 브라우저 세션이 사용하는 자원을 줄입니다."
+                    >Reduce resources used by inactive CLI and browser sessions in projects you are not viewing.</span>
+                  </div>
+
+                  <label class="settings-toggle settings-switch settings-optimization-toggle">
+                    <input
+                      id="auto-sleep-idle-agents"
+                      type="checkbox"
+                      role="switch"
+                    />
+                    <span class="settings-switch-track" aria-hidden="true">
+                      <span class="settings-switch-thumb"></span>
+                    </span>
+                    <span class="settings-optimization-copy">
+                      <strong
+                        data-i18n-en="Automatically sleep inactive sessions"
+                        data-i18n-ko="비활성 세션 자동 절전"
+                      >Automatically sleep inactive sessions</strong>
+                      <small
+                        data-i18n-en="After 5 minutes, stop idle Codex and Grok CLIs and unload browser sessions only in projects you are not viewing. Sessions in the current project, working agents, unsent input, and plain PowerShell stay running."
+                        data-i18n-ko="5분 후 현재 보고 있지 않은 프로젝트의 유휴 Codex와 Grok CLI를 종료하고 브라우저 세션을 메모리에서 내립니다. 현재 프로젝트의 세션, 작업 중인 에이전트, 전송하지 않은 입력과 일반 PowerShell은 계속 유지됩니다."
+                      >After 5 minutes, stop idle Codex and Grok CLIs and unload browser sessions only in projects you are not viewing. Sessions in the current project, working agents, unsent input, and plain PowerShell stay running.</small>
+                    </span>
+                  </label>
+
+                  <p
+                    class="settings-optimization-note"
+                    data-i18n-en="Opening that project resumes saved AI conversations and restores browser panes at their last addresses. Background child processes and unsaved in-page state cannot be restored. This option is off by default."
+                    data-i18n-ko="해당 프로젝트를 열면 저장된 AI 대화를 자동으로 이어가고 브라우저 창을 마지막 주소로 복원합니다. 백그라운드 자식 프로세스와 웹페이지에서 저장하지 않은 상태는 복원되지 않습니다. 이 옵션은 기본적으로 꺼져 있습니다."
+                  >Opening that project resumes saved AI conversations and restores browser panes at their last addresses. Background child processes and unsaved in-page state cannot be restored. This option is off by default.</p>
+                </section>
+              </section>
+
+              <section
                 id="settings-notifications-panel"
                 class="settings-panel"
                 role="tabpanel"
@@ -519,8 +583,11 @@
                     >Send CLI completion and error notifications to a Discord channel.</span>
                   </div>
 
-                  <label class="phone-notification-toggle phone-notification-master">
-                    <input id="phone-notification-enabled" type="checkbox" />
+                  <label class="phone-notification-toggle settings-switch phone-notification-master">
+                    <input id="phone-notification-enabled" type="checkbox" role="switch" />
+                    <span class="settings-switch-track" aria-hidden="true">
+                      <span class="settings-switch-thumb"></span>
+                    </span>
                     <span data-i18n-en="Enable mobile notifications" data-i18n-ko="휴대폰 알림 사용">
                       Enable mobile notifications
                     </span>
@@ -587,12 +654,18 @@
 
                   <fieldset class="phone-notification-kinds">
                     <legend data-i18n-en="Notify me when" data-i18n-ko="알림 받을 때">Notify me when</legend>
-                    <label class="phone-notification-toggle">
-                      <input id="phone-notification-success" type="checkbox" />
+                    <label class="phone-notification-toggle settings-switch">
+                      <input id="phone-notification-success" type="checkbox" role="switch" />
+                      <span class="settings-switch-track" aria-hidden="true">
+                        <span class="settings-switch-thumb"></span>
+                      </span>
                       <span data-i18n-en="Work completes" data-i18n-ko="작업 완료">Work completes</span>
                     </label>
-                    <label class="phone-notification-toggle">
-                      <input id="phone-notification-error" type="checkbox" />
+                    <label class="phone-notification-toggle settings-switch">
+                      <input id="phone-notification-error" type="checkbox" role="switch" />
+                      <span class="settings-switch-track" aria-hidden="true">
+                        <span class="settings-switch-thumb"></span>
+                      </span>
                       <span data-i18n-en="An error occurs" data-i18n-ko="작업 오류">An error occurs</span>
                     </label>
                   </fieldset>

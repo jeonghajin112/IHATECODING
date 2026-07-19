@@ -1,4 +1,3 @@
-export const PHASE2_MAX_PANES = 20;
 export const DEFAULT_START_CONCURRENCY = 2;
 
 export type GridLayout = Readonly<{
@@ -46,12 +45,12 @@ export function layoutFor(count: number): GridLayout {
   if (count <= 12) return { columns: 4, rows: 3 };
   if (count <= 15) return { columns: 5, rows: 3 };
   if (count === 16) return { columns: 4, rows: 4 };
-  return { columns: 5, rows: 4 };
+  return { columns: 5, rows: Math.ceil(count / 5) };
 }
 
 export function clampPaneCount(value: number): number {
   if (!Number.isFinite(value)) return 1;
-  return Math.min(PHASE2_MAX_PANES, Math.max(1, Math.trunc(value)));
+  return Math.max(1, Math.trunc(value));
 }
 
 export function binaryStringToRawBytes(data: string): number[] {

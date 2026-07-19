@@ -66,8 +66,9 @@ JavaScript's exact range, but it is not an exact-byte import mechanism.
 
 The parser currently enforces a 16 MiB whole-file limit, required fields,
 non-empty IDs/names/paths, unique project IDs, unique terminal IDs within a
-project, a resolvable selected project, at most 20 terminals per project,
-positive finite non-empty ratio vectors, and RFC 3339 terminal timestamps. A
+project, a resolvable selected project, positive finite non-empty ratio
+vectors, and RFC 3339 terminal timestamps. Terminal count has no separate
+per-project product cap; the whole-file limit remains authoritative. A
 top-level unknown `SchemaVersion`, if present, must equal `1`; the normal file
 does not serialize a required schema version.
 
@@ -195,6 +196,7 @@ browser processes or terminal sessions from it.
       "id": "project-id",
       "name": "Example",
       "folderPath": "C:\\Example",
+      "lastModifiedAtUtc": "2026-07-17T00:00:00Z",
       "terminals": [
         {
           "id": "terminal-id",
@@ -243,8 +245,10 @@ payload cannot replace them.
 
 - At most 256 projects exist. Project IDs are non-empty, bounded opaque strings
   and are unique using exact ordinal comparison.
-- At most 20 terminals exist per project. Terminal IDs are unique within the
-  project, and array order is pane order.
+- Terminal count has no product-level per-project cap. Terminal IDs are unique
+  within the project, and array order is pane order. Whole-document byte/depth
+  limits and the runtime's process-wide defensive admission guard remain in
+  force.
 - Names are trimmed for emptiness but their Unicode content is preserved.
 - `folderPath` and `startDirectory` retain the user's display spelling. Path
   availability and containment are derived at activation time and are not
@@ -253,6 +257,9 @@ payload cannot replace them.
   validation conflict; the values remain preserved but all conflicting panes
   are resume-blocked until Phase 5 resolves them.
 - `createdAtUtc` is null or an RFC 3339 instant. Writers emit UTC `Z` form.
+- `lastModifiedAtUtc` is null for legacy projects or an RFC 3339 instant. The
+  frontend updates it only for durable project-content or pane-state changes;
+  tab activation alone does not change recent-project ordering.
 - `completionPending` is the persisted unread terminal alert. The project
   unread count is derived, not independently stored.
 - `paneWidthRatios` preserves the legacy key format. Active keys match
@@ -306,8 +313,9 @@ Importer behavior is deterministic:
 - project and terminal order are unchanged;
 - the first duplicate legacy ID is the active canonical item, while duplicates
   remain in the raw snapshot and produce diagnostics;
-- more than 20 terminals are not spawned or silently deleted; overflow is
-  reported and remains in the raw snapshot;
+- all terminals that fit the validated document resource limits remain in
+  canonical pane order; importing does not spawn sessions, and later activation
+  remains subject to the runtime's process-wide defensive admission guard;
 - invalid or dangling selected project becomes unselected rather than choosing
   and launching the first project;
 - a valid selected project produces one deterministic project tab; otherwise

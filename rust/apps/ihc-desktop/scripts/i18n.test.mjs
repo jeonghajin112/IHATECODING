@@ -93,10 +93,11 @@ test("static application chrome has paired English and Korean translations", () 
   }
 });
 
-test("settings wire immediate language changes and separate notification controls", () => {
+test("settings wire immediate language and optimization changes with separate notification controls", () => {
   assert.match(mainSource, /languageSelect\.addEventListener\("change"[\s\S]*setAppLanguage\(language\)/);
-  assert.match(mainSource, /setActiveSettingsTab\("general"[\s\S]*generalPanel\.hidden[\s\S]*notificationsPanel\.hidden/);
-  assert.match(mainSource, /testButton\.hidden = generalActive[\s\S]*saveButton\.hidden = generalActive/);
+  assert.match(mainSource, /autoSleepIdleAgentsInput\.addEventListener\("change"[\s\S]*setAutoSleepIdleAgents\(enabled\)/);
+  assert.match(mainSource, /\["general", this\.generalTab, this\.generalPanel\][\s\S]*\["optimization", this\.optimizationTab, this\.optimizationPanel\][\s\S]*\["notifications", this\.notificationsTab, this\.notificationsPanel\]/);
+  assert.match(mainSource, /testButton\.hidden = !notificationsActive[\s\S]*saveButton\.hidden = !notificationsActive/);
   assert.match(mainSource, /language:\s*getAppLanguage\(\)/);
 });
 

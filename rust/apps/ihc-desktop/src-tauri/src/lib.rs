@@ -36,10 +36,16 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     env, io,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
-use tauri::{Manager, State, Webview, ipc::Channel};
+use tauri::{Emitter, EventTarget, Manager, State, Webview, ipc::Channel};
 use uuid::Uuid;
+#[cfg(windows)]
+use webview2_com::{
+    Microsoft::Web::WebView2::Win32::ICoreWebView2, SourceChangedEventHandler, take_pwstr,
+};
+#[cfg(windows)]
+use windows_core::PWSTR;
 use workspace_store::{
     ImportProvenanceV1, RecoveryCandidateSummary, RecoveryPreview, SaveWorkspaceRequest,
     SaveWorkspaceResponse, StorageError, StorageErrorCode, StorageMode, StorageResult,
@@ -55,6 +61,35 @@ const PHASE6_SMOKE_PREFIX: &str = "ihatecoding-phase6-";
 const PHASE6_SMOKE_MARKER: &str = ".ihatecoding-phase6-root";
 const PRODUCTION_AGENT_BACKFILL_MARKER: &str = "productionAgentStateBackfillV1";
 const PRODUCTION_AGENT_BACKFILL_V2_MARKER: &str = "productionAgentStateBackfillV2";
+const BROWSER_WEBVIEW_URL_CHANGED_EVENT: &str = "browser-webview-url-changed";
+const MAX_BROWSER_WEBVIEW_URL_BYTES: usize = 16 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct BrowserWebviewUrlChanged {
+    label: String,
+    url: String,
+}
+
+#[derive(Default)]
+struct BrowserWebviewUrlWatchState {
+    registered_labels: Mutex<HashSet<String>>,
+}
+
+impl BrowserWebviewUrlWatchState {
+    fn reserve(&self, label: &str) -> Result<bool, String> {
+        let mut labels = self
+            .registered_labels
+            .lock()
+            .map_err(|_| "The browser URL watcher registry is unavailable.".to_owned())?;
+        Ok(labels.insert(label.to_owned()))
+    }
+
+    fn forget(&self, label: &str) {
+        if let Ok(mut labels) = self.registered_labels.lock() {
+            labels.remove(label);
+        }
+    }
+}
 
 #[tauri::command]
 fn read_provider_usage() -> provider_usage::ProviderUsageResponse {
@@ -75,14 +110,172 @@ fn read_browser_webview_url(
     let url = webview
         .url()
         .map_err(|_| "웹 패널의 현재 주소를 확인하지 못했습니다.".to_owned())?;
+    Ok(safe_browser_webview_url(&url))
+}
+
+#[tauri::command]
+fn watch_browser_webview_url(
+    webview: Webview,
+    state: State<'_, Arc<BrowserWebviewUrlWatchState>>,
+    label: String,
+) -> Result<(), String> {
+    ensure_agent_main_webview(&webview)?;
+    if !is_browser_pane_webview_label(&label) {
+        return Err("The web pane identifier is invalid.".to_owned());
+    }
+
+    let app = webview.app_handle().clone();
+    let child = app
+        .get_webview(&label)
+        .ok_or_else(|| "The web pane no longer exists.".to_owned())?;
+    if !state.reserve(&label)? {
+        // A repeated request must not install another native handler, but it
+        // still receives an authoritative snapshot in case the frontend
+        // listener was recreated.
+        emit_current_browser_webview_url(&app, &child, &label)?;
+        return Ok(());
+    }
+
+    #[cfg(windows)]
+    {
+        let callback_app = app.clone();
+        let callback_label = label.clone();
+        let callback_state = state.inner().clone();
+        if let Err(error) = child.with_webview(move |platform_webview| {
+            if let Err(error) = install_windows_browser_url_watcher(
+                platform_webview,
+                callback_app,
+                callback_label.clone(),
+            ) {
+                callback_state.forget(&callback_label);
+                eprintln!("failed to install browser URL watcher for {callback_label}: {error}");
+            }
+        }) {
+            state.forget(&label);
+            return Err(format!("Could not attach the browser URL watcher: {error}"));
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        // SourceChanged is a WebView2 facility. Other platforms still receive
+        // the current snapshot and may use the existing page-load fallback.
+        state.forget(&label);
+        emit_current_browser_webview_url(&app, &child, &label)?;
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+fn unwatch_browser_webview_url(
+    webview: Webview,
+    state: State<'_, Arc<BrowserWebviewUrlWatchState>>,
+    label: String,
+) -> Result<(), String> {
+    ensure_agent_main_webview(&webview)?;
+    if !is_browser_pane_webview_label(&label) {
+        return Err("The web pane identifier is invalid.".to_owned());
+    }
+    state.forget(&label);
+    Ok(())
+}
+
+fn safe_browser_webview_url(url: &tauri::Url) -> Option<String> {
     if !matches!(url.scheme(), "http" | "https")
         || url.host_str().is_none()
         || !url.username().is_empty()
         || url.password().is_some()
     {
-        return Ok(None);
+        return None;
     }
-    Ok(Some(url.to_string()))
+    let normalized = url.to_string();
+    (normalized.len() <= MAX_BROWSER_WEBVIEW_URL_BYTES).then_some(normalized)
+}
+
+fn safe_browser_webview_url_text(raw_url: &str) -> Option<String> {
+    tauri::Url::parse(raw_url)
+        .ok()
+        .and_then(|url| safe_browser_webview_url(&url))
+}
+
+fn emit_current_browser_webview_url(
+    app: &tauri::AppHandle,
+    webview: &Webview,
+    label: &str,
+) -> Result<(), String> {
+    let url = webview
+        .url()
+        .map_err(|_| "Could not read the current web pane address.".to_owned())?;
+    if let Some(url) = safe_browser_webview_url(&url) {
+        emit_browser_webview_url_changed(app, label, url)?;
+    }
+    Ok(())
+}
+
+fn emit_browser_webview_url_changed(
+    app: &tauri::AppHandle,
+    label: &str,
+    url: String,
+) -> Result<(), String> {
+    app.emit_to(
+        EventTarget::webview(MAIN_WEBVIEW_LABEL),
+        BROWSER_WEBVIEW_URL_CHANGED_EVENT,
+        BrowserWebviewUrlChanged {
+            label: label.to_owned(),
+            url,
+        },
+    )
+    .map_err(|error| format!("Could not publish the web pane address: {error}"))
+}
+
+#[cfg(windows)]
+fn install_windows_browser_url_watcher(
+    platform_webview: tauri::webview::PlatformWebview,
+    app: tauri::AppHandle,
+    label: String,
+) -> Result<(), String> {
+    let controller = platform_webview.controller();
+    // SAFETY: Tauri invokes `with_webview` on the WebView2 UI thread and the
+    // returned controller belongs to this live child webview.
+    let core = unsafe { controller.CoreWebView2() }
+        .map_err(|error| format!("Could not access WebView2: {error}"))?;
+    let event_app = app.clone();
+    let event_label = label.clone();
+    let handler = SourceChangedEventHandler::create(Box::new(move |sender, _| {
+        if let Some(sender) = sender
+            && let Some(url) = read_windows_browser_webview_url(&sender)?
+        {
+            let _ = emit_browser_webview_url_changed(&event_app, &event_label, url);
+        }
+        Ok(())
+    }));
+    let mut token = 0_i64;
+    // SAFETY: the COM interface and event handler are valid on the WebView2
+    // UI thread. WebView2 retains the handler until the child webview dies.
+    unsafe { core.add_SourceChanged(&handler, &mut token) }
+        .map_err(|error| format!("Could not subscribe to WebView2 SourceChanged: {error}"))?;
+
+    // Subscribe first, then read Source. Since both operations execute on the
+    // WebView2 UI thread, a redirect cannot change Source between the snapshot
+    // and handler installation without producing an event.
+    if let Some(url) = read_windows_browser_webview_url(&core)
+        .map_err(|error| format!("Could not read the initial WebView2 address: {error}"))?
+    {
+        emit_browser_webview_url_changed(&app, &label, url)?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn read_windows_browser_webview_url(
+    webview: &ICoreWebView2,
+) -> windows_core::Result<Option<String>> {
+    let mut raw_url = PWSTR::null();
+    // SAFETY: WebView2 allocates Source with CoTaskMemAlloc. `take_pwstr`
+    // copies the UTF-16 string and releases that allocation exactly once.
+    unsafe { webview.Source(&mut raw_url) }?;
+    Ok(safe_browser_webview_url_text(&take_pwstr(raw_url)))
 }
 
 fn is_browser_pane_webview_label(label: &str) -> bool {
@@ -103,7 +296,10 @@ fn is_browser_pane_webview_label(label: &str) -> bool {
 
 #[cfg(test)]
 mod browser_webview_label_tests {
-    use super::is_browser_pane_webview_label;
+    use super::{
+        BrowserWebviewUrlWatchState, MAX_BROWSER_WEBVIEW_URL_BYTES, is_browser_pane_webview_label,
+        safe_browser_webview_url_text,
+    };
 
     #[test]
     fn browser_webview_labels_are_narrow_and_generated_only() {
@@ -119,6 +315,45 @@ mod browser_webview_label_tests {
         ] {
             assert!(!is_browser_pane_webview_label(invalid), "{invalid}");
         }
+    }
+
+    #[test]
+    fn browser_webview_url_filter_accepts_only_persistable_http_urls() {
+        assert_eq!(
+            safe_browser_webview_url_text("https://example.com/path?q=1#fragment").as_deref(),
+            Some("https://example.com/path?q=1#fragment"),
+        );
+        assert_eq!(
+            safe_browser_webview_url_text("http://127.0.0.1:3000/").as_deref(),
+            Some("http://127.0.0.1:3000/"),
+        );
+        for rejected in [
+            "file:///C:/secret.txt",
+            "javascript:alert(1)",
+            "https://user@example.com/",
+            "https://user:password@example.com/",
+            "https://",
+            "not a URL",
+        ] {
+            assert!(
+                safe_browser_webview_url_text(rejected).is_none(),
+                "{rejected}",
+            );
+        }
+        let oversized = format!(
+            "https://example.com/{}",
+            "a".repeat(MAX_BROWSER_WEBVIEW_URL_BYTES)
+        );
+        assert!(safe_browser_webview_url_text(&oversized).is_none());
+    }
+
+    #[test]
+    fn browser_webview_url_watcher_reservation_is_idempotent() {
+        let state = BrowserWebviewUrlWatchState::default();
+        assert_eq!(state.reserve("ihc-browser-1-1"), Ok(true));
+        assert_eq!(state.reserve("ihc-browser-1-1"), Ok(false));
+        state.forget("ihc-browser-1-1");
+        assert_eq!(state.reserve("ihc-browser-1-1"), Ok(true));
     }
 }
 
@@ -621,6 +856,17 @@ fn phase2_initial_panes() -> u8 {
 #[tauri::command]
 fn stop_terminal(manager: State<'_, TerminalManager>, session_id: String) -> Result<(), String> {
     manager.stop(&session_id)
+}
+
+#[tauri::command]
+async fn stop_terminal_and_wait(
+    manager: State<'_, TerminalManager>,
+    session_id: String,
+) -> Result<(), String> {
+    let manager = manager.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || manager.stop_and_wait(&session_id))
+        .await
+        .map_err(|error| format!("Terminal stop worker failed: {error}"))?
 }
 
 #[tauri::command]
@@ -1539,6 +1785,7 @@ fn workspace_state_from_legacy(draft: LegacyWorkspaceDraft) -> WorkspaceStateV1 
             id: project.id,
             name: project.name,
             folder_path: project.folder_path,
+            last_modified_at_utc: None,
             terminals: project
                 .terminals
                 .into_iter()
@@ -1753,6 +2000,7 @@ pub fn run() {
         .manage(agent_runtime)
         .manage(project_store)
         .manage(provider_account_service)
+        .manage(Arc::new(BrowserWebviewUrlWatchState::default()))
         .setup(move |app| {
             let app_local_data_dir = setup_app_local_data_dir.clone();
             let workspace_store = WorkspaceStore::open(&app_local_data_dir)?;
@@ -1794,6 +2042,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             read_provider_usage,
             read_browser_webview_url,
+            watch_browser_webview_url,
+            unwatch_browser_webview_url,
             read_provider_account,
             list_provider_accounts,
             add_provider_account,
@@ -1822,6 +2072,7 @@ pub fn run() {
             terminal_engine_status,
             phase2_initial_panes,
             stop_terminal,
+            stop_terminal_and_wait,
             load_project_catalog,
             save_project_catalog,
             inspect_project_catalog_copy,
@@ -2030,6 +2281,7 @@ mod phase3b_bridge_tests {
                 id: "current-project".to_owned(),
                 name: "Current layout".to_owned(),
                 folder_path: r"C:\Current".to_owned(),
+                last_modified_at_utc: None,
                 terminals,
                 pane_width_ratios: BTreeMap::from([("grid-2x1-row-0".to_owned(), vec![0.4, 0.6])]),
                 legacy_extensions: BTreeMap::new(),

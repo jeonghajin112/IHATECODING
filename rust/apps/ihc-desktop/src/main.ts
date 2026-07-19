@@ -12,6 +12,7 @@ import {
   LogicalSize,
 } from "@tauri-apps/api/window";
 import { FitAddon } from "@xterm/addon-fit";
+import { WebLinksAddon } from "@xterm/addon-web-links";
 import { Terminal } from "@xterm/xterm";
 import {
   CumulativeAckPolicy,
@@ -25,7 +26,6 @@ import {
   type TerminalEvent,
 } from "./phase2-core";
 import {
-  MAX_WORKSPACE_TERMINALS as MAX_PROJECT_PANES,
   type WorkspaceProject,
   type WorkspaceTerminal,
 } from "./phase3b-core";
@@ -75,6 +75,15 @@ import {
   tr,
   type AppLanguage,
 } from "./i18n";
+import {
+  agentTurnStartIdentity,
+  getAutoSleepIdleAgents,
+  inactiveAgentSleepDeadline,
+  inactiveBrowserSleepDeadline,
+  INACTIVE_AGENT_SLEEP_SWEEP_MS,
+  setAutoSleepIdleAgents,
+  shouldReleaseAgentInputProtection,
+} from "./optimization-settings";
 
 initializeAppLanguage();
 
@@ -93,11 +102,18 @@ type PaneState =
 
 type StatusTone = "normal" | "error";
 type BrowserState = "closed" | "opening" | "open" | "closing";
+type AgentTurnState = "unknown" | "working" | "idle";
 
 type OutputBatch = Extract<TerminalEvent, { event: "output" }>["data"];
 type TerminalInput =
   | { kind: "text"; data: string }
   | { kind: "binary"; data: number[] };
+
+type InactiveAgentSleepCandidate = Readonly<{
+  sessionId: string;
+  provider: AgentProvider;
+  conversationId: string;
+}>;
 
 type CursorClickSnapshot = {
   clientX: number;
@@ -166,6 +182,11 @@ type QueuedPhoneNotification = {
   labels: PhoneNotificationLabels;
 };
 
+type BrowserWebviewUrlChanged = {
+  label: string;
+  url: string;
+};
+
 const OUTPUT_SETTLED_DELAY_MS = 120;
 const OUTPUT_RENDER_COALESCE_MS = 10;
 const OUTPUT_RENDER_MAX_BYTES = 256 * 1024;
@@ -197,6 +218,7 @@ const CLIPBOARD_READ_TIMEOUT_MS = 3_000;
 const TERMINAL_LAUNCH_PROBE_TTL_MS = 12_000;
 const TERMINAL_PAINT_WATCHDOG_POLL_MS = 120;
 const TERMINAL_SYNCHRONIZED_PAINT_LIMIT_MS = 1_600;
+const BROWSER_URL_FALLBACK_SYNC_INTERVAL_MS = 1_000;
 const PANE_DRAG_START_DISTANCE_PX = 8;
 const PANE_DRAG_MINIMUM_REORDER_DISTANCE_PX = 12;
 const PANE_DRAG_SLOT_HYSTERESIS_PX = 18;
@@ -258,6 +280,7 @@ class TerminalPane {
   private phoneErrorNotifiedEpoch = -1;
   private disposed = false;
   private catalogWritable = false;
+  private titleEditCommitRequested = false;
   private terminalFailed = false;
   private copyShortcutReleasePending = false;
   private fitTimer = 0;
@@ -269,6 +292,7 @@ class TerminalPane {
   private userBrowsingScrollback = false;
   private selectionGestureActive = false;
   private cursorClickSnapshot: CursorClickSnapshot | null = null;
+  private webLinkActivationVersion = 0;
   private editableAnchorColumn: number | null = null;
   private capturedCursorMoveInput: string[] | null = null;
   private terminalRenderVersion = 0;
@@ -290,6 +314,12 @@ class TerminalPane {
   private agentProvider: AgentProvider | null;
   private agentConversationId: string | null;
   private agentConversationBound: boolean;
+  private agentTurnState: AgentTurnState = "unknown";
+  private agentIdleSinceUnixMs: number | null = null;
+  private agentInputAwaitingTurnStart = false;
+  private agentLastTurnStartIdentity: string | null = null;
+  private agentInputBaselineTurnStartIdentity: string | null = null;
+  private agentInputObservedAtUnixMs: number | null = null;
   private runtimeStartedAtUnixMs = Date.now();
   private agentDiscoveryTimer = 0;
   private agentDiscoveryAttempts = 0;
@@ -309,6 +339,7 @@ class TerminalPane {
   private readonly onWindowMouseUp = (event: MouseEvent) => {
     if (event.button !== 0 || !this.selectionGestureActive) return;
     const snapshot = this.cursorClickSnapshot;
+    const linkActivationVersion = this.webLinkActivationVersion;
     const release = {
       clientX: event.clientX,
       clientY: event.clientY,
@@ -326,7 +357,10 @@ class TerminalPane {
       this.userBrowsingScrollback = false;
     }
     if (snapshot) {
-      window.setTimeout(() => this.moveCursorFromClick(snapshot, release), 0);
+      window.setTimeout(() => {
+        if (this.webLinkActivationVersion !== linkActivationVersion) return;
+        this.moveCursorFromClick(snapshot, release);
+      }, 0);
     }
   };
 
@@ -368,6 +402,7 @@ class TerminalPane {
     projectId: string,
     savedState: WorkspaceTerminal,
     private readonly resumePlan: SafeResumePlan,
+    resumedFromAutoSleep: boolean,
   ) {
     this.terminalId = savedState.id;
     this.id = paneRuntimeId(projectId, savedState.id);
@@ -379,6 +414,13 @@ class TerminalPane {
     this.agentConversationId =
       resumePlan.action === "resume" ? resumePlan.conversationId : null;
     this.agentConversationBound = resumePlan.action === "resume";
+    if (resumedFromAutoSleep && resumePlan.action === "resume") {
+      // Auto-sleep is entered only from an explicitly idle, settled turn. Seed
+      // that durable state after recreation because providers do not always
+      // replay an idle lifecycle edge when a conversation is resumed.
+      this.agentTurnState = "idle";
+      this.agentIdleSinceUnixMs = Date.now();
+    }
     this.completionPending = savedState.completionPending;
 
     this.element = document.createElement("article");
@@ -480,6 +522,33 @@ class TerminalPane {
       this.fileDropOverlay,
     );
 
+    const showWebLinkTarget = (_event: MouseEvent, uri: string) => {
+      this.viewport.title = uri;
+    };
+    const clearWebLinkTarget = () => {
+      this.viewport.removeAttribute("title");
+    };
+    const openWebLink = (event: MouseEvent, uri: string) => {
+      if (event.button !== 0 || this.disposed || this.terminal.hasSelection()) return;
+      let parsed: URL;
+      try {
+        parsed = new URL(uri);
+      } catch {
+        return;
+      }
+      if (
+        (parsed.protocol !== "http:" && parsed.protocol !== "https:") ||
+        parsed.username ||
+        parsed.password
+      ) {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      this.webLinkActivationVersion += 1;
+      void this.workspace.openTerminalWebLink(this.projectId, uri);
+    };
+
     this.terminal = new Terminal({
       altClickMovesCursor: false,
       // Keep the input caret stable while full-screen CLIs repaint progress.
@@ -496,6 +565,12 @@ class TerminalPane {
       scrollback: 10_000,
       smoothScrollDuration: 0,
       rightClickSelectsWord: false,
+      linkHandler: {
+        activate: openWebLink,
+        hover: showWebLinkTarget,
+        leave: clearWebLinkTarget,
+        allowNonHttpProtocols: false,
+      },
       vtExtensions: {
         kittyKeyboard: true,
         win32InputMode: true,
@@ -536,6 +611,12 @@ class TerminalPane {
         brightWhite: "#fafafa",
       },
     });
+    this.terminal.loadAddon(
+      new WebLinksAddon(openWebLink, {
+        hover: showWebLinkTarget,
+        leave: clearWebLinkTarget,
+      }),
+    );
     this.terminal.loadAddon(this.fitAddon);
     this.terminal.open(this.viewport);
     this.installStableCursorPolicy();
@@ -560,8 +641,17 @@ class TerminalPane {
       event.stopPropagation();
       void this.workspace.closePane(this.id);
     });
-    this.titleElement.addEventListener("dblclick", (event) => {
+    header.addEventListener("dblclick", (event) => {
+      const target = event.target;
+      if (
+        !(target instanceof Element) ||
+        target.closest("button, input, textarea, select, [contenteditable='true']")
+      ) {
+        return;
+      }
+      event.preventDefault();
       event.stopPropagation();
+      this.workspace.cancelLayoutInteraction();
       this.beginTitleEdit();
     });
     this.titleEditor.addEventListener("pointerdown", (event) => event.stopPropagation());
@@ -634,12 +724,20 @@ class TerminalPane {
 
   setAgentConversation(provider: AgentProvider, conversationId: string) {
     const normalizedConversationId = conversationId.toLowerCase();
-    if (
+    const conversationChanged =
       !this.agentConversationBound ||
       this.agentProvider !== provider ||
-      this.agentConversationId !== normalizedConversationId
+      this.agentConversationId !== normalizedConversationId;
+    if (
+      conversationChanged
     ) {
       this.clearAgentContextUsage();
+      this.agentTurnState = "unknown";
+      this.agentIdleSinceUnixMs = null;
+      this.agentInputAwaitingTurnStart = false;
+      this.agentLastTurnStartIdentity = null;
+      this.agentInputBaselineTurnStartIdentity = null;
+      this.agentInputObservedAtUnixMs = null;
     }
     this.agentProvider = provider;
     this.agentConversationId = normalizedConversationId;
@@ -649,6 +747,86 @@ class TerminalPane {
     this.agentDiscoveryTimer = 0;
     window.clearTimeout(this.resumeHealthTimer);
     this.resumeHealthTimer = 0;
+  }
+
+  setAgentTurnWorking(
+    working: boolean,
+    turnId: string | null,
+    observedAtUnixMs: number,
+  ) {
+    if (this.disposed) return;
+    if (working) {
+      const nextIdentity = agentTurnStartIdentity(turnId, observedAtUnixMs);
+      if (
+        this.agentInputAwaitingTurnStart &&
+        shouldReleaseAgentInputProtection({
+          baselineTurnStartIdentity: this.agentInputBaselineTurnStartIdentity,
+          inputObservedAtUnixMs: this.agentInputObservedAtUnixMs,
+          nextTurnId: turnId,
+          nextTurnObservedAtUnixMs: observedAtUnixMs,
+        })
+      ) {
+        this.agentInputAwaitingTurnStart = false;
+        this.agentInputBaselineTurnStartIdentity = null;
+        this.agentInputObservedAtUnixMs = null;
+      }
+      if (nextIdentity !== null) this.agentLastTurnStartIdentity = nextIdentity;
+    }
+    this.agentTurnState = working ? "working" : "idle";
+    this.agentIdleSinceUnixMs = working ? null : Date.now();
+  }
+
+  inactiveAgentSleepCandidate(
+    plan: SafeResumePlan | undefined,
+    enabled: boolean,
+    projectActive: boolean,
+    projectInactiveSinceUnixMs: number | null,
+    nowUnixMs: number,
+  ): InactiveAgentSleepCandidate | null {
+    const resumableConversation =
+      plan?.action === "resume" &&
+      plan.provider !== null &&
+      plan.conversationId !== null &&
+      this.agentConversationBound &&
+      this.agentProvider === plan.provider &&
+      this.agentConversationId === plan.conversationId.toLowerCase();
+    const lifecycleSettled =
+      !this.agentDiscoveryPending &&
+      this.outputSequencer.pendingCount === 0 &&
+      this.ackPolicy.inFlight === null &&
+      this.pendingRenderBatches.length === 0 &&
+      !this.renderDrainScheduled &&
+      this.pendingExit === null &&
+      this.pendingCompletionKey === null &&
+      this.pendingAgentCompletionRoutes.length === 0 &&
+      !this.completionAckPending &&
+      !this.agentInputAwaitingTurnStart &&
+      performance.now() - this.lastRenderedOutputAt >= COMPLETION_OUTPUT_QUIET_MS;
+    const deadline = inactiveAgentSleepDeadline({
+      enabled,
+      projectActive,
+      paneRunning: this.paneState === "running" && !this.disposed && !this.terminalFailed,
+      runtimeSessionPresent: this.sessionId !== null,
+      resumableConversation,
+      agentTurnState: this.agentTurnState,
+      lifecycleSettled,
+      projectInactiveSinceUnixMs,
+      agentIdleSinceUnixMs: this.agentIdleSinceUnixMs,
+    });
+    if (
+      deadline === null ||
+      deadline > nowUnixMs ||
+      !this.sessionId ||
+      !this.agentProvider ||
+      !this.agentConversationId
+    ) {
+      return null;
+    }
+    return {
+      sessionId: this.sessionId,
+      provider: this.agentProvider,
+      conversationId: this.agentConversationId,
+    };
   }
 
   setAgentContextUsage(
@@ -681,7 +859,19 @@ class TerminalPane {
   }
 
   startAfter(barrier: Promise<void>) {
-    this.startCompletion = barrier.then(() => this.start());
+    this.startCompletion = barrier
+      .then(() => this.start())
+      .catch((error) => {
+        if (this.disposed) return;
+        this.setState(
+          "error",
+          tr(
+            `Could not safely restart this CLI: ${errorMessage(error)}`,
+            `이 CLI를 안전하게 다시 시작하지 못했습니다: ${errorMessage(error)}`,
+          ),
+          "error",
+        );
+      });
     return this.startCompletion;
   }
 
@@ -914,7 +1104,7 @@ class TerminalPane {
     this.catalogWritable = writable;
     this.maximizeButton.disabled = !writable;
     this.closeButton.disabled = !writable;
-    if (!writable && !this.titleEditor.hidden) this.cancelTitleEdit();
+    if (writable) this.resumeDeferredTitleEdit();
   }
 
   scheduleFit(delay = 35) {
@@ -927,7 +1117,9 @@ class TerminalPane {
     }, delay);
   }
 
-  dispose(): Promise<void> {
+  dispose(
+    stopSession: (sessionId: string) => Promise<void> = stopBackendSession,
+  ): Promise<void> {
     if (this.disposed) return Promise.resolve();
     this.disposed = true;
     this.startAbortController.abort();
@@ -963,7 +1155,7 @@ class TerminalPane {
       this.workspace.releaseSession(targetSession, this.id);
     }
     const stopBarrier = Promise.all([
-      ...[...sessionsToStop].map(stopBackendSession),
+      ...[...sessionsToStop].map(stopSession),
       this.startCompletion.catch(() => undefined),
     ]).then(() => undefined);
     this.unboundOutput.length = 0;
@@ -972,6 +1164,10 @@ class TerminalPane {
     this.selectionCopyGuard.invalidate();
     this.terminal.dispose();
     return stopBarrier;
+  }
+
+  disposeForAutoSleep(): Promise<void> {
+    return this.dispose(stopBackendSessionAndWait);
   }
 
   private installTerminalInputHandlers() {
@@ -1908,6 +2104,19 @@ class TerminalPane {
     return (input: TerminalInput | null) => {
       if (committed) return;
       committed = true;
+      if (input && input.data.length > 0) {
+        // Any PTY input after an idle edge may be an unsent draft or a newly
+        // submitted prompt whose start hook has not arrived yet. Input entered
+        // during a running turn can also be the next queued prompt, so protect
+        // it until a newer turn-start edge proves that the CLI consumed it.
+        this.agentInputAwaitingTurnStart = true;
+        this.agentInputBaselineTurnStartIdentity = this.agentLastTurnStartIdentity;
+        this.agentInputObservedAtUnixMs = Date.now();
+        if (this.agentTurnState !== "working") {
+          this.agentTurnState = "unknown";
+          this.agentIdleSinceUnixMs = null;
+        }
+      }
       resolveInput(input);
     };
   }
@@ -2622,7 +2831,11 @@ class TerminalPane {
   }
 
   private beginTitleEdit() {
-    if (this.disposed || !this.catalogWritable) return;
+    if (this.disposed) return;
+    if (!this.titleEditor.hidden) {
+      this.titleEditor.focus();
+      return;
+    }
     this.titleEditor.value = this.title;
     this.titleElement.hidden = true;
     this.titleEditor.hidden = false;
@@ -2631,6 +2844,12 @@ class TerminalPane {
   }
 
   private commitTitleEdit() {
+    if (this.disposed) return;
+    if (!this.catalogWritable) {
+      this.titleEditCommitRequested = true;
+      return;
+    }
+    this.titleEditCommitRequested = false;
     const title = this.titleEditor.value.trim();
     this.titleEditor.hidden = true;
     this.titleElement.hidden = false;
@@ -2639,10 +2858,19 @@ class TerminalPane {
   }
 
   private cancelTitleEdit() {
+    this.titleEditCommitRequested = false;
     this.titleEditor.hidden = true;
     this.titleElement.hidden = false;
     this.titleEditor.value = this.title;
     this.terminal.focus();
+  }
+
+  private resumeDeferredTitleEdit() {
+    if (this.disposed || !this.catalogWritable || !this.titleEditCommitRequested) return;
+    queueMicrotask(() => {
+      if (this.disposed || !this.catalogWritable) return;
+      if (this.titleEditCommitRequested) this.commitTitleEdit();
+    });
   }
 }
 
@@ -2658,6 +2886,7 @@ class BrowserPane {
   private readonly titleElement: HTMLElement;
   private readonly titleEditor: HTMLInputElement;
   private readonly stateLabel: HTMLElement;
+  private readonly maximizeButton: HTMLButtonElement;
   private readonly closeButton: HTMLButtonElement;
   private readonly resizeHandle: HTMLDivElement;
   private readonly resizeObserver: ResizeObserver;
@@ -2667,8 +2896,22 @@ class BrowserPane {
   private disposed = false;
   private layoutVisible = false;
   private interactionSuspended = false;
+  private hibernated = false;
+  private desiredSleep = false;
   private catalogWritable = true;
+  private titleEditCommitRequested = false;
   private currentUrl: string;
+  private persistedUrl: string;
+  private addressDirty = false;
+  private navigationRevision = 0;
+  private urlSyncFallbackTimer = 0;
+  private urlSyncFallbackEnabled = false;
+  private pendingNavigation: {
+    url: string;
+    persist: boolean;
+    revision: number;
+    queued: boolean;
+  } | null = null;
   private statusMessage = tr("Browser ready", "브라우저 준비 중");
   private statusTone: StatusTone = "normal";
   private operationQueue: Promise<void> = Promise.resolve();
@@ -2685,6 +2928,7 @@ class BrowserPane {
     this.id = browserPaneRuntimeId(projectId, savedState.id);
     this.title = savedState.title;
     this.currentUrl = savedState.url;
+    this.persistedUrl = savedState.url;
 
     this.element = document.createElement("article");
     this.element.className = "terminal-pane browser-pane";
@@ -2716,13 +2960,23 @@ class BrowserPane {
     heading.append(this.titleElement, this.titleEditor, this.stateLabel);
     const actions = document.createElement("div");
     actions.className = "terminal-actions";
+    this.maximizeButton = document.createElement("button");
+    this.maximizeButton.className = "terminal-window-action terminal-maximize";
+    this.maximizeButton.type = "button";
+    this.maximizeButton.textContent = "□";
+    this.maximizeButton.title = tr(`Maximize ${this.title}`, `${this.title} 확대`);
+    this.maximizeButton.setAttribute(
+      "aria-label",
+      tr(`Maximize ${this.title}`, `${this.title} 확대`),
+    );
+    this.maximizeButton.setAttribute("aria-pressed", "false");
     this.closeButton = document.createElement("button");
     this.closeButton.className = "terminal-window-action terminal-close";
     this.closeButton.type = "button";
     this.closeButton.textContent = "×";
     this.closeButton.title = tr(`Close ${this.title}`, `${this.title} 닫기`);
     this.closeButton.setAttribute("aria-label", tr(`Close ${this.title}`, `${this.title} 닫기`));
-    actions.append(this.closeButton);
+    actions.append(this.maximizeButton, this.closeButton);
     header.append(stateDot, heading, actions);
 
     const navigation = document.createElement("form");
@@ -2762,12 +3016,25 @@ class BrowserPane {
     );
     this.element.append(header, navigation, this.viewport, this.resizeHandle);
 
+    this.maximizeButton.addEventListener("click", (event) => {
+      event.stopPropagation();
+      this.workspace.togglePaneMaximize(this.id);
+    });
     this.closeButton.addEventListener("click", (event) => {
       event.stopPropagation();
       void this.workspace.closeBrowserPane(this.id);
     });
-    this.titleElement.addEventListener("dblclick", (event) => {
+    header.addEventListener("dblclick", (event) => {
+      const target = event.target;
+      if (
+        !(target instanceof Element) ||
+        target.closest("button, input, textarea, select, [contenteditable='true']")
+      ) {
+        return;
+      }
+      event.preventDefault();
       event.stopPropagation();
+      this.workspace.cancelLayoutInteraction();
       this.beginTitleEdit();
     });
     this.titleEditor.addEventListener("pointerdown", (event) => event.stopPropagation());
@@ -2795,9 +3062,20 @@ class BrowserPane {
       this.workspace.beginPaneResize(event, this.id, this.resizeHandle);
     });
     navigation.addEventListener("pointerdown", (event) => event.stopPropagation());
+    this.address.addEventListener("input", () => {
+      this.addressDirty = true;
+    });
+    navigation.addEventListener("focusout", () => {
+      queueMicrotask(() => {
+        if (this.disposed || navigation.contains(document.activeElement)) return;
+        this.addressDirty = false;
+        this.address.value = this.pendingNavigation?.url ?? this.currentUrl;
+      });
+    });
     navigation.addEventListener("submit", (event) => {
       event.preventDefault();
       event.stopPropagation();
+      this.addressDirty = false;
       this.navigate(this.address.value);
     });
 
@@ -2811,6 +3089,52 @@ class BrowserPane {
 
   start() {
     this.navigate(this.address.value, false);
+  }
+
+  isRunningForAutoSleep() {
+    return (
+      !this.disposed &&
+      !this.hibernated &&
+      !this.desiredSleep &&
+      this.webview !== null &&
+      this.pendingNavigation === null
+    );
+  }
+
+  hibernate(): Promise<void> {
+    if (this.disposed || this.hibernated) return Promise.resolve();
+    this.desiredSleep = true;
+    const operation = this.operationQueue
+      .then(() => this.hibernateNow())
+      .catch((error) => {
+        if (!this.disposed && this.desiredSleep) {
+          this.desiredSleep = false;
+          console.warn("Automatic browser sleep did not finish cleanly", error);
+        }
+      });
+    this.operationQueue = operation;
+    return operation;
+  }
+
+  wake(): Promise<void> {
+    if (this.disposed) return Promise.resolve();
+    this.desiredSleep = false;
+    const operation = this.operationQueue
+      .then(() => this.wakeNow())
+      .catch((error) => {
+        if (!this.disposed && !this.desiredSleep) {
+          this.setState(
+            "error",
+            tr(
+              `Failed to restore browser session: ${errorMessage(error)}`,
+              `브라우저 세션 복원 실패: ${errorMessage(error)}`,
+            ),
+            "error",
+          );
+        }
+      });
+    this.operationQueue = operation;
+    return operation;
   }
 
   focus() {
@@ -2832,6 +3156,11 @@ class BrowserPane {
     this.element.setAttribute("aria-label", title);
     this.closeButton.title = tr(`Close ${title}`, `${title} 닫기`);
     this.closeButton.setAttribute("aria-label", tr(`Close ${title}`, `${title} 닫기`));
+    const maximized = this.element.dataset.maximized === "true";
+    this.maximizeButton.title = maximized
+      ? tr(`Restore ${title}`, `${title} 복원`)
+      : tr(`Maximize ${title}`, `${title} 확대`);
+    this.maximizeButton.setAttribute("aria-label", this.maximizeButton.title);
     this.resizeHandle.setAttribute(
       "aria-label",
       tr(`Resize ${title} width`, `${title} 너비 조절`),
@@ -2840,8 +3169,15 @@ class BrowserPane {
 
   setCatalogWritable(writable: boolean) {
     this.catalogWritable = writable;
+    this.maximizeButton.disabled = !writable;
     this.closeButton.disabled = !writable;
-    this.titleEditor.disabled = !writable;
+    if (!writable) return;
+    this.resumeDeferredTitleEdit();
+    if (this.pendingNavigation) {
+      this.queuePendingNavigation();
+    } else if (this.currentUrl !== this.persistedUrl && this.webview) {
+      this.observeWebviewUrl(this.webview.label, this.currentUrl);
+    }
   }
 
   setResizeHandleEnabled(enabled: boolean) {
@@ -2853,24 +3189,38 @@ class BrowserPane {
     this.element.dataset.dragging = String(dragging);
   }
 
+  setMaximized(maximized: boolean) {
+    this.element.dataset.maximized = String(maximized);
+    this.maximizeButton.textContent = maximized ? "▣" : "□";
+    this.maximizeButton.title = maximized
+      ? tr(`Restore ${this.title}`, `${this.title} 복원`)
+      : tr(`Maximize ${this.title}`, `${this.title} 확대`);
+    this.maximizeButton.setAttribute("aria-label", this.maximizeButton.title);
+    this.maximizeButton.setAttribute("aria-pressed", String(maximized));
+  }
+
   setLayoutVisible(visible: boolean) {
     if (this.disposed || this.layoutVisible === visible) return;
     this.layoutVisible = visible;
     if (!visible) {
+      this.clearUrlSyncFallbackTimer();
       void this.webview?.hide().catch(() => undefined);
       return;
     }
     this.scheduleFit(0);
+    this.scheduleUrlSyncFallback(0);
   }
 
   setInteractionSuspended(suspended: boolean) {
     if (this.disposed || this.interactionSuspended === suspended) return;
     this.interactionSuspended = suspended;
     if (suspended) {
+      this.clearUrlSyncFallbackTimer();
       void this.webview?.hide().catch(() => undefined);
       return;
     }
     this.scheduleFit(0);
+    this.scheduleUrlSyncFallback(0);
   }
 
   overlapsNativeOverlay(bounds: RectangleBounds) {
@@ -2892,48 +3242,181 @@ class BrowserPane {
   }
 
   async captureCurrentUrl(): Promise<void> {
+    const capture = this.operationQueue.then(() => this.captureCurrentUrlNow());
+    this.operationQueue = capture.then(
+      () => undefined,
+      () => undefined,
+    );
+    await capture;
+  }
+
+  private async captureCurrentUrlNow(): Promise<boolean> {
     const webview = this.webview;
-    if (this.disposed || !this.catalogWritable || !webview) return;
+    if (this.disposed || !webview || this.pendingNavigation) return false;
+    const navigationRevision = this.navigationRevision;
     let observed: string | null;
     try {
       observed = await invoke<string | null>("read_browser_webview_url", {
         label: webview.label,
       });
     } catch {
-      return;
+      return false;
     }
-    if (this.disposed || this.webview !== webview || !observed) return;
-    let url: string;
-    try {
-      url = normalizeBrowserUrl(observed);
-    } catch {
-      return;
+    if (
+      this.disposed ||
+      this.webview !== webview ||
+      navigationRevision !== this.navigationRevision ||
+      !observed
+    ) {
+      return false;
     }
-    if (url === this.currentUrl) return;
-    const saved = await this.workspace.updateBrowserPaneUrl(this.id, url);
-    if (!saved || this.disposed || this.webview !== webview) return;
-    this.currentUrl = url;
-    if (document.activeElement !== this.address) this.address.value = url;
+    const url = this.applyObservedUrl(webview.label, observed, navigationRevision);
+    if (!url) return false;
+    return this.persistObservedUrl(webview.label, url, navigationRevision);
+  }
+
+  observeWebviewUrl(label: string, rawUrl: string) {
+    if (this.disposed || label !== this.webview?.label) return;
+    const navigationRevision = this.navigationRevision;
+    const url = this.applyObservedUrl(label, rawUrl, navigationRevision);
+    if (!url) return;
+    this.operationQueue = this.operationQueue
+      .then(() => this.persistObservedUrl(label, url, navigationRevision))
+      .then(() => undefined)
+      .catch(() => undefined);
   }
 
   async dispose(): Promise<void> {
     if (this.disposed) return;
     this.disposed = true;
+    this.navigationRevision += 1;
     this.generation += 1;
+    this.clearUrlSyncFallbackTimer();
     window.clearTimeout(this.fitTimer);
     this.resizeObserver.disconnect();
-    await this.operationQueue.catch(() => undefined);
-    await this.boundsQueue.catch(() => undefined);
     const webview = this.webview;
     this.webview = null;
+    await webview?.hide().catch(() => undefined);
+    await this.operationQueue.catch(() => undefined);
+    await this.boundsQueue.catch(() => undefined);
     if (webview) {
-      await webview.hide().catch(() => undefined);
-      await webview.close().catch(() => undefined);
+      const closed = await webview.close().then(
+        () => true,
+        () => false,
+      );
+      if (closed) await this.workspace.unwatchBrowserWebviewUrl(webview.label);
+    }
+  }
+
+  private async hibernateNow(): Promise<void> {
+    if (
+      this.disposed ||
+      !this.desiredSleep ||
+      this.hibernated ||
+      !this.catalogWritable ||
+      this.pendingNavigation ||
+      !this.webview
+    ) {
+      if (!this.disposed && this.desiredSleep && !this.hibernated) {
+        this.desiredSleep = false;
+      }
+      return;
+    }
+
+    const captured = await this.captureCurrentUrlNow();
+    if (
+      this.disposed ||
+      !this.desiredSleep ||
+      !captured ||
+      !this.catalogWritable ||
+      this.pendingNavigation ||
+      !this.webview ||
+      this.currentUrl !== this.persistedUrl
+    ) {
+      if (!this.disposed && this.desiredSleep && !this.hibernated) {
+        this.desiredSleep = false;
+      }
+      return;
+    }
+
+    const webview = this.webview;
+    const urlSyncFallbackWasEnabled = this.urlSyncFallbackEnabled;
+    this.hibernated = true;
+    this.element.dataset.hibernated = "true";
+    this.urlSyncFallbackEnabled = false;
+    this.clearUrlSyncFallbackTimer();
+    this.navigationRevision += 1;
+    this.generation += 1;
+    this.webview = null;
+
+    try {
+      await webview.hide();
+      await this.boundsQueue.catch(() => undefined);
+      if (!this.disposed && !this.desiredSleep) {
+        this.restoreHibernatingWebview(webview, urlSyncFallbackWasEnabled);
+        return;
+      }
+      // `close()` is invoked immediately after the final cancellation check.
+      // JavaScript cannot process a project activation between the check and
+      // this call, which keeps the destructive commit window as small as the
+      // native WebView API permits.
+      await webview.close();
+      await this.workspace.unwatchBrowserWebviewUrl(webview.label);
+    } catch (error) {
+      if (!this.disposed) {
+        this.restoreHibernatingWebview(webview, urlSyncFallbackWasEnabled);
+      }
+      throw error;
+    }
+
+    if (!this.disposed) {
+      this.setState("queued", tr("Browser session sleeping", "브라우저 세션 절전 중"));
+    }
+  }
+
+  private restoreHibernatingWebview(webview: Webview, urlSyncFallbackWasEnabled: boolean) {
+    if (this.disposed) return;
+    this.webview = webview;
+    this.hibernated = false;
+    this.desiredSleep = false;
+    delete this.element.dataset.hibernated;
+    this.urlSyncFallbackEnabled = urlSyncFallbackWasEnabled;
+    this.scheduleFit(0);
+    this.scheduleUrlSyncFallback(0);
+  }
+
+  private async wakeNow(): Promise<void> {
+    if (this.disposed || this.desiredSleep) return;
+    if (!this.hibernated && this.webview) {
+      this.scheduleFit(0);
+      this.scheduleUrlSyncFallback(0);
+      return;
+    }
+
+    this.hibernated = false;
+    delete this.element.dataset.hibernated;
+    this.currentUrl = this.persistedUrl;
+    if (!this.addressDirty && document.activeElement !== this.address) {
+      this.address.value = this.persistedUrl;
+    }
+    try {
+      await this.replaceWebview(this.persistedUrl);
+    } catch (error) {
+      if (!this.disposed && !this.desiredSleep) {
+        this.hibernated = true;
+        this.element.dataset.hibernated = "true";
+      }
+      throw error;
     }
   }
 
   private navigate(rawUrl: string, persist = true) {
     if (this.disposed) return;
+    this.desiredSleep = false;
+    if (this.hibernated) {
+      this.hibernated = false;
+      delete this.element.dataset.hibernated;
+    }
     let url: string;
     try {
       url = normalizeBrowserUrl(rawUrl);
@@ -2943,20 +3426,48 @@ class BrowserPane {
       this.address.select();
       return;
     }
+    const navigationRevision = ++this.navigationRevision;
+    this.addressDirty = false;
     this.address.value = url;
+    this.pendingNavigation = {
+      url,
+      persist,
+      revision: navigationRevision,
+      queued: false,
+    };
+    this.queuePendingNavigation();
+  }
+
+  private queuePendingNavigation() {
+    const request = this.pendingNavigation;
+    if (!request || request.queued || this.disposed) return;
+    request.queued = true;
     this.operationQueue = this.operationQueue
       .then(async () => {
-        if (persist && url !== this.currentUrl) {
-          const saved = await this.workspace.updateBrowserPaneUrl(this.id, url);
-          if (!saved || this.disposed) {
-            if (!this.disposed) this.address.value = this.currentUrl;
+        if (this.disposed || request.revision !== this.navigationRevision) return;
+        if (request.persist && !this.catalogWritable) {
+          request.queued = false;
+          return;
+        }
+        if (request.persist && request.url !== this.persistedUrl) {
+          const saved = await this.workspace.updateBrowserPaneUrl(this.id, request.url);
+          if (saved) this.persistedUrl = request.url;
+          if (!saved) {
+            if (!this.disposed && request.revision === this.navigationRevision) {
+              if (this.pendingNavigation === request) this.pendingNavigation = null;
+              this.address.value = this.currentUrl;
+            }
             return;
           }
+          if (this.disposed || request.revision !== this.navigationRevision) return;
         }
-        this.currentUrl = url;
-        await this.replaceWebview(url);
+        if (this.disposed || request.revision !== this.navigationRevision) return;
+        this.currentUrl = request.url;
+        if (this.pendingNavigation === request) this.pendingNavigation = null;
+        await this.replaceWebview(request.url);
       })
       .catch((error) => {
+        if (this.pendingNavigation === request) this.pendingNavigation = null;
         if (!this.disposed) {
           this.setState(
             "error",
@@ -2970,14 +3481,81 @@ class BrowserPane {
       });
   }
 
+  private applyObservedUrl(
+    label: string,
+    rawUrl: string,
+    navigationRevision: number,
+  ): string | null {
+    const webview = this.webview;
+    if (
+      this.disposed ||
+      !webview ||
+      webview.label !== label ||
+      navigationRevision !== this.navigationRevision
+    ) {
+      return null;
+    }
+    let url: string;
+    try {
+      url = normalizeBrowserUrl(rawUrl);
+    } catch {
+      return null;
+    }
+
+    if (this.pendingNavigation?.revision === navigationRevision) return null;
+    this.currentUrl = url;
+    if (!this.addressDirty && document.activeElement !== this.address) {
+      this.address.value = url;
+    }
+    return url;
+  }
+
+  private async persistObservedUrl(
+    label: string,
+    url: string,
+    navigationRevision: number,
+  ): Promise<boolean> {
+    const webview = this.webview;
+    if (
+      this.disposed ||
+      !webview ||
+      webview.label !== label ||
+      navigationRevision !== this.navigationRevision ||
+      this.currentUrl !== url
+    ) {
+      return false;
+    }
+
+    if (url === this.persistedUrl) return true;
+    if (!this.catalogWritable) return false;
+
+    const saved = await this.workspace.updateBrowserPaneUrl(this.id, url);
+    if (saved) this.persistedUrl = url;
+    if (
+      !saved ||
+      this.disposed ||
+      this.webview !== webview ||
+      navigationRevision !== this.navigationRevision
+    ) {
+      return false;
+    }
+    return true;
+  }
+
   private async replaceWebview(url: string) {
     const generation = ++this.generation;
+    this.urlSyncFallbackEnabled = false;
+    this.clearUrlSyncFallbackTimer();
     const previous = this.webview;
     this.webview = null;
     this.setState("starting", tr("Loading page", "페이지 불러오는 중"));
     if (previous) {
       await previous.hide().catch(() => undefined);
-      await previous.close().catch(() => undefined);
+      const closed = await previous.close().then(
+        () => true,
+        () => false,
+      );
+      if (closed) await this.workspace.unwatchBrowserWebviewUrl(previous.label);
     }
     if (this.disposed || generation !== this.generation) return;
     await nextAnimationFrame();
@@ -3010,6 +3588,15 @@ class BrowserPane {
       }
       this.setState("running", tr("Web browser", "웹 브라우저"));
       await this.syncBounds(generation, webview);
+      if (this.disposed || generation !== this.generation || this.webview !== webview) return;
+      try {
+        await this.workspace.watchBrowserWebviewUrl(webview.label);
+      } catch {
+        if (!this.disposed && generation === this.generation && this.webview === webview) {
+          this.urlSyncFallbackEnabled = true;
+          this.scheduleUrlSyncFallback(0);
+        }
+      }
     } catch (error) {
       if (this.webview === webview) this.webview = null;
       await webview.hide().catch(() => undefined);
@@ -3069,6 +3656,29 @@ class BrowserPane {
     await webview.show();
   }
 
+  private clearUrlSyncFallbackTimer() {
+    window.clearTimeout(this.urlSyncFallbackTimer);
+    this.urlSyncFallbackTimer = 0;
+  }
+
+  private scheduleUrlSyncFallback(delay = BROWSER_URL_FALLBACK_SYNC_INTERVAL_MS) {
+    this.clearUrlSyncFallbackTimer();
+    if (
+      this.disposed ||
+      !this.urlSyncFallbackEnabled ||
+      !this.layoutVisible ||
+      this.interactionSuspended ||
+      !this.webview
+    ) {
+      return;
+    }
+    this.urlSyncFallbackTimer = window.setTimeout(async () => {
+      this.urlSyncFallbackTimer = 0;
+      await this.captureCurrentUrl().catch(() => undefined);
+      this.scheduleUrlSyncFallback();
+    }, delay);
+  }
+
   private setState(state: PaneState, message: string, tone: StatusTone = "normal") {
     this.element.dataset.state = state;
     this.statusMessage = message;
@@ -3079,7 +3689,11 @@ class BrowserPane {
   }
 
   private beginTitleEdit() {
-    if (this.disposed || !this.catalogWritable) return;
+    if (this.disposed) return;
+    if (!this.titleEditor.hidden) {
+      this.titleEditor.focus();
+      return;
+    }
     this.titleEditor.value = this.title;
     this.titleElement.hidden = true;
     this.titleEditor.hidden = false;
@@ -3088,6 +3702,12 @@ class BrowserPane {
   }
 
   private commitTitleEdit() {
+    if (this.disposed) return;
+    if (!this.catalogWritable) {
+      this.titleEditCommitRequested = true;
+      return;
+    }
+    this.titleEditCommitRequested = false;
     const title = this.titleEditor.value.trim();
     this.titleEditor.hidden = true;
     this.titleElement.hidden = false;
@@ -3096,10 +3716,19 @@ class BrowserPane {
   }
 
   private cancelTitleEdit() {
+    this.titleEditCommitRequested = false;
     this.titleEditor.hidden = true;
     this.titleElement.hidden = false;
     this.titleEditor.value = this.title;
     this.focus();
+  }
+
+  private resumeDeferredTitleEdit() {
+    if (this.disposed || !this.catalogWritable || !this.titleEditCommitRequested) return;
+    queueMicrotask(() => {
+      if (this.disposed || !this.catalogWritable) return;
+      if (this.titleEditCommitRequested) this.commitTitleEdit();
+    });
   }
 }
 
@@ -3166,9 +3795,16 @@ class TerminalWorkspace {
   private readonly scheduler = new StartScheduler();
   private readonly restoredProjects = new Set<string>();
   private readonly projectNames = new Map<string, string>();
+  private readonly projectTerminalStates = new Map<
+    string,
+    Map<string, WorkspaceTerminal>
+  >();
   private readonly projectOrders = new Map<string, string[]>();
   private readonly projectRatios = new Map<string, Record<string, number[]>>();
   private readonly resumePlans = new Map<string, SafeResumePlan>();
+  private readonly inactiveProjectSinceUnixMs = new Map<string, number>();
+  private readonly sleepingPaneIds = new Set<string>();
+  private readonly autoSleepStopBarriers = new Map<string, Promise<void>>();
   private readonly activeRows = new Map<string, ActiveTerminalRow>();
   private readonly rowsHost = document.createElement("div");
   private readonly inactivePaneBin = document.createElement("div");
@@ -3189,9 +3825,16 @@ class TerminalWorkspace {
   private nativeFileDropTargetPaneId: string | null = null;
   private nativeFileDropCount = 0;
   private readonly nativeFileDropUnlisteners: Array<() => void> = [];
+  private readonly browserUrlUnlisteners: Array<() => void> = [];
+  private browserUrlRegistrationEpoch = 0;
+  private browserUrlListenerReady: Promise<boolean> = Promise.resolve(false);
+  private browserUrlUpdateTail: Promise<void> = Promise.resolve();
   private dragState: PaneDragState | null = null;
   private resizeState: PaneResizeState | null = null;
   private stopBarrier: Promise<void> = Promise.resolve();
+  private autoSleepIdleAgents = false;
+  private inactiveAgentSleepTimer = 0;
+  private inactiveAgentSleepSweepRunning = false;
   private readonly onAppPointerDown = (event: PointerEvent) => {
     const target = event.target;
     if (
@@ -3281,6 +3924,10 @@ class TerminalWorkspace {
       paneId: string,
       url: string,
     ) => Promise<boolean>,
+    private readonly onTerminalWebLinkOpenedCallback: (
+      projectId: string,
+      url: string,
+    ) => Promise<void>,
     private readonly onPaneReorderedCallback: (
       projectId: string,
       paneId: string,
@@ -3334,6 +3981,62 @@ class TerminalWorkspace {
     window.addEventListener("keydown", this.onLayoutKeyDown, true);
     window.addEventListener("blur", this.onLayoutWindowBlur);
     this.installNativeFileDrop();
+    this.browserUrlListenerReady = this.installBrowserUrlSync();
+  }
+
+  private async installBrowserUrlSync(): Promise<boolean> {
+    const registrationEpoch = ++this.browserUrlRegistrationEpoch;
+    try {
+      const unlisten = await getCurrentWebview().listen<BrowserWebviewUrlChanged>(
+        "browser-webview-url-changed",
+        ({ payload }) => {
+          if (
+            this.disposed ||
+            registrationEpoch !== this.browserUrlRegistrationEpoch ||
+            typeof payload?.label !== "string" ||
+            typeof payload?.url !== "string"
+          ) {
+            return;
+          }
+          for (const pane of this.browserPanes.values()) {
+            pane.observeWebviewUrl(payload.label, payload.url);
+          }
+        },
+      );
+      if (this.disposed || registrationEpoch !== this.browserUrlRegistrationEpoch) {
+        unlisten();
+        return false;
+      }
+      this.browserUrlUnlisteners.push(unlisten);
+      return true;
+    } catch (error) {
+      if (!this.disposed) {
+        this.setFooterStatus(
+          tr(
+            `Failed to initialize browser address sync: ${errorMessage(error)}`,
+            `브라우저 주소 동기화 초기화 실패: ${errorMessage(error)}`,
+          ),
+          "error",
+        );
+      }
+      return false;
+    }
+  }
+
+  async watchBrowserWebviewUrl(label: string) {
+    if (!(await this.browserUrlListenerReady)) {
+      throw new Error(
+        tr(
+          "Browser address synchronization is unavailable.",
+          "브라우저 주소 동기화를 사용할 수 없습니다.",
+        ),
+      );
+    }
+    await invoke("watch_browser_webview_url", { label });
+  }
+
+  async unwatchBrowserWebviewUrl(label: string) {
+    await invoke("unwatch_browser_webview_url", { label }).catch(() => undefined);
   }
 
   private installNativeFileDrop() {
@@ -3482,21 +4185,16 @@ class TerminalWorkspace {
     if (resetFileCount) this.nativeFileDropCount = 0;
   }
 
-  addPane(projectId: string, savedState: WorkspaceTerminal, focus = true) {
+  addPane(
+    projectId: string,
+    savedState: WorkspaceTerminal,
+    focus = true,
+    resumedFromAutoSleep = false,
+  ) {
     if (this.disposed) return null;
+    this.rememberProjectTerminalState(projectId, savedState);
     const existing = this.panes.get(paneRuntimeId(projectId, savedState.id));
     if (existing) return existing;
-    const projectPaneCount = this.projectPaneCount(projectId);
-    if (projectPaneCount >= MAX_PROJECT_PANES) {
-      this.setFooterStatus(
-        tr(
-          `You can open up to ${MAX_PROJECT_PANES} PowerShell panes per project.`,
-          `PowerShell은 프로젝트마다 최대 ${MAX_PROJECT_PANES}개까지 열 수 있습니다.`,
-        ),
-        "error",
-      );
-      return null;
-    }
     const plan = this.resumePlans.get(paneRuntimeId(projectId, savedState.id)) ?? {
       projectId,
       terminalId: savedState.id,
@@ -3507,7 +4205,14 @@ class TerminalWorkspace {
       blockingReasons: [],
       duplicateOwners: [],
     };
-    const pane = new TerminalPane(this, this.scheduler, projectId, savedState, plan);
+    const pane = new TerminalPane(
+      this,
+      this.scheduler,
+      projectId,
+      savedState,
+      plan,
+      resumedFromAutoSleep,
+    );
     pane.setCatalogWritable(this.catalogWritable);
     this.panes.set(pane.id, pane);
     const order = this.projectOrders.get(projectId) ?? [];
@@ -3519,7 +4224,10 @@ class TerminalWorkspace {
       this.activatePane(pane.id, false);
     }
     this.updateLayout();
-    void pane.startAfter(this.stopBarrier);
+    const autoSleepStop = this.autoSleepStopBarriers.get(pane.id) ?? Promise.resolve();
+    void pane.startAfter(
+      Promise.all([this.stopBarrier, autoSleepStop]).then(() => undefined),
+    );
     if (
       focus &&
       this.workspaceView === "terminals" &&
@@ -3535,25 +4243,11 @@ class TerminalWorkspace {
     savedState: WorkspaceBrowserPane,
     focus = true,
   ) {
-    if (
-      this.disposed ||
-      !this.catalogWritable ||
-      projectId !== this.activeProjectId
-    ) {
+    if (this.disposed || projectId !== this.activeProjectId) {
       return null;
     }
     const existing = this.browserPanes.get(browserPaneRuntimeId(projectId, savedState.id));
     if (existing) return existing;
-    if (this.projectPaneCount(projectId) >= MAX_PROJECT_PANES) {
-      this.setFooterStatus(
-        tr(
-          `You can open up to ${MAX_PROJECT_PANES} terminal and browser panes per project.`,
-          `터미널과 브라우저는 프로젝트마다 최대 ${MAX_PROJECT_PANES}개까지 열 수 있습니다.`,
-        ),
-        "error",
-      );
-      return null;
-    }
     const pane = new BrowserPane(this, projectId, savedState, ++this.browserSequence);
     pane.setCatalogWritable(this.catalogWritable);
     this.applyBrowserSuspension(pane);
@@ -3588,15 +4282,14 @@ class TerminalWorkspace {
     const incoming = targetRemainsRestored
       ? 0
       : project.terminals.length + projectBrowserPanes(project).length;
-    return evaluateWorkspaceRestoreCapacity(current, incoming, MAX_PROJECT_PANES);
+    return evaluateWorkspaceRestoreCapacity(current, incoming);
   }
 
   canAddPane(projectId: string) {
     return (
       !this.disposed &&
       this.catalogWritable &&
-      projectId === this.activeProjectId &&
-      this.projectPaneCount(projectId) < MAX_PROJECT_PANES
+      projectId === this.activeProjectId
     );
   }
 
@@ -3606,8 +4299,71 @@ class TerminalWorkspace {
       : 0;
   }
 
+  setAutoSleepIdleAgents(enabled: boolean) {
+    if (this.disposed || this.autoSleepIdleAgents === enabled) return;
+    this.autoSleepIdleAgents = enabled;
+    window.clearTimeout(this.inactiveAgentSleepTimer);
+    this.inactiveAgentSleepTimer = 0;
+    this.inactiveProjectSinceUnixMs.clear();
+    if (!enabled) {
+      // Turning the optimization off restores the previous always-running
+      // behavior immediately. Browser panes retain their DOM and last durable
+      // URL while asleep, so waking them does not alter the saved layout.
+      for (const pane of this.browserPanes.values()) void pane.wake();
+      // Each CLI pane still starts behind the stop barrier, so a just-hibernated
+      // conversation cannot overlap with its replacement.
+      let blocked = 0;
+      for (const [projectId, terminals] of this.projectTerminalStates) {
+        if (!this.restoredProjects.has(projectId)) continue;
+        for (const terminal of terminals.values()) {
+          const paneId = paneRuntimeId(projectId, terminal.id);
+          const plan = this.resumePlans.get(paneId);
+          if (
+            !this.sleepingPaneIds.has(paneId) ||
+            plan?.action !== "resume" ||
+            plan.provider === null ||
+            plan.conversationId === null
+          ) {
+            if (this.sleepingPaneIds.has(paneId)) blocked += 1;
+            continue;
+          }
+          if (!this.sleepingPaneIds.delete(paneId)) continue;
+          if (!this.addPane(projectId, terminal, false, true)) {
+            this.sleepingPaneIds.add(paneId);
+          }
+        }
+      }
+      if (blocked > 0) {
+        this.setFooterStatus(
+          tr(
+            `${formatAppNumber(blocked)} sleeping CLI sessions could not be resumed safely. Open their projects to review them.`,
+            `절전 중인 CLI ${formatAppNumber(blocked)}개를 안전하게 재개할 수 없습니다. 해당 프로젝트를 열어 확인해 주세요.`,
+          ),
+          "error",
+        );
+      }
+      return;
+    }
+    const now = Date.now();
+    for (const projectId of this.restoredProjects) {
+      if (projectId !== this.activeProjectId) {
+        this.inactiveProjectSinceUnixMs.set(projectId, now);
+      }
+    }
+    this.scheduleInactiveAgentSleepSweep();
+  }
+
   syncProject(project: WorkspaceProject) {
     this.projectNames.set(project.id, project.name);
+    this.projectTerminalStates.set(
+      project.id,
+      new Map(
+        project.terminals.map((terminal) => [
+          terminal.id,
+          structuredClone(terminal),
+        ]),
+      ),
+    );
     const savedBrowsers = projectBrowserPanes(project);
     const orderedTerminals = project.terminals.map((terminal) =>
       paneRuntimeId(project.id, terminal.id),
@@ -3637,6 +4393,12 @@ class TerminalWorkspace {
         ]),
       ),
     );
+    const terminalRuntimePrefix = `${project.id.length}:${project.id}`;
+    for (const paneId of [...this.sleepingPaneIds]) {
+      if (paneId.startsWith(terminalRuntimePrefix) && !terminalIds.has(paneId)) {
+        this.sleepingPaneIds.delete(paneId);
+      }
+    }
     if (this.restoredProjects.has(project.id)) {
       for (const terminal of project.terminals) {
         const existing = this.panes.get(paneRuntimeId(project.id, terminal.id));
@@ -3644,7 +4406,9 @@ class TerminalWorkspace {
           existing.setTitle(terminal.name);
           existing.setCompletionPending(terminal.completionPending);
         }
-        else this.addPane(project.id, terminal, false);
+        else if (!this.sleepingPaneIds.has(paneRuntimeId(project.id, terminal.id))) {
+          this.addPane(project.id, terminal, false);
+        }
       }
       for (const browser of savedBrowsers) {
         const existing = this.browserPanes.get(browserPaneRuntimeId(project.id, browser.id));
@@ -3674,6 +4438,15 @@ class TerminalWorkspace {
   showProject(project: WorkspaceProject) {
     if (this.disposed) return false;
     this.projectNames.set(project.id, project.name);
+    this.projectTerminalStates.set(
+      project.id,
+      new Map(
+        project.terminals.map((terminal) => [
+          terminal.id,
+          structuredClone(terminal),
+        ]),
+      ),
+    );
     this.cancelLayoutInteraction();
     const capacity = this.restoreCapacity(project);
     if (!capacity.allowed) {
@@ -3688,9 +4461,17 @@ class TerminalWorkspace {
       );
       return false;
     }
-    const projectChanged = this.activeProjectId !== project.id;
+    const previousActiveProjectId = this.activeProjectId;
+    const projectChanged = previousActiveProjectId !== project.id;
     if (projectChanged) this.maximizedPaneId = null;
+    if (this.autoSleepIdleAgents && projectChanged && previousActiveProjectId) {
+      this.inactiveProjectSinceUnixMs.set(previousActiveProjectId, Date.now());
+    }
     this.activeProjectId = project.id;
+    this.inactiveProjectSinceUnixMs.delete(project.id);
+    for (const pane of this.browserPanes.values()) {
+      if (pane.projectId === project.id) void pane.wake();
+    }
     for (const pane of this.allPanes()) {
       pane.element.hidden = pane.projectId !== project.id;
       pane.setActive(false);
@@ -3728,6 +4509,12 @@ class TerminalWorkspace {
       this.restoredProjects.add(project.id);
     }
 
+    for (const terminal of project.terminals) {
+      const paneId = paneRuntimeId(project.id, terminal.id);
+      if (!this.sleepingPaneIds.delete(paneId)) continue;
+      this.addPane(project.id, terminal, false, true);
+    }
+
     const visible = this.visiblePanes();
     const prior = this.activePaneId ? this.layoutPane(this.activePaneId) : null;
     this.activePaneId =
@@ -3737,12 +4524,16 @@ class TerminalWorkspace {
     this.app.dataset.workspaceView = "terminals";
     this.updateLayout();
     this.renderActiveStatus();
+    this.scheduleInactiveAgentSleepSweep();
     return true;
   }
 
   showEmptyView() {
     if (this.disposed) return;
     this.cancelLayoutInteraction();
+    if (this.autoSleepIdleAgents && this.activeProjectId) {
+      this.inactiveProjectSinceUnixMs.set(this.activeProjectId, Date.now());
+    }
     this.activeProjectId = null;
     this.activePaneId = null;
     this.maximizedPaneId = null;
@@ -3754,6 +4545,7 @@ class TerminalWorkspace {
     this.app.dataset.workspaceView = "empty";
     this.updateLayout();
     this.setFooterStatus(tr("Select a project on the left.", "왼쪽에서 프로젝트를 선택하세요."));
+    this.scheduleInactiveAgentSleepSweep();
   }
 
   setCatalogWritable(writable: boolean) {
@@ -3804,7 +4596,16 @@ class TerminalWorkspace {
       pane.element.remove();
     }
     this.restoredProjects.delete(projectId);
+    this.inactiveProjectSinceUnixMs.delete(projectId);
+    const terminalRuntimePrefix = `${projectId.length}:${projectId}`;
+    const pendingAutoSleepStops = [...this.autoSleepStopBarriers]
+      .filter(([paneId]) => paneId.startsWith(terminalRuntimePrefix))
+      .map(([, barrier]) => barrier);
+    for (const paneId of [...this.sleepingPaneIds]) {
+      if (paneId.startsWith(terminalRuntimePrefix)) this.sleepingPaneIds.delete(paneId);
+    }
     this.projectNames.delete(projectId);
+    this.projectTerminalStates.delete(projectId);
     this.projectOrders.delete(projectId);
     this.projectRatios.delete(projectId);
     if ([...targets, ...browserTargets].some((pane) => pane.id === this.maximizedPaneId)) {
@@ -3816,9 +4617,10 @@ class TerminalWorkspace {
     } else if ([...targets, ...browserTargets].some((pane) => pane.id === this.activePaneId)) {
       this.activePaneId = null;
     }
-    const stops = Promise.all([...targets, ...browserTargets].map((pane) => pane.dispose())).then(
-      () => undefined,
-    );
+    const stops = Promise.all([
+      ...[...targets, ...browserTargets].map((pane) => pane.dispose()),
+      ...pendingAutoSleepStops,
+    ]).then(() => undefined);
     const barrier = this.appendStopBarrier(stops);
     this.updateLayout();
     this.renderActiveStatus();
@@ -3828,7 +4630,12 @@ class TerminalWorkspace {
   async unloadAllProjects() {
     if (this.disposed) return;
     this.cancelLayoutInteraction();
-    const projectIds = [...new Set(this.allPanes().map((pane) => pane.projectId))];
+    const projectIds = [
+      ...new Set([
+        ...this.restoredProjects,
+        ...this.allPanes().map((pane) => pane.projectId),
+      ]),
+    ];
     for (const projectId of projectIds) await this.unloadProject(projectId);
   }
 
@@ -3927,9 +4734,27 @@ class TerminalWorkspace {
     }
   }
 
+  async openTerminalWebLink(projectId: string, url: string): Promise<void> {
+    if (
+      this.disposed ||
+      !this.catalogWritable ||
+      projectId !== this.activeProjectId
+    ) {
+      return;
+    }
+    try {
+      await this.onTerminalWebLinkOpenedCallback(projectId, url);
+    } catch {
+      this.setFooterStatus(
+        tr("The selected link could not be opened.", "선택한 링크를 열지 못했습니다."),
+        "error",
+      );
+    }
+  }
+
   togglePaneMaximize(paneId: string) {
     if (this.disposed || !this.catalogWritable) return;
-    const pane = this.panes.get(paneId);
+    const pane = this.layoutPane(paneId);
     if (!pane || pane.projectId !== this.activeProjectId) return;
     this.cancelLayoutInteraction();
     this.maximizedPaneId = this.maximizedPaneId === paneId ? null : paneId;
@@ -3978,13 +4803,21 @@ class TerminalWorkspace {
 
   updateBrowserPaneUrl(paneId: string, url: string): Promise<boolean> {
     if (!this.catalogWritable) return Promise.resolve(false);
-    const pane = this.browserPanes.get(paneId);
-    if (!pane) return Promise.resolve(false);
-    return this.onBrowserPaneUrlChangedCallback(
-      pane.projectId,
-      pane.persistentId,
-      url,
+    const update = this.browserUrlUpdateTail.then(async () => {
+      if (this.disposed || !this.catalogWritable) return false;
+      const pane = this.browserPanes.get(paneId);
+      if (!pane) return false;
+      return this.onBrowserPaneUrlChangedCallback(
+        pane.projectId,
+        pane.persistentId,
+        url,
+      );
+    });
+    this.browserUrlUpdateTail = update.then(
+      () => undefined,
+      () => undefined,
     );
+    return update;
   }
 
   claimSession(sessionId: string, paneId: string) {
@@ -4085,6 +4918,8 @@ class TerminalWorkspace {
     provider: AgentProvider,
     conversationId: string,
     working: boolean,
+    turnId: string | null,
+    observedAtUnixMs: number,
   ) {
     const pane = this.panes.get(paneRuntimeId(projectId, terminalId));
     if (
@@ -4093,7 +4928,9 @@ class TerminalWorkspace {
     ) {
       return false;
     }
+    pane.setAgentTurnWorking(working, turnId, observedAtUnixMs);
     this.onTerminalAgentWorkingChangedCallback(projectId, terminalId, working);
+    if (!working) this.scheduleInactiveAgentSleepSweep();
     return true;
   }
 
@@ -4239,11 +5076,6 @@ class TerminalWorkspace {
       layoutFrozen: false,
       frame: 0,
     };
-    try {
-      captureTarget.setPointerCapture(event.pointerId);
-    } catch {
-      // Window-level pointer listeners remain active if capture is unavailable.
-    }
   }
 
   beginPaneResize(event: PointerEvent, paneId: string, captureTarget: HTMLElement) {
@@ -4335,6 +5167,11 @@ class TerminalWorkspace {
         return;
       }
       state.started = true;
+      try {
+        state.captureTarget.setPointerCapture(state.pointerId);
+      } catch {
+        // Window-level pointer listeners keep the drag alive if capture is unavailable.
+      }
       this.freezePaneDragLayout(state);
       this.layoutPane(state.paneId)?.setDragging(true);
       this.setBrowserSuspensionReason("layout-interaction", true);
@@ -4674,10 +5511,16 @@ class TerminalWorkspace {
     }
     this.disposed = true;
     this.catalogWritable = false;
+    window.clearTimeout(this.inactiveAgentSleepTimer);
+    this.inactiveAgentSleepTimer = 0;
+    this.inactiveProjectSinceUnixMs.clear();
+    this.sleepingPaneIds.clear();
     this.cancelLayoutInteraction();
     this.nativeFileDropRegistrationEpoch += 1;
+    this.browserUrlRegistrationEpoch += 1;
     this.clearNativeFileDropTarget();
     for (const unlisten of this.nativeFileDropUnlisteners.splice(0)) unlisten();
+    for (const unlisten of this.browserUrlUnlisteners.splice(0)) unlisten();
     this.app.removeEventListener("pointerdown", this.onAppPointerDown);
     window.removeEventListener("pointermove", this.onLayoutPointerMove, true);
     window.removeEventListener("pointerup", this.onLayoutPointerUp, true);
@@ -4687,15 +5530,23 @@ class TerminalWorkspace {
     const stops = Promise.all(
       this.allPanes().map((pane) => pane.dispose()),
     ).then(() => undefined);
+    const sleepingStops = Promise.all(
+      [...this.autoSleepStopBarriers.values()].map((barrier) =>
+        barrier.catch(() => undefined),
+      ),
+    ).then(() => undefined);
     this.panes.clear();
     this.browserPanes.clear();
     this.sessionOwners.clear();
     this.restoredProjects.clear();
     this.projectNames.clear();
+    this.projectTerminalStates.clear();
     this.projectOrders.clear();
     this.projectRatios.clear();
     this.activeRows.clear();
-    await this.appendStopBarrier(stops);
+    await this.appendStopBarrier(
+      Promise.all([stops, sleepingStops]).then(() => undefined),
+    );
   }
 
   private updateLayout() {
@@ -4707,7 +5558,7 @@ class TerminalWorkspace {
       this.maximizedPaneId = null;
       maximized = null;
     }
-    for (const pane of this.panes.values()) {
+    for (const pane of this.allPanes()) {
       pane.setMaximized(pane.id === maximized?.id);
     }
     const visible = maximized ? [maximized] : allVisible;
@@ -4773,11 +5624,9 @@ class TerminalWorkspace {
   }
 
   private updateControls() {
-    const visible = this.visiblePanes();
     this.addButton.disabled =
       !this.catalogWritable ||
-      this.activeProjectId === null ||
-      visible.length >= MAX_PROJECT_PANES;
+      this.activeProjectId === null;
     for (const row of this.activeRows.values()) {
       row.paneIds.forEach((paneId, index) => {
         this.layoutPane(paneId)
@@ -4885,10 +5734,143 @@ class TerminalWorkspace {
     pane.setInteractionSuspended(globallySuspended || overlapsProviderUsage);
   }
 
+  private scheduleInactiveAgentSleepSweep() {
+    if (
+      this.disposed ||
+      !this.autoSleepIdleAgents ||
+      this.inactiveAgentSleepSweepRunning ||
+      this.inactiveAgentSleepTimer !== 0
+    ) {
+      return;
+    }
+    this.inactiveAgentSleepTimer = window.setTimeout(() => {
+      this.inactiveAgentSleepTimer = 0;
+      void this.sweepInactiveAgentPanes();
+    }, INACTIVE_AGENT_SLEEP_SWEEP_MS);
+  }
+
+  private async sweepInactiveAgentPanes() {
+    if (
+      this.disposed ||
+      !this.autoSleepIdleAgents ||
+      this.inactiveAgentSleepSweepRunning
+    ) {
+      return;
+    }
+    this.inactiveAgentSleepSweepRunning = true;
+    try {
+      for (const pane of [...this.panes.values()]) {
+        if (this.disposed || !this.autoSleepIdleAgents) break;
+        const inactiveSince = this.inactiveProjectSinceUnixMs.get(pane.projectId) ?? null;
+        const plan = this.resumePlans.get(pane.id);
+        const candidate = pane.inactiveAgentSleepCandidate(
+          plan,
+          this.autoSleepIdleAgents,
+          pane.projectId === this.activeProjectId,
+          inactiveSince,
+          Date.now(),
+        );
+        if (!candidate) continue;
+
+        const detected = await invoke<AgentProvider | null>("detect_terminal_agent", {
+          sessionId: candidate.sessionId,
+        }).catch(() => null);
+        if (detected !== candidate.provider) continue;
+        if (
+          this.disposed ||
+          !this.autoSleepIdleAgents ||
+          this.activeProjectId === pane.projectId ||
+          this.panes.get(pane.id) !== pane
+        ) {
+          continue;
+        }
+        const verified = pane.inactiveAgentSleepCandidate(
+          this.resumePlans.get(pane.id),
+          true,
+          false,
+          this.inactiveProjectSinceUnixMs.get(pane.projectId) ?? null,
+          Date.now(),
+        );
+        if (
+          !verified ||
+          verified.sessionId !== candidate.sessionId ||
+          verified.provider !== candidate.provider ||
+          verified.conversationId !== candidate.conversationId
+        ) {
+          continue;
+        }
+        this.hibernateInactiveAgentPane(pane);
+      }
+
+      for (const pane of [...this.browserPanes.values()]) {
+        if (this.disposed || !this.autoSleepIdleAgents) break;
+        const deadline = inactiveBrowserSleepDeadline({
+          enabled: this.autoSleepIdleAgents,
+          projectActive: pane.projectId === this.activeProjectId,
+          paneRunning: pane.isRunningForAutoSleep(),
+          projectInactiveSinceUnixMs:
+            this.inactiveProjectSinceUnixMs.get(pane.projectId) ?? null,
+        });
+        if (deadline === null || deadline > Date.now()) continue;
+        if (
+          this.disposed ||
+          !this.autoSleepIdleAgents ||
+          this.activeProjectId === pane.projectId ||
+          this.browserPanes.get(pane.id) !== pane
+        ) {
+          continue;
+        }
+        await pane.hibernate();
+      }
+    } finally {
+      this.inactiveAgentSleepSweepRunning = false;
+      this.scheduleInactiveAgentSleepSweep();
+    }
+  }
+
+  private hibernateInactiveAgentPane(pane: TerminalPane) {
+    if (
+      this.disposed ||
+      !this.autoSleepIdleAgents ||
+      pane.projectId === this.activeProjectId ||
+      this.panes.get(pane.id) !== pane ||
+      !this.projectTerminalStates.get(pane.projectId)?.has(pane.terminalId)
+    ) {
+      return;
+    }
+    this.panes.delete(pane.id);
+    this.sleepingPaneIds.add(pane.id);
+    if (this.activePaneId === pane.id) this.activePaneId = null;
+    if (this.maximizedPaneId === pane.id) this.maximizedPaneId = null;
+    pane.element.remove();
+    const stop = pane.disposeForAutoSleep();
+    let barrier: Promise<void>;
+    barrier = stop.then(() => {
+      if (this.autoSleepStopBarriers.get(pane.id) === barrier) {
+        this.autoSleepStopBarriers.delete(pane.id);
+      }
+    });
+    this.autoSleepStopBarriers.set(pane.id, barrier);
+    void barrier.catch((error) => {
+      console.warn("Automatic CLI sleep did not finish cleanly", error);
+    });
+    this.updateLayout();
+    this.renderActiveStatus();
+  }
+
   private appendStopBarrier(stop: Promise<void>) {
     const barrier = Promise.all([this.stopBarrier, stop]).then(() => undefined);
     this.stopBarrier = barrier.catch(() => undefined);
     return barrier;
+  }
+
+  private rememberProjectTerminalState(
+    projectId: string,
+    terminal: WorkspaceTerminal,
+  ) {
+    const terminals = this.projectTerminalStates.get(projectId) ?? new Map();
+    terminals.set(terminal.id, structuredClone(terminal));
+    this.projectTerminalStates.set(projectId, terminals);
   }
 }
 
@@ -5956,7 +6938,7 @@ class PhoneNotificationController {
   private busy = false;
   private disposed = false;
   private settingsLoadError: string | null = null;
-  private activeSettingsTab: "general" | "notifications" = "general";
+  private activeSettingsTab: "general" | "optimization" | "notifications" = "general";
   private readonly saveButton: HTMLButtonElement;
 
   constructor(
@@ -5964,10 +6946,13 @@ class PhoneNotificationController {
     private readonly dialog: HTMLDialogElement,
     private readonly form: HTMLFormElement,
     private readonly generalTab: HTMLButtonElement,
+    private readonly optimizationTab: HTMLButtonElement,
     private readonly notificationsTab: HTMLButtonElement,
     private readonly generalPanel: HTMLElement,
+    private readonly optimizationPanel: HTMLElement,
     private readonly notificationsPanel: HTMLElement,
     private readonly languageSelect: HTMLSelectElement,
+    private readonly autoSleepIdleAgentsInput: HTMLInputElement,
     private readonly enabledInput: HTMLInputElement,
     private readonly webhookInput: HTMLInputElement,
     private readonly webhookState: HTMLElement,
@@ -5978,6 +6963,7 @@ class PhoneNotificationController {
     private readonly closeButton: HTMLButtonElement,
     private readonly status: HTMLElement,
     private readonly setModalOpen: (open: boolean) => void,
+    private readonly setAutoSleepIdleAgentsEnabled: (enabled: boolean) => void,
   ) {
     const saveButton = this.form.querySelector<HTMLButtonElement>(".dialog-submit");
     if (!saveButton) throw new Error("Missing settings save button");
@@ -5988,15 +6974,23 @@ class PhoneNotificationController {
     this.openButton.addEventListener("click", () => this.open());
     this.closeButton.addEventListener("click", () => this.dialog.close());
     this.generalTab.addEventListener("click", () => this.setActiveSettingsTab("general", true));
+    this.optimizationTab.addEventListener("click", () =>
+      this.setActiveSettingsTab("optimization", true),
+    );
     this.notificationsTab.addEventListener("click", () =>
       this.setActiveSettingsTab("notifications", true),
     );
-    for (const tab of [this.generalTab, this.notificationsTab]) {
+    for (const tab of [this.generalTab, this.optimizationTab, this.notificationsTab]) {
       tab.addEventListener("keydown", (event) => this.onSettingsTabKeyDown(event));
     }
     this.languageSelect.addEventListener("change", () => {
       const language = this.languageSelect.value;
       if (language === "en" || language === "ko") setAppLanguage(language);
+    });
+    this.autoSleepIdleAgentsInput.addEventListener("change", () => {
+      const enabled = this.autoSleepIdleAgentsInput.checked;
+      setAutoSleepIdleAgents(enabled);
+      this.setAutoSleepIdleAgentsEnabled(enabled);
     });
     this.removeButton.addEventListener("click", () => void this.removeWebhook());
     this.testButton.addEventListener("click", () => void this.test());
@@ -6006,6 +7000,7 @@ class PhoneNotificationController {
     });
     this.dialog.addEventListener("close", () => this.setModalOpen(false));
     this.languageSelect.value = getAppLanguage();
+    this.autoSleepIdleAgentsInput.checked = getAutoSleepIdleAgents();
     this.setActiveSettingsTab("general", false);
     this.renderButton();
   }
@@ -6017,6 +7012,7 @@ class PhoneNotificationController {
 
   refreshLocalizedUi() {
     this.languageSelect.value = getAppLanguage();
+    this.autoSleepIdleAgentsInput.checked = getAutoSleepIdleAgents();
     this.renderButton();
     this.renderWebhookState();
   }
@@ -6122,6 +7118,7 @@ class PhoneNotificationController {
     const settings = this.settings;
     if (this.dialog.open) return;
     this.languageSelect.value = getAppLanguage();
+    this.autoSleepIdleAgentsInput.checked = getAutoSleepIdleAgents();
     if (settings) {
       this.enabledInput.checked = settings.enabled;
       this.successInput.checked = settings.notifyOnSuccess;
@@ -6149,24 +7146,42 @@ class PhoneNotificationController {
     this.generalTab.focus();
   }
 
-  private setActiveSettingsTab(tab: "general" | "notifications", focus: boolean) {
+  private setActiveSettingsTab(
+    tab: "general" | "optimization" | "notifications",
+    focus: boolean,
+  ) {
     this.activeSettingsTab = tab;
-    const generalActive = tab === "general";
-    this.generalTab.setAttribute("aria-selected", String(generalActive));
-    this.generalTab.tabIndex = generalActive ? 0 : -1;
-    this.notificationsTab.setAttribute("aria-selected", String(!generalActive));
-    this.notificationsTab.tabIndex = generalActive ? -1 : 0;
-    this.generalPanel.hidden = !generalActive;
-    this.notificationsPanel.hidden = generalActive;
-    this.testButton.hidden = generalActive;
-    this.saveButton.hidden = generalActive;
-    if (focus) (generalActive ? this.generalTab : this.notificationsTab).focus();
+    const entries = [
+      ["general", this.generalTab, this.generalPanel],
+      ["optimization", this.optimizationTab, this.optimizationPanel],
+      ["notifications", this.notificationsTab, this.notificationsPanel],
+    ] as const;
+    for (const [name, tabElement, panel] of entries) {
+      const active = name === tab;
+      tabElement.setAttribute("aria-selected", String(active));
+      tabElement.tabIndex = active ? 0 : -1;
+      panel.hidden = !active;
+    }
+    const notificationsActive = tab === "notifications";
+    this.testButton.hidden = !notificationsActive;
+    this.saveButton.hidden = !notificationsActive;
+    if (focus) entries.find(([name]) => name === tab)?.[1].focus();
   }
 
   private onSettingsTabKeyDown(event: KeyboardEvent) {
-    if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+    const tabs = ["general", "optimization", "notifications"] as const;
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
     event.preventDefault();
-    const next = this.activeSettingsTab === "general" ? "notifications" : "general";
+    const currentIndex = tabs.indexOf(this.activeSettingsTab);
+    const next =
+      event.key === "Home"
+        ? tabs[0]
+        : event.key === "End"
+          ? tabs[tabs.length - 1]
+          : tabs[
+              (currentIndex + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) %
+                tabs.length
+            ];
     this.setActiveSettingsTab(next, true);
   }
 
@@ -6583,6 +7598,8 @@ class AgentEventController {
       provider,
       conversationId,
       event === "turnStarted",
+      turnId,
+      observedAtUnixMs,
     );
     if (!accepted) {
       // A resume/discovery watcher can emit its initial lifecycle snapshot
@@ -6683,6 +7700,21 @@ class AgentEventController {
 
 async function stopBackendSession(sessionId: string) {
   await invoke("stop_terminal", { sessionId }).catch(() => undefined);
+}
+
+async function stopBackendSessionAndWait(sessionId: string) {
+  const retryDelaysMs = [0, 150, 600, 1_500, 4_000] as const;
+  let lastError: unknown = new Error("Terminal cleanup did not start");
+  for (const retryDelayMs of retryDelaysMs) {
+    if (retryDelayMs > 0) await delay(retryDelayMs);
+    try {
+      await invoke("stop_terminal_and_wait", { sessionId });
+      return;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError;
 }
 
 function isTerminalInputIntentKey(event: KeyboardEvent, hasSelection: boolean) {
@@ -7115,10 +8147,13 @@ const openSettingsButton = requireButton("open-settings");
 const settingsDialog = requireDialog("settings-dialog");
 const settingsForm = requireForm("settings-form");
 const settingsGeneralTab = requireButton("settings-general-tab");
+const settingsOptimizationTab = requireButton("settings-optimization-tab");
 const settingsNotificationsTab = requireButton("settings-notifications-tab");
 const settingsGeneralPanel = requireElement("settings-general-panel");
+const settingsOptimizationPanel = requireElement("settings-optimization-panel");
 const settingsNotificationsPanel = requireElement("settings-notifications-panel");
 const appLanguageSelect = requireSelect("app-language");
+const autoSleepIdleAgentsInput = requireInput("auto-sleep-idle-agents");
 const phoneNotificationEnabled = requireInput("phone-notification-enabled");
 const phoneNotificationWebhook = requireInput("phone-notification-webhook");
 const phoneNotificationWebhookState = requireElement("phone-notification-webhook-state");
@@ -7150,6 +8185,8 @@ const workspace = new TerminalWorkspace(
   (projectId, paneId, url) =>
     controller?.onBrowserPaneUrlChanged(projectId, paneId, url) ??
     Promise.resolve(false),
+  (projectId, url) =>
+    controller?.addBrowserPaneFromLink(projectId, url) ?? Promise.resolve(),
   (projectId, paneId, target) =>
     controller?.onPaneReordered(projectId, paneId, target),
   (projectId, layoutKey, ratios) =>
@@ -7169,15 +8206,19 @@ const workspace = new TerminalWorkspace(
     controller?.acknowledgeTerminalCompletion(projectId, terminalId) ??
     Promise.resolve(false),
 );
+workspace.setAutoSleepIdleAgents(getAutoSleepIdleAgents());
 phoneNotifications = new PhoneNotificationController(
   openSettingsButton,
   settingsDialog,
   settingsForm,
   settingsGeneralTab,
+  settingsOptimizationTab,
   settingsNotificationsTab,
   settingsGeneralPanel,
+  settingsOptimizationPanel,
   settingsNotificationsPanel,
   appLanguageSelect,
+  autoSleepIdleAgentsInput,
   phoneNotificationEnabled,
   phoneNotificationWebhook,
   phoneNotificationWebhookState,
@@ -7188,6 +8229,7 @@ phoneNotifications = new PhoneNotificationController(
   closeSettingsButton,
   phoneNotificationStatus,
   (open) => workspace.setModalOverlayOpen("settings", open),
+  (enabled) => workspace.setAutoSleepIdleAgents(enabled),
 );
 void phoneNotifications.start();
 const agentEvents = new AgentEventController(workspace, (message) =>

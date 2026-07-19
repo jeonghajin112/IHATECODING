@@ -351,6 +351,10 @@ test("interactive CLI launch recovers a missed xterm paint without polling norma
     /recoverInteractiveLaunchPaint\(\)[\s\S]*?isTerminalViewportPaintable\(\)[\s\S]*?fitTerminal\(\)[\s\S]*?queueCurrentSize\(\)[\s\S]*?core\.refresh\(0,[\s\S]*?true\)/,
   );
   assert.equal(JSON.parse(packageSource).dependencies["@xterm/xterm"], "6.1.0-beta.290");
+  assert.equal(
+    JSON.parse(packageSource).dependencies["@xterm/addon-web-links"],
+    "0.13.0-beta.290",
+  );
   assert.doesNotMatch(recovery, /terminal\.write\("\\u001b\[\?2026l"/);
   assert.match(main, /TERMINAL_LAUNCH_PROBE_TTL_MS = 12_000/);
   assert.match(main, /TERMINAL_SYNCHRONIZED_PAINT_LIMIT_MS = 1_600/);
@@ -364,11 +368,23 @@ test("pane maximize is a reversible workspace view and leaves sibling sessions a
     main,
     /setMaximized\(maximized: boolean\)[\s\S]*?dataset\.maximized = String\(maximized\)[\s\S]*?aria-pressed", String\(maximized\)/,
   );
+  const browserStart = main.indexOf("class BrowserPane");
+  const browserEnd = main.indexOf("type LayoutPane", browserStart);
+  assert.ok(browserStart >= 0 && browserEnd > browserStart);
+  const browserPane = main.slice(browserStart, browserEnd);
+  assert.match(browserPane, /private readonly maximizeButton: HTMLButtonElement/);
+  assert.match(browserPane, /actions\.append\(this\.maximizeButton, this\.closeButton\)/);
+  assert.match(browserPane, /this\.workspace\.togglePaneMaximize\(this\.id\)/);
+  assert.match(
+    browserPane,
+    /setMaximized\(maximized: boolean\)[\s\S]*?aria-pressed", String\(maximized\)/,
+  );
 
   const toggleStart = main.indexOf("togglePaneMaximize(paneId: string)");
   const toggleEnd = main.indexOf("async renamePane", toggleStart);
   assert.ok(toggleStart >= 0 && toggleEnd > toggleStart);
   const toggle = main.slice(toggleStart, toggleEnd);
+  assert.match(toggle, /const pane = this\.layoutPane\(paneId\)/);
   assert.match(toggle, /cancelLayoutInteraction\(\)/);
   assert.match(toggle, /this\.maximizedPaneId === paneId \? null : paneId/);
   assert.match(toggle, /this\.updateLayout\(\)/);
@@ -380,14 +396,19 @@ test("pane maximize is a reversible workspace view and leaves sibling sessions a
   const layout = main.slice(layoutStart, layoutEnd);
   assert.match(layout, /const allVisible = this\.visiblePanes\(\)/);
   assert.match(layout, /const visible = maximized \? \[maximized\] : allVisible/);
+  assert.match(
+    layout,
+    /for \(const pane of this\.allPanes\(\)\) \{\s*pane\.setMaximized/,
+  );
   assert.match(layout, /for \(const pane of this\.allPanes\(\)\)[\s\S]*?inactivePaneBin\.append\(pane\.element\)/);
   assert.doesNotMatch(layout, /dispose\(|panes\.delete/);
   assert.match(main, /if \(projectChanged\) this\.maximizedPaneId = null/);
   assert.match(main, /if \(this\.maximizedPaneId === paneId\) this\.maximizedPaneId = null/);
 
+  const addPaneStart = main.indexOf("  addPane(");
   const addPane = main.slice(
-    main.indexOf("addPane(projectId: string"),
-    main.indexOf("addBrowserPane(", main.indexOf("addPane(projectId: string")),
+    addPaneStart,
+    main.indexOf("addBrowserPane(", addPaneStart),
   );
   assert.match(
     addPane,
@@ -415,6 +436,24 @@ test("live pane dragging preserves stable thresholds, frozen preview, and outsid
     assert.match(main, new RegExp(`const ${currentName} = ${expected};`));
   }
   assert.match(main, /const PANE_DRAG_CANDIDATE_HOLD_MS = 80;/);
+
+  const beginDragStart = main.indexOf("  beginPaneDrag(");
+  const beginDragEnd = main.indexOf("  beginPaneResize(", beginDragStart);
+  const updateDragStart = main.indexOf("  private updatePaneDrag(");
+  const updateDragEnd = main.indexOf("  private renderPaneDragFrame(", updateDragStart);
+  assert.ok(beginDragStart >= 0 && beginDragEnd > beginDragStart);
+  assert.ok(updateDragStart >= 0 && updateDragEnd > updateDragStart);
+  const beginDrag = main.slice(beginDragStart, beginDragEnd);
+  const updateDrag = main.slice(updateDragStart, updateDragEnd);
+  assert.doesNotMatch(
+    beginDrag,
+    /setPointerCapture/,
+    "a click must remain targeted at the title so its dblclick rename can fire",
+  );
+  assert.match(
+    updateDrag,
+    /state\.started = true;[\s\S]*?state\.captureTarget\.setPointerCapture\(state\.pointerId\)/,
+  );
 
   assert.match(
     main,
@@ -651,7 +690,7 @@ test("usage, unread badges, and the single native clipboard snapshot are wired",
   assert.doesNotMatch(controller, /Rust 작업 공간 r\$\{status\.revision\}을 불러왔습니다/);
   assert.match(styles, /\.provider-usage\s*\{[\s\S]*?margin-left:\s*0/);
   assert.match(styles, /\.usage-meter\s*\{[\s\S]*?width:\s*48px;[\s\S]*?height:\s*4px/);
-  assert.match(styles, /\.provider-icon\s*\{[\s\S]*?width:\s*14px;[\s\S]*?height:\s*14px/);
+  assert.match(styles, /\.provider-icon\s*\{[^}]*?width:\s*13px;[^}]*?height:\s*13px/);
   assert.match(styles, /\.usage-limit \+ \.usage-limit\s*\{[\s\S]*?margin-left:\s*12px/);
   assert.match(
     styles,
@@ -1126,6 +1165,180 @@ test("new Codex and Grok conversations are discovered, saved, and resumable", as
   assert.match(backend, /read_grok_session_metadata/);
   assert.match(notifier, /agent-turn-complete/);
   assert.match(notifier, /IHATECODING_CODEX_NOTIFY_ROUTE/);
+});
+
+test("terminal web links open a persisted browser pane without hijacking selection", async () => {
+  const [main, controller, packageSource] = await Promise.all([
+    source("src/main.ts"),
+    source("src/phase4-controller.ts"),
+    source("package.json"),
+  ]);
+  assert.equal(
+    JSON.parse(packageSource).dependencies["@xterm/addon-web-links"],
+    "0.13.0-beta.290",
+  );
+  assert.match(main, /import \{ WebLinksAddon \} from "@xterm\/addon-web-links"/);
+  assert.match(
+    main,
+    /const openWebLink = \(event: MouseEvent, uri: string\)[\s\S]*?event\.button !== 0[\s\S]*?this\.terminal\.hasSelection\(\)[\s\S]*?parsed\.protocol !== "http:"[\s\S]*?parsed\.protocol !== "https:"[\s\S]*?this\.workspace\.openTerminalWebLink\(this\.projectId, uri\)/,
+  );
+  assert.match(
+    main,
+    /const linkActivationVersion = this\.webLinkActivationVersion[\s\S]*?this\.webLinkActivationVersion !== linkActivationVersion[\s\S]*?this\.moveCursorFromClick/,
+  );
+  assert.match(
+    main,
+    /linkHandler:\s*\{[\s\S]*?activate:\s*openWebLink[\s\S]*?allowNonHttpProtocols:\s*false/,
+  );
+  assert.match(main, /new WebLinksAddon\(openWebLink/);
+  assert.match(
+    main,
+    /openTerminalWebLink\(projectId: string, url: string\)[\s\S]*?projectId !== this\.activeProjectId[\s\S]*?onTerminalWebLinkOpenedCallback\(projectId, url\)/,
+  );
+
+  const linkStart = controller.indexOf("async addBrowserPaneFromLink(");
+  const linkEnd = controller.indexOf("private async persist", linkStart);
+  assert.ok(linkStart >= 0 && linkEnd > linkStart);
+  const linkPane = controller.slice(linkStart, linkEnd);
+  assert.match(linkPane, /state\.projects\.find\(\(item\) => item\.id === projectId\)/);
+  assert.match(linkPane, /createWorkspaceBrowserPane\(this\.idFactory\(\), "WEB", url\)/);
+  assert.match(
+    linkPane,
+    /appendProjectBrowserPane\(state, project\.id, browser\)[\s\S]*?await this\.persist\([\s\S]*?this\.runtime\.addBrowserPane\(project\.id, browser, true\)/,
+  );
+  assert.match(
+    main,
+    /controller\?\.addBrowserPaneFromLink\(projectId, url\) \?\? Promise\.resolve\(\)/,
+  );
+});
+
+test("opt-in idle agent sleep preserves the active project and resumes only durable conversations", async () => {
+  const [main, optimization, backend, pty, html] = await Promise.all([
+    source("src/main.ts"),
+    source("src/optimization-settings.ts"),
+    source("src-tauri/src/lib.rs"),
+    source("src-tauri/src/pty.rs"),
+    source("index.html"),
+  ]);
+  assert.match(optimization, /autoSleepIdleAgents:\s*false/);
+  assert.match(optimization, /agentTurnState !== "idle"/);
+  assert.match(html, /id="settings-optimization-tab"[\s\S]*id="auto-sleep-idle-agents"/);
+  assert.match(main, /pane\.projectId === this\.activeProjectId/);
+  assert.match(main, /plan\?\.action === "resume"/);
+  assert.match(main, /this\.agentInputAwaitingTurnStart = true[\s\S]*resolveInput\(input\)/);
+  assert.match(main, /shouldReleaseAgentInputProtection\([\s\S]*this\.agentInputAwaitingTurnStart = false/);
+  assert.match(main, /pane\.setAgentTurnWorking\(working, turnId, observedAtUnixMs\)/);
+  assert.match(main, /!this\.agentInputAwaitingTurnStart[\s\S]*inactiveAgentSleepDeadline/);
+  assert.match(main, /invoke<AgentProvider \| null>\("detect_terminal_agent"/);
+  assert.match(main, /sleepingPaneIds\.has\(paneRuntimeId\(project\.id, terminal\.id\)\)/);
+  assert.match(main, /sleepingPaneIds\.delete\(paneId\)[\s\S]*addPane\(project\.id, terminal, false, true\)/);
+  assert.match(main, /if \(!enabled\)[\s\S]*projectTerminalStates[\s\S]*sleepingPaneIds\.delete\(paneId\)[\s\S]*addPane\(projectId, terminal, false, true\)/);
+  assert.match(main, /resumedFromAutoSleep[\s\S]*this\.agentTurnState = "idle"/);
+  assert.match(main, /retryDelaysMs[\s\S]*invoke\("stop_terminal_and_wait"/);
+  assert.match(main, /autoSleepStopBarriers\.get\(pane\.id\)[\s\S]*pane\.startAfter/);
+  assert.doesNotMatch(main, /appendStopBarrier\(stop\)[\s\S]*Automatic CLI sleep/);
+  assert.match(main, /disposeForAutoSleep[\s\S]*stopBackendSessionAndWait/);
+  assert.match(backend, /async fn stop_terminal_and_wait/);
+  assert.match(pty, /pub\(crate\) fn stop_and_wait[\s\S]*while state\.sessions\.contains_key/);
+  assert.match(
+    pty,
+    /agent_runtime\.unbind\(&wait_id\);[\s\S]*remove_session\(&manager_state, &manager_state_changed, &wait_id\)/,
+  );
+
+  const browserStart = main.indexOf("class BrowserPane");
+  const browserEnd = main.indexOf("type LayoutPane", browserStart);
+  assert.ok(browserStart >= 0 && browserEnd > browserStart);
+  const browserPane = main.slice(browserStart, browserEnd);
+  assert.match(optimization, /function inactiveBrowserSleepDeadline\(/);
+  assert.match(
+    browserPane,
+    /hibernate\(\): Promise<void>[\s\S]*?this\.operationQueue[\s\S]*?this\.hibernateNow\(\)/,
+    "browser sleep must be serialized with navigation and URL persistence",
+  );
+  assert.match(
+    browserPane,
+    /private async hibernateNow\(\): Promise<void>[\s\S]*?captureCurrentUrlNow\(\)[\s\S]*?this\.currentUrl !== this\.persistedUrl[\s\S]*?this\.webview = null[\s\S]*?await webview\.close\(\)/,
+    "browser sleep must persist the latest address before closing only its native WebView",
+  );
+  const hibernateNowStart = browserPane.indexOf("private async hibernateNow()");
+  const hibernateNowEnd = browserPane.indexOf("private async wakeNow()", hibernateNowStart);
+  assert.ok(hibernateNowStart >= 0 && hibernateNowEnd > hibernateNowStart);
+  const hibernateNow = browserPane.slice(hibernateNowStart, hibernateNowEnd);
+  const boundsAwait = hibernateNow.indexOf("await this.boundsQueue");
+  const closeWebview = hibernateNow.indexOf("await webview.close()");
+  const finalCancellationCheck = hibernateNow.lastIndexOf("!this.desiredSleep", closeWebview);
+  const unwatchWebview = hibernateNow.indexOf("await this.workspace.unwatchBrowserWebviewUrl");
+  assert.ok(boundsAwait >= 0 && closeWebview > boundsAwait);
+  assert.ok(
+    finalCancellationCheck > boundsAwait && finalCancellationCheck < closeWebview,
+    "sleep cancellation must be rechecked after all hide/bounds awaits and immediately before close",
+  );
+  assert.ok(
+    unwatchWebview > closeWebview,
+    "the URL watcher registry must be forgotten only after the native WebView closes successfully",
+  );
+
+  const closeCatchStart = hibernateNow.indexOf("} catch (error) {", closeWebview);
+  const closeCatchEnd = hibernateNow.indexOf("throw error", closeCatchStart);
+  assert.ok(closeCatchStart > closeWebview && closeCatchEnd > closeCatchStart);
+  const closeCatch = hibernateNow.slice(closeCatchStart, closeCatchEnd);
+  assert.doesNotMatch(
+    closeCatch,
+    /if \([^)]*desiredSleep/,
+    "close failure rollback must not depend on whether a concurrent wake cleared desiredSleep",
+  );
+  assert.match(
+    closeCatch,
+    /this\.restoreHibernatingWebview\(webview, urlSyncFallbackWasEnabled\)/,
+  );
+  const restoreStart = hibernateNow.indexOf("private restoreHibernatingWebview(");
+  const restoreEnd = hibernateNow.length;
+  assert.ok(restoreStart >= 0 && restoreEnd > restoreStart);
+  const restoreHibernatingWebview = hibernateNow.slice(restoreStart, restoreEnd);
+  assert.doesNotMatch(restoreHibernatingWebview, /if \([^)]*desiredSleep/);
+  assert.match(restoreHibernatingWebview, /this\.webview = webview/);
+  assert.match(restoreHibernatingWebview, /this\.hibernated = false/);
+  assert.match(restoreHibernatingWebview, /this\.desiredSleep = false/);
+  assert.match(restoreHibernatingWebview, /delete this\.element\.dataset\.hibernated/);
+  assert.match(
+    browserPane,
+    /wake\(\): Promise<void>[\s\S]*?this\.operationQueue[\s\S]*?this\.wakeNow\(\)/,
+    "browser wake must be serialized behind any pending sleep operation",
+  );
+  assert.match(
+    browserPane,
+    /private async wakeNow\(\): Promise<void>[\s\S]*?this\.currentUrl = this\.persistedUrl[\s\S]*?replaceWebview\(this\.persistedUrl\)/,
+    "waking a browser pane must recreate it from its last persisted URL",
+  );
+
+  const sweepStart = main.indexOf("private async sweepInactiveAgentPanes");
+  const sweepEnd = main.indexOf("private hibernateInactiveAgentPane", sweepStart);
+  assert.ok(sweepStart >= 0 && sweepEnd > sweepStart);
+  const sweep = main.slice(sweepStart, sweepEnd);
+  assert.match(sweep, /for \(const pane of \[\.\.\.this\.browserPanes\.values\(\)\]\)/);
+  assert.match(sweep, /inactiveBrowserSleepDeadline\(/);
+  assert.match(sweep, /pane\.projectId === this\.activeProjectId/);
+  assert.match(sweep, /await pane\.hibernate\(\)/);
+
+  const showProjectStart = main.indexOf("showProject(project: WorkspaceProject)");
+  const showProjectEnd = main.indexOf("showEmptyView()", showProjectStart);
+  assert.ok(showProjectStart >= 0 && showProjectEnd > showProjectStart);
+  const showProject = main.slice(showProjectStart, showProjectEnd);
+  assert.match(
+    showProject,
+    /this\.activeProjectId = project\.id[\s\S]*?browserPanes[\s\S]*?pane\.projectId === project\.id[\s\S]*?pane\.wake\(\)/,
+    "returning to a project must wake its retained browser panes",
+  );
+
+  const toggleStart = main.indexOf("setAutoSleepIdleAgents(enabled: boolean)");
+  const toggleEnd = main.indexOf("syncProject(project: WorkspaceProject)", toggleStart);
+  assert.ok(toggleStart >= 0 && toggleEnd > toggleStart);
+  const toggle = main.slice(toggleStart, toggleEnd);
+  assert.match(
+    toggle,
+    /if \(!enabled\)[\s\S]*?browserPanes\.values\(\)[\s\S]*?pane\.wake\(\)/,
+    "turning session sleep off must immediately wake every retained browser pane",
+  );
 });
 
 test("application chrome stays monochrome except for completion alerts", async () => {

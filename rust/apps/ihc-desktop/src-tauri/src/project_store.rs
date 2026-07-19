@@ -672,11 +672,6 @@ fn validate_catalog(catalog: &ProjectCatalogV1) -> Result<(), String> {
             &project.folder_path,
             &format!("Projects[{project_index}].FolderPath"),
         )?;
-        if project.terminals.len() > 20 {
-            return Err(format!(
-                "Projects[{project_index}].Terminals exceeds the v1 limit of 20."
-            ));
-        }
         for ratios in project.pane_width_ratios.values() {
             if ratios.is_empty() {
                 return Err(format!(
@@ -1229,11 +1224,6 @@ mod tests {
         let missing: Value = serde_json::json!({ "Projects": [] });
         assert!(parse_catalog_bytes(&serde_json::to_vec(&missing).unwrap()).is_err());
 
-        let mut too_many: Value = serde_json::from_str(FIXTURE).unwrap();
-        let terminal = too_many["Projects"][0]["Terminals"][0].clone();
-        too_many["Projects"][0]["Terminals"] = Value::Array(vec![terminal; 21]);
-        assert!(parse_catalog_bytes(&serde_json::to_vec(&too_many).unwrap()).is_err());
-
         let mut invalid_ratio: Value = serde_json::from_str(FIXTURE).unwrap();
         invalid_ratio["Projects"][0]["PaneWidthRatios"]["2x1:row-0"] = serde_json::json!([0.0]);
         assert!(parse_catalog_bytes(&serde_json::to_vec(&invalid_ratio).unwrap()).is_err());
@@ -1246,6 +1236,22 @@ mod tests {
         let mut future_version: Value = serde_json::from_str(FIXTURE).unwrap();
         future_version["SchemaVersion"] = serde_json::json!(2);
         assert!(parse_catalog_bytes(&serde_json::to_vec(&future_version).unwrap()).is_err());
+    }
+
+    #[test]
+    fn accepts_more_than_twenty_distinct_terminals() {
+        let mut catalog = fixture();
+        let template = catalog.projects[0].terminals[0].clone();
+        for index in 1..21 {
+            let mut terminal = template.clone();
+            terminal.id = format!("terminal-{index}");
+            catalog.projects[0].terminals.push(terminal);
+        }
+
+        let bytes = serialize_catalog(&catalog).expect("catalog should accept 21 terminals");
+        let parsed = parse_catalog_bytes(&bytes).expect("catalog should preserve 21 terminals");
+        assert_eq!(parsed.projects[0].terminals.len(), 21);
+        assert_eq!(parsed.projects[0].terminals[20].id, "terminal-20");
     }
 
     #[test]

@@ -30,7 +30,6 @@ const LOCK_FILE_NAME: &str = "write.lock";
 const MAX_WORKSPACE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_PROJECTS: usize = 256;
 const MAX_TABS: usize = 128;
-const MAX_TERMINALS_PER_PROJECT: usize = 20;
 const MAX_ID_BYTES: usize = 256;
 const MAX_NAME_BYTES: usize = 4 * 1024;
 const MAX_PATH_BYTES: usize = 32 * 1024;
@@ -154,6 +153,8 @@ pub(crate) struct WorkspaceProjectV1 {
     pub(crate) id: String,
     pub(crate) name: String,
     pub(crate) folder_path: String,
+    #[serde(default)]
+    pub(crate) last_modified_at_utc: Option<String>,
     pub(crate) terminals: Vec<WorkspaceTerminalV1>,
     pub(crate) pane_width_ratios: BTreeMap<String, Vec<f64>>,
     #[serde(default)]
@@ -1319,10 +1320,12 @@ fn validate_state(state: &WorkspaceStateV1) -> StorageResult<()> {
             &format!("{prefix}/name"),
         )?;
         validate_windows_path(&project.folder_path, &format!("{prefix}/folderPath"))?;
-        if project.terminals.len() > MAX_TERMINALS_PER_PROJECT {
+        if let Some(last_modified_at) = &project.last_modified_at_utc
+            && !is_rfc3339(last_modified_at)
+        {
             return Err(StorageError::invalid(
-                "A project contains too many terminals.",
-                format!("{prefix}/terminals"),
+                "The project modification timestamp is invalid.",
+                format!("{prefix}/lastModifiedAtUtc"),
             ));
         }
         validate_extensions(
@@ -1375,17 +1378,11 @@ fn validate_state(state: &WorkspaceStateV1) -> StorageResult<()> {
                 &format!("{terminal_prefix}/legacyExtensions"),
             )?;
         }
-        let browser_pane_count = validate_project_browser_panes(
+        validate_project_browser_panes(
             &project.legacy_extensions,
             &terminal_ids,
             &format!("{prefix}/legacyExtensions/{PROJECT_BROWSER_PANES_EXTENSION}"),
         )?;
-        if project.terminals.len() + browser_pane_count > MAX_TERMINALS_PER_PROJECT {
-            return Err(StorageError::invalid(
-                "A project contains too many terminal and browser panes.",
-                format!("{prefix}/legacyExtensions/{PROJECT_BROWSER_PANES_EXTENSION}"),
-            ));
-        }
         for (key, ratios) in &project.pane_width_ratios {
             if key.len() > MAX_ID_BYTES || ratios.is_empty() || ratios.len() > 5 {
                 return Err(StorageError::invalid(
@@ -1640,9 +1637,9 @@ fn validate_project_browser_panes(
     extensions: &BTreeMap<String, Value>,
     terminal_ids: &HashSet<&str>,
     pointer: &str,
-) -> StorageResult<usize> {
+) -> StorageResult<()> {
     let Some(value) = extensions.get(PROJECT_BROWSER_PANES_EXTENSION) else {
-        return Ok(0);
+        return Ok(());
     };
     let Value::Array(panes) = value else {
         return Err(StorageError::invalid(
@@ -1650,13 +1647,6 @@ fn validate_project_browser_panes(
             pointer,
         ));
     };
-    if panes.len() > MAX_TERMINALS_PER_PROJECT {
-        return Err(StorageError::invalid(
-            "A project contains too many browser panes.",
-            pointer,
-        ));
-    }
-
     let mut browser_ids = HashSet::new();
     for (index, pane) in panes.iter().enumerate() {
         let pane_pointer = format!("{pointer}/{index}");
@@ -1692,7 +1682,7 @@ fn validate_project_browser_panes(
         }
         validate_browser_url(url, &format!("{pane_pointer}/url"))?;
     }
-    Ok(panes.len())
+    Ok(())
 }
 
 fn required_browser_pane_string<'a>(
@@ -2413,6 +2403,7 @@ mod tests {
                 id: project_id.clone(),
                 name: "Example".to_owned(),
                 folder_path: r"C:\Preview\Example".to_owned(),
+                last_modified_at_utc: Some("2026-07-18T09:30:00Z".to_owned()),
                 terminals: vec![WorkspaceTerminalV1 {
                     id: "terminal-1".to_owned(),
                     name: "MAIN".to_owned(),
@@ -2469,7 +2460,46 @@ mod tests {
             snapshot.state.projects[0].pane_width_ratios["2x1:row-0"],
             vec![0.5, 0.5]
         );
+        assert_eq!(
+            snapshot.state.projects[0].last_modified_at_utc.as_deref(),
+            Some("2026-07-18T09:30:00Z")
+        );
         assert!(snapshot.written_at_utc.as_deref().is_some_and(is_rfc3339));
+    }
+
+    #[test]
+    fn project_modification_timestamp_accepts_legacy_missing_and_null_values() {
+        let document = WorkspaceDocumentV1 {
+            schema_version: WORKSPACE_SCHEMA_VERSION,
+            revision: 1,
+            written_at_utc: "2026-07-18T10:00:00Z".to_owned(),
+            state: sample_state(),
+            import_provenance: None,
+        };
+        let mut missing = serde_json::to_value(&document).unwrap();
+        missing["projects"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("lastModifiedAtUtc");
+        let parsed = parse_document(&serde_json::to_vec(&missing).unwrap()).unwrap();
+        assert_eq!(parsed.state.projects[0].last_modified_at_utc, None);
+
+        let mut null = serde_json::to_value(&document).unwrap();
+        null["projects"][0]["lastModifiedAtUtc"] = Value::Null;
+        let parsed = parse_document(&serde_json::to_vec(&null).unwrap()).unwrap();
+        assert_eq!(parsed.state.projects[0].last_modified_at_utc, None);
+    }
+
+    #[test]
+    fn project_modification_timestamp_rejects_invalid_rfc3339() {
+        let mut state = sample_state();
+        state.projects[0].last_modified_at_utc = Some("2026-02-30T00:00:00Z".to_owned());
+        let error = normalize_and_validate_state(&mut state).unwrap_err();
+        assert_eq!(error.code, StorageErrorCode::InvalidState);
+        assert_eq!(
+            error.json_pointer.as_deref(),
+            Some("/projects/0/lastModifiedAtUtc")
+        );
     }
 
     #[test]
@@ -2691,11 +2721,17 @@ mod tests {
             );
         }
 
-        let mut overflow = sample_state();
-        overflow.projects[0].legacy_extensions.insert(
+        let mut many_panes = sample_state();
+        let terminal_template = many_panes.projects[0].terminals[0].clone();
+        for index in 2..=21 {
+            let mut terminal = terminal_template.clone();
+            terminal.id = format!("terminal-{index}");
+            many_panes.projects[0].terminals.push(terminal);
+        }
+        many_panes.projects[0].legacy_extensions.insert(
             PROJECT_BROWSER_PANES_EXTENSION.to_owned(),
             Value::Array(
-                (0..MAX_TERMINALS_PER_PROJECT)
+                (0..21)
                     .map(|index| {
                         serde_json::json!({
                             "id": format!("browser-{index}"),
@@ -2706,11 +2742,15 @@ mod tests {
                     .collect(),
             ),
         );
+        normalize_and_validate_state(&mut many_panes)
+            .expect("workspace storage must not impose a per-project pane count cap");
+        assert_eq!(many_panes.projects[0].terminals.len(), 21);
         assert_eq!(
-            normalize_and_validate_state(&mut overflow)
-                .unwrap_err()
-                .code,
-            StorageErrorCode::InvalidState
+            many_panes.projects[0].legacy_extensions[PROJECT_BROWSER_PANES_EXTENSION]
+                .as_array()
+                .unwrap()
+                .len(),
+            21
         );
     }
 

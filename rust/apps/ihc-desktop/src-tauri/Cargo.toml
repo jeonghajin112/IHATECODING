@@ -24,7 +24,9 @@ custom-protocol = ["tauri/custom-protocol"]
 # Tauri's child-WebView command is compiled as an error stub unless the
 # multiwebview API is enabled. BrowserPane relies on that command to embed a
 # browser beside terminal panes.
-tauri = { version = "2", features = ["image-png", "unstable"] }
+# Native WebView handles are version-coupled to Tauri's Wry dependencies.
+# Keep the minor release pinned when using `Webview::with_webview` below.
+tauri = { version = "~2.11.5", features = ["image-png", "unstable"] }
 tauri-plugin-dialog = "2"
 portable-pty = "0.9.0"
 base64 = "0.22"
@@ -38,6 +40,8 @@ uuid = { version = "1", features = ["v4"] }
 tempfile = "3"
 
 [target.'cfg(windows)'.dependencies]
+webview2-com = "~0.38.2"
+windows-core = "~0.61.2"
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Networking_WinHttp", "Win32_Security", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_DataExchange", "Win32_System_Diagnostics_Debug", "Win32_System_Diagnostics_ToolHelp", "Win32_System_JobObjects", "Win32_System_Memory", "Win32_System_Threading", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 
 [target.'cfg(unix)'.dependencies]
