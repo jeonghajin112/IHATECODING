@@ -161,11 +161,57 @@ export type WorkspaceUnreadSummary = {
 
 export type TerminalLaunchPaintDecision = "idle" | "waiting" | "recover";
 
+const TERMINAL_LAUNCH_ESCAPE_TAIL_LENGTH = 16;
+const TERMINAL_LAUNCH_CONTROL_PATTERN =
+  /(?:\x1b\[|\u009b)\?(?:47|1047|1049|2026)h/;
+
+export function scanTerminalLaunchControl(tail: string, data: string) {
+  const combined = tail.slice(-TERMINAL_LAUNCH_ESCAPE_TAIL_LENGTH) + data;
+  return {
+    detected: TERMINAL_LAUNCH_CONTROL_PATTERN.test(combined),
+    tail: combined.slice(-TERMINAL_LAUNCH_ESCAPE_TAIL_LENGTH),
+  };
+}
+
+export type TerminalDirectPaintState = {
+  documentVisible: boolean;
+  connected: boolean;
+  hidden: boolean;
+  paneActive: boolean;
+  focusInside: boolean;
+};
+
+export function shouldDirectPaintTerminalOutput(state: TerminalDirectPaintState) {
+  return (
+    state.documentVisible &&
+    state.connected &&
+    !state.hidden &&
+    (state.paneActive || state.focusInside)
+  );
+}
+
+export type TerminalDirectRefreshState = {
+  hasUnpaintedOutput: boolean;
+  firstBatchAfterIdle: boolean;
+  millisecondsSinceLastForcedRefresh: number;
+};
+
+export function shouldForceDirectTerminalRefresh(
+  state: TerminalDirectRefreshState,
+  minimumIntervalMs: number,
+) {
+  return (
+    state.hasUnpaintedOutput &&
+    (state.firstBatchAfterIdle ||
+      state.millisecondsSinceLastForcedRefresh >= minimumIntervalMs)
+  );
+}
+
 /**
- * Tracks only the two paint checkpoints that can make an interactive CLI look
- * as if it never started: the first output after Enter and the first switch to
- * the alternate buffer. Normal streaming output deliberately does not arm a
- * watchdog, so busy terminals do not pay a timer per batch.
+ * Tracks one bounded paint checkpoint at a time. Enter arms the first output;
+ * the raw-output scanner independently re-arms immediately before an alternate
+ * buffer control is parsed. Normal streaming output does not retain a launch
+ * watchdog after its first visible paint.
  */
 export class TerminalLaunchPaintWatchdog {
   private armedEpoch: number | null = null;
@@ -225,9 +271,7 @@ export class TerminalLaunchPaintWatchdog {
     ) {
       return false;
     }
-    this.expectedRenderVersion = 0;
-    this.synchronizationDeadline = 0;
-    if (this.alternateBufferObserved) this.clear();
+    this.clear();
     return true;
   }
 
@@ -258,6 +302,17 @@ export class TerminalLaunchPaintWatchdog {
 
   get isArmed() {
     return this.armedEpoch !== null;
+  }
+
+  /**
+   * Output that belongs to a just-submitted command must not wait behind a
+   * WebView timer. xterm normally uses timers to batch writes, but WebView2 can
+   * leave those timers parked after a terminal has been re-laid out. Keep the
+   * direct path active until that checkpoint paints (or the bounded probe
+   * expires). A delayed alternate-buffer control re-arms through the raw scan.
+   */
+  get shouldBypassRenderTimers() {
+    return this.armedEpoch !== null && !this.recoveryUsed;
   }
 
   get hasPendingPaint() {
@@ -592,6 +647,15 @@ export function selectClipboardImageSequence(
   if (provider === "codex") return "\u0016";
   if (provider === "grok") return "\u001bv";
   return null;
+}
+
+/**
+ * UI Pick owns a compact local-file reference, never terminal control input.
+ * The system clipboard is globally writable, so strip every C0/DEL control
+ * even when the marker appears valid before handing the text to a PTY.
+ */
+export function sanitizeUiPickClipboardText(text: string): string {
+  return text.replace(/[\u0000-\u001f\u007f]+/g, " ").slice(0, 32_768);
 }
 
 export const MAX_DROPPED_FILE_REFERENCES = 20;

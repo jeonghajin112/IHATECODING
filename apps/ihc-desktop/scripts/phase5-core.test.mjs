@@ -793,6 +793,16 @@ test("clipboard image routing is provider-specific and inert for a plain shell",
   assert.equal(core.selectClipboardImageSequence(undefined), null);
 });
 
+test("UI Pick clipboard references cannot carry terminal control input", () => {
+  const marked = "[IHATECODING UI PICK] Context file: C:\\capture.md";
+  assert.equal(
+    core.sanitizeUiPickClipboardText(`${marked}\rnext\nline\r\nend\x00\x1b\x7f`),
+    `${marked} next line end `,
+  );
+  assert.equal(core.sanitizeUiPickClipboardText("ordinary text"), "ordinary text");
+  assert.equal(core.sanitizeUiPickClipboardText("a".repeat(40_000)).length, 32_768);
+});
+
 test("native file drops keep safe unique Windows paths within the per-drop limit", () => {
   const first = String.raw`C:\Users\example\Documents\한글 이미지.png`;
   const unc = String.raw`\\server\share\design spec.pdf`;
@@ -1086,20 +1096,115 @@ test("unread summaries derive project, tab, and global badges without extra stat
   });
 });
 
-test("interactive launch paint watchdog observes only first output and alternate-buffer entry", () => {
+test("interactive launch paint watchdog finishes each visible checkpoint", () => {
   const watchdog = new core.TerminalLaunchPaintWatchdog(1_600);
   watchdog.arm(7);
+  assert.equal(watchdog.shouldBypassRenderTimers, true);
 
   assert.equal(watchdog.observeOutput(7, 4, false, 100), true);
   assert.equal(watchdog.observeOutput(7, 5, false, 110), false);
   assert.equal(watchdog.observePaint(4), true);
   assert.equal(watchdog.poll(7, 4, false, 150), "idle");
-  assert.equal(watchdog.isArmed, true);
+  assert.equal(watchdog.isArmed, false);
+  assert.equal(watchdog.shouldBypassRenderTimers, false);
 
+  // The raw alternate-buffer scanner re-arms before this later control is
+  // parsed, without keeping an ordinary streaming command hot for 12 seconds.
+  watchdog.arm(7);
   assert.equal(watchdog.observeOutput(7, 6, true, 200), true);
   assert.equal(watchdog.observeOutput(7, 7, true, 210), false);
   assert.equal(watchdog.observePaint(6), true);
   assert.equal(watchdog.isArmed, false);
+  assert.equal(watchdog.shouldBypassRenderTimers, false);
+});
+
+test("foreground terminal output paints directly only for a visible active receiver", () => {
+  const visible = {
+    documentVisible: true,
+    connected: true,
+    hidden: false,
+    paneActive: false,
+    focusInside: false,
+  };
+  assert.equal(core.shouldDirectPaintTerminalOutput(visible), false);
+  assert.equal(
+    core.shouldDirectPaintTerminalOutput({ ...visible, paneActive: true }),
+    true,
+  );
+  assert.equal(
+    core.shouldDirectPaintTerminalOutput({ ...visible, focusInside: true }),
+    true,
+  );
+  assert.equal(
+    core.shouldDirectPaintTerminalOutput({ ...visible, paneActive: true, hidden: true }),
+    false,
+  );
+  assert.equal(
+    core.shouldDirectPaintTerminalOutput({
+      ...visible,
+      focusInside: true,
+      documentVisible: false,
+    }),
+    false,
+  );
+});
+
+test("foreground synchronous refresh is burst-aware and rate-limited", () => {
+  assert.equal(
+    core.shouldForceDirectTerminalRefresh(
+      {
+        hasUnpaintedOutput: false,
+        firstBatchAfterIdle: true,
+        millisecondsSinceLastForcedRefresh: Number.POSITIVE_INFINITY,
+      },
+      120,
+    ),
+    false,
+  );
+  assert.equal(
+    core.shouldForceDirectTerminalRefresh(
+      {
+        hasUnpaintedOutput: true,
+        firstBatchAfterIdle: true,
+        millisecondsSinceLastForcedRefresh: 1,
+      },
+      120,
+    ),
+    true,
+  );
+  assert.equal(
+    core.shouldForceDirectTerminalRefresh(
+      {
+        hasUnpaintedOutput: true,
+        firstBatchAfterIdle: false,
+        millisecondsSinceLastForcedRefresh: 119,
+      },
+      120,
+    ),
+    false,
+  );
+  assert.equal(
+    core.shouldForceDirectTerminalRefresh(
+      {
+        hasUnpaintedOutput: true,
+        firstBatchAfterIdle: false,
+        millisecondsSinceLastForcedRefresh: 120,
+      },
+      120,
+    ),
+    true,
+  );
+});
+
+test("terminal launch controls are detected across native output batch boundaries", () => {
+  const first = core.scanTerminalLaunchControl("", "plain\x1b[?10");
+  assert.equal(first.detected, false);
+  const second = core.scanTerminalLaunchControl(first.tail, "49hready");
+  assert.equal(second.detected, true);
+  assert.equal(core.scanTerminalLaunchControl("", "\x1b[?2026h").detected, true);
+  assert.equal(core.scanTerminalLaunchControl("", "\u009b?47h").detected, true);
+  assert.equal(core.scanTerminalLaunchControl("", "text ?1049h").detected, false);
+  assert.ok(second.tail.length <= 16);
 });
 
 test("interactive launch paint watchdog waits for synchronized output but recovers once", () => {
@@ -1109,6 +1214,7 @@ test("interactive launch paint watchdog waits for synchronized output but recove
 
   assert.equal(watchdog.poll(3, 9, true, 1_699), "waiting");
   assert.equal(watchdog.poll(3, 9, true, 1_700), "recover");
+  assert.equal(watchdog.shouldBypassRenderTimers, false);
   assert.equal(watchdog.poll(3, 9, false, 1_800), "idle");
   assert.equal(watchdog.observeOutput(3, 11, true, 1_900), false);
 });

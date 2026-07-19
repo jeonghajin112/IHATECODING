@@ -51,9 +51,13 @@ import {
   normalizeProviderAccountListResponse,
   normalizeProviderUsageResponse,
   rectanglesOverlap,
+  scanTerminalLaunchControl,
+  sanitizeUiPickClipboardText,
   selectDroppedFilePaths,
   selectClipboardImageSequence,
   shouldManuallySendTerminalInterrupt,
+  shouldDirectPaintTerminalOutput,
+  shouldForceDirectTerminalRefresh,
   shouldOwnTerminalCopyFallback,
   TerminalLaunchPaintWatchdog,
   TerminalSelectionCopyGuard,
@@ -187,9 +191,23 @@ type BrowserWebviewUrlChanged = {
   url: string;
 };
 
+type BrowserUiPickResult = {
+  label: string;
+  ok: boolean;
+  screenshot: boolean;
+};
+
+type BrowserWebviewPrepared = {
+  label: string;
+  ok: boolean;
+  uiPickAvailable: boolean;
+};
+
 const OUTPUT_SETTLED_DELAY_MS = 120;
 const OUTPUT_RENDER_COALESCE_MS = 10;
-const OUTPUT_RENDER_MAX_BYTES = 256 * 1024;
+const OUTPUT_RENDER_MAX_BYTES = 64 * 1024;
+const FOREGROUND_OUTPUT_BURST_IDLE_MS = 48;
+const FOREGROUND_FORCED_REFRESH_INTERVAL_MS = 120;
 const COMPLETION_OUTPUT_QUIET_MS = 1_000;
 const EXIT_GAP_TIMEOUT_MS = 2_000;
 const UNBOUND_OUTPUT_MAX_BATCHES = 64;
@@ -219,6 +237,7 @@ const TERMINAL_LAUNCH_PROBE_TTL_MS = 12_000;
 const TERMINAL_PAINT_WATCHDOG_POLL_MS = 120;
 const TERMINAL_SYNCHRONIZED_PAINT_LIMIT_MS = 1_600;
 const BROWSER_URL_FALLBACK_SYNC_INTERVAL_MS = 1_000;
+const BROWSER_LISTENER_READY_TIMEOUT_MS = 1_500;
 const PANE_DRAG_START_DISTANCE_PX = 8;
 const PANE_DRAG_MINIMUM_REORDER_DISTANCE_PX = 12;
 const PANE_DRAG_SLOT_HYSTERESIS_PX = 18;
@@ -266,6 +285,7 @@ class TerminalPane {
   private readonly selectionCopyGuard = new TerminalSelectionCopyGuard();
   private readonly unboundOutput: OutputBatch[] = [];
   private readonly pendingRenderBatches: OutputBatch[] = [];
+  private launchEscapeTail = "";
   private readonly terminatedSessionIds = new Set<string>();
   private readonly startAbortController = new AbortController();
 
@@ -297,6 +317,8 @@ class TerminalPane {
   private capturedCursorMoveInput: string[] | null = null;
   private terminalRenderVersion = 0;
   private terminalPaintedVersion = 0;
+  private lastForegroundOutputAt = Number.NEGATIVE_INFINITY;
+  private lastForcedForegroundPaintAt = Number.NEGATIVE_INFINITY;
   private interactionEpoch = 0;
   private exitBarrierVersion = 0;
   private pendingExit: {
@@ -373,6 +395,9 @@ class TerminalPane {
   };
 
   private readonly onWindowFocus = () => {
+    if (this.pinnedXtermRendererNeedsResume()) {
+      this.resumePinnedXtermRenderer(true);
+    }
     this.resumeInteractiveLaunchPaintProbeIfVisible();
   };
 
@@ -1117,6 +1142,26 @@ class TerminalPane {
     }, delay);
   }
 
+  /**
+   * Reconcile xterm after the workspace changes its grid. The dependency is
+   * pinned because its renderer pause state is private; merely calling the
+   * public refresh method is a no-op while that state is stale.
+   */
+  resumeAfterLayout() {
+    if (this.disposed || !this.isTerminalViewportPaintable()) return;
+    this.fitTerminal();
+    this.queueCurrentSize();
+    this.resumePinnedXtermRenderer(true);
+    this.resumeInteractiveLaunchPaintProbeIfVisible();
+    // Let the browser deliver the real IntersectionObserver edge for the new
+    // connected layout first. Replaying visibility synchronously here can be
+    // overwritten by a stale hidden edge from the previous parent.
+    requestAnimationFrame(() => {
+      if (this.disposed || !this.isTerminalViewportPaintable()) return;
+      this.resumePinnedXtermRenderer(true);
+    });
+  }
+
   dispose(
     stopSession: (sessionId: string) => Promise<void> = stopBackendSession,
   ): Promise<void> {
@@ -1497,9 +1542,10 @@ class TerminalPane {
         performance.now(),
       )
     ) {
-      return;
+      return false;
     }
     this.scheduleInteractiveLaunchPaintWatchdog();
+    return true;
   }
 
   private scheduleInteractiveLaunchPaintWatchdog() {
@@ -1562,15 +1608,88 @@ class TerminalPane {
     if (!this.isTerminalViewportPaintable()) return;
     this.fitTerminal();
     this.queueCurrentSize();
-    // @xterm/xterm is intentionally pinned to 6.1.0-beta.290. Its public
-    // refresh API is rAF-debounced, which cannot release a frame whose rAF is
-    // itself wedged in WebView2. Use the pinned core's synchronous refresh only
-    // for this single, bounded launch recovery and retain the public fallback.
-    const core = (
+    const core = this.pinnedXtermCore();
+    if (this.terminal.modes.synchronizedOutputMode) {
+      try {
+        // Release only the pinned renderer flag. Feeding a synthetic escape
+        // through xterm.writeSync can replay already-parsed queued chunks.
+        // refresh() below flushes the synchronized row range without touching
+        // PTY input or the parser's pending-write offset.
+        if (core?.coreService?.decPrivateModes) {
+          core.coreService.decPrivateModes.synchronizedOutput = false;
+        }
+      } catch {
+        // Visibility reconciliation and refresh remain safe fallbacks.
+      }
+    }
+    this.resumePinnedXtermRenderer(true);
+  }
+
+  private pinnedXtermCore() {
+    return (
       this.terminal as unknown as {
-        _core?: { refresh(start: number, end: number, sync?: boolean): void };
+        _core?: {
+          refresh(start: number, end: number, sync?: boolean): void;
+          coreService?: {
+            decPrivateModes?: { synchronizedOutput: boolean };
+          };
+          _writeBuffer?: { handleUserInput(): void };
+          _renderService?: {
+            _isPaused?: boolean;
+            _needsFullRefresh?: boolean;
+            _handleIntersectionChange(entry: {
+              isIntersecting?: boolean;
+              intersectionRatio: number;
+            }): void;
+          };
+        };
       }
     )._core;
+  }
+
+  private primePinnedXtermImmediateWrite() {
+    try {
+      this.pinnedXtermCore()?._writeBuffer?.handleUserInput();
+    } catch {
+      // The normal public write path remains available if pinned internals move.
+    }
+  }
+
+  private pinnedXtermRendererNeedsResume() {
+    const renderer = this.pinnedXtermCore()?._renderService;
+    return (
+      this.launchPaintWatchdog.hasPendingPaint ||
+      this.terminalRenderVersion > this.terminalPaintedVersion ||
+      renderer?._isPaused === true ||
+      renderer?._needsFullRefresh === true
+    );
+  }
+
+  private shouldDirectPaintOutput() {
+    return shouldDirectPaintTerminalOutput({
+      documentVisible: document.visibilityState === "visible",
+      connected: this.element.isConnected,
+      hidden: this.element.hidden,
+      paneActive: this.element.dataset.active === "true",
+      focusInside: this.viewport.contains(document.activeElement),
+    });
+  }
+
+  private resumePinnedXtermRenderer(forceRefresh: boolean) {
+    if (!this.isTerminalViewportPaintable()) return;
+    const core = this.pinnedXtermCore();
+    try {
+      // updateLayout can move the screen between connected containers before
+      // xterm's IntersectionObserver delivers its final visible edge. Replay
+      // only that visible edge after verifying the pane is actually paintable.
+      core?._renderService?._handleIntersectionChange({
+        isIntersecting: true,
+        intersectionRatio: 1,
+      });
+    } catch {
+      // A public refresh below is still useful when the renderer is not paused.
+    }
+    if (!forceRefresh) return;
     try {
       if (core?.refresh) core.refresh(0, Math.max(0, this.terminal.rows - 1), true);
       else this.terminal.refresh(0, Math.max(0, this.terminal.rows - 1));
@@ -1924,6 +2043,17 @@ class TerminalPane {
     return true;
   }
 
+  private observeRawLaunchControl(data: string) {
+    const control = scanTerminalLaunchControl(this.launchEscapeTail, data);
+    this.launchEscapeTail = control.tail;
+    if (this.terminal.buffer.active.type === "normal" && control.detected) {
+      // Slow agent startup can exceed the Enter-triggered probe TTL. Re-arm on
+      // the raw alternate-buffer/DEC-2026 sequence before xterm parsing, so
+      // that exact transition bypasses a parked WebView timer.
+      this.armInteractiveLaunchPaintProbe();
+    }
+  }
+
   private scheduleRenderDrain() {
     if (this.renderDrainScheduled || this.disposed || this.terminalFailed) return;
     this.renderDrainScheduled = true;
@@ -1935,13 +2065,24 @@ class TerminalPane {
     try {
       // A Codex TUI redraw can cross the Rust output dispatcher's 8 ms batch
       // boundary. Briefly collect adjacent batches so xterm never paints the
-      // intermediate cleared composer between those fragments.
-      await delay(OUTPUT_RENDER_COALESCE_MS);
+      // intermediate cleared composer between those fragments. The first
+      // output after Enter is deliberately exempt: waiting on a WebView timer
+      // here can strand an already-running CLI until the window loses focus.
+      if (
+        !this.shouldDirectPaintOutput() &&
+        !this.launchPaintWatchdog.shouldBypassRenderTimers
+      ) {
+        await delay(OUTPUT_RENDER_COALESCE_MS);
+      }
       while (!this.disposed && !this.terminalFailed && this.pendingRenderBatches.length > 0) {
         rendering = this.takePendingRenderBatches();
         await this.renderOutputBatches(rendering);
         rendering = [];
-        if (this.pendingRenderBatches.length > 0) {
+        if (
+          this.pendingRenderBatches.length > 0 &&
+          !this.shouldDirectPaintOutput() &&
+          !this.launchPaintWatchdog.shouldBypassRenderTimers
+        ) {
           await delay(OUTPUT_RENDER_COALESCE_MS);
         }
       }
@@ -1976,14 +2117,53 @@ class TerminalPane {
     const writeEpoch = this.interactionEpoch;
     const data = batches.map((batch) => batch.data).join("");
     const bufferTypeBeforeWrite = this.terminal.buffer.active.type;
+    // Scan at the actual write boundary. Scanning all accepted batches earlier
+    // lets a control-free 64 KiB slice consume a probe that belongs to a later
+    // slice containing the alternate-buffer control.
+    this.observeRawLaunchControl(data);
+    const directPaint = this.shouldDirectPaintOutput();
+    const launchSensitiveWrite = this.launchPaintWatchdog.shouldBypassRenderTimers;
+    const immediateWrite = directPaint || launchSensitiveWrite;
+    const writeStartedAt = performance.now();
+    const firstForegroundBatchAfterIdle =
+      directPaint &&
+      writeStartedAt - this.lastForegroundOutputAt >= FOREGROUND_OUTPUT_BURST_IDLE_MS;
+    if (directPaint) this.lastForegroundOutputAt = writeStartedAt;
+    const expectedRenderVersion = this.terminalRenderVersion + batches.length;
+    this.terminalRenderVersion = expectedRenderVersion;
+
+    // xterm normally schedules an empty write buffer through setTimeout(0).
+    // Mark foreground and bounded launch writes as input-adjacent so parsing
+    // starts in the current task even if WebView2 has parked render timers.
+    // Full synchronous refreshes below are separately rate-limited.
+    if (immediateWrite) this.primePinnedXtermImmediateWrite();
 
     await new Promise<void>((resolve) => {
       this.terminal.write(data, () => {
-        this.terminalRenderVersion += batches.length;
-        this.observeInteractiveLaunchOutput(
+        const observedLaunchCheckpoint = this.observeInteractiveLaunchOutput(
           bufferTypeBeforeWrite !== "alternate" &&
             this.terminal.buffer.active.type === "alternate",
         );
+        const paintCheckedAt = performance.now();
+        const forceForegroundRefresh =
+          directPaint &&
+          shouldForceDirectTerminalRefresh(
+            {
+              hasUnpaintedOutput:
+                this.terminalPaintedVersion < expectedRenderVersion,
+              firstBatchAfterIdle: firstForegroundBatchAfterIdle,
+              millisecondsSinceLastForcedRefresh:
+                paintCheckedAt - this.lastForcedForegroundPaintAt,
+            },
+            FOREGROUND_FORCED_REFRESH_INTERVAL_MS,
+          );
+        if (
+          forceForegroundRefresh ||
+          (launchSensitiveWrite && observedLaunchCheckpoint)
+        ) {
+          this.lastForcedForegroundPaintAt = paintCheckedAt;
+          this.resumePinnedXtermRenderer(true);
+        }
         if (
           !this.disposed &&
           !this.terminalFailed &&
@@ -2204,16 +2384,17 @@ class TerminalPane {
     window.clearTimeout(this.outputSettledTimer);
     if (!shouldFollow || this.disposed) return;
     this.outputSettledTimer = window.setTimeout(() => {
-      this.terminal.write("", () => {
-        if (
-          !this.disposed &&
-          writeEpoch === this.interactionEpoch &&
-          this.canAutoFollow() &&
-          !this.isAtBottom()
-        ) {
-          this.terminal.scrollToBottom();
-        }
-      });
+      // An empty xterm write creates its own zero-delay parser timer. If real
+      // PTY output arrives in that tiny window, it can become trapped behind
+      // the empty write until WebView2 receives an unrelated focus event.
+      if (
+        !this.disposed &&
+        writeEpoch === this.interactionEpoch &&
+        this.canAutoFollow() &&
+        !this.isAtBottom()
+      ) {
+        this.terminal.scrollToBottom();
+      }
     }, OUTPUT_SETTLED_DELAY_MS);
   }
 
@@ -2631,28 +2812,7 @@ class TerminalPane {
     );
 
     if (snapshot.kind === "image") {
-      let provider: AgentProvider | null = null;
-      if (this.sessionId) {
-        const detected = await invoke<AgentProvider | null>("detect_terminal_agent", {
-          sessionId: this.sessionId,
-        }).catch(() => null);
-        if (detected === "codex" || detected === "grok") {
-          provider = detected;
-          if (
-            this.agentProvider &&
-            this.agentProvider !== detected &&
-            this.agentConversationBound
-          ) {
-            await invoke("unbind_agent_session", { sessionId: this.sessionId }).catch(
-              () => undefined,
-            );
-            this.agentConversationBound = false;
-            this.agentConversationId = null;
-            this.clearAgentContextUsage();
-          }
-          this.agentProvider = detected;
-        }
-      }
+      const provider = await this.detectClipboardAgent();
       const sequence = selectClipboardImageSequence(provider);
       if (!sequence) {
         this.setStatusOnly(
@@ -2669,10 +2829,45 @@ class TerminalPane {
     }
 
     if (snapshot.kind === "empty" || !snapshot.text) return null;
+    const uiPick = snapshot.text.startsWith("[IHATECODING UI PICK]");
+    if (uiPick && !(await this.detectClipboardAgent())) {
+      this.setStatusOnly(
+        tr(
+          "Start Codex or Grok in this PowerShell before pasting UI Pick context.",
+          "UI Pick 정보를 붙여넣으려면 이 PowerShell에서 Codex 또는 Grok을 먼저 실행하세요.",
+        ),
+        "error",
+      );
+      return null;
+    }
+    if (uiPick) this.scheduleAgentDiscovery(true);
+    const bracketed = this.terminal.modes.bracketedPasteMode;
+    const text = uiPick ? sanitizeUiPickClipboardText(snapshot.text) : snapshot.text;
     return {
       kind: "text",
-      data: prepareTerminalPaste(snapshot.text, this.terminal.modes.bracketedPasteMode),
+      data: prepareTerminalPaste(text, bracketed),
     };
+  }
+
+  private async detectClipboardAgent(): Promise<AgentProvider | null> {
+    const sessionId = this.sessionId;
+    if (!sessionId) return null;
+    const detected = await invoke<AgentProvider | null>("detect_terminal_agent", {
+      sessionId,
+    }).catch(() => null);
+    if (detected !== "codex" && detected !== "grok") return null;
+    if (
+      this.agentProvider &&
+      this.agentProvider !== detected &&
+      this.agentConversationBound
+    ) {
+      await invoke("unbind_agent_session", { sessionId }).catch(() => undefined);
+      this.agentConversationBound = false;
+      this.agentConversationId = null;
+      this.clearAgentContextUsage();
+    }
+    this.agentProvider = detected;
+    return detected;
   }
 
   private async detectDroppedFileProvider(): Promise<AgentProvider | null> {
@@ -3150,6 +3345,31 @@ class BrowserPane {
     this.element.dataset.active = String(active);
   }
 
+  ownsWebviewLabel(label: string) {
+    return !this.disposed && this.webview?.label === label;
+  }
+
+  observeWebviewPrepared(label: string, ok: boolean, uiPickAvailable: boolean) {
+    if (!this.ownsWebviewLabel(label)) return;
+    if (!ok) {
+      this.setState(
+        "error",
+        tr("Could not open the web page", "웹페이지를 열지 못했습니다"),
+        "error",
+      );
+      return;
+    }
+    if (!uiPickAvailable) {
+      this.workspace.setFooterStatus(
+        tr(
+          "The browser opened, but UI Pick is unavailable in this pane.",
+          "브라우저는 열렸지만 이 창에서는 UI Pick을 사용할 수 없습니다.",
+        ),
+        "error",
+      );
+    }
+  }
+
   setTitle(title: string) {
     this.title = title;
     this.titleElement.textContent = title;
@@ -3562,7 +3782,7 @@ class BrowserPane {
     const bounds = this.viewport.getBoundingClientRect();
     const label = `ihc-browser-${this.sequence}-${generation}`;
     const webview = new Webview(getCurrentWindow(), label, {
-      url,
+      url: "about:blank",
       x: Math.max(0, Math.round(bounds.left)),
       y: Math.max(0, Math.round(bounds.top)),
       width: Math.max(1, Math.round(bounds.width)),
@@ -3589,13 +3809,15 @@ class BrowserPane {
       this.setState("running", tr("Web browser", "웹 브라우저"));
       await this.syncBounds(generation, webview);
       if (this.disposed || generation !== this.generation || this.webview !== webview) return;
-      try {
-        await this.workspace.watchBrowserWebviewUrl(webview.label);
-      } catch {
-        if (!this.disposed && generation === this.generation && this.webview === webview) {
-          this.urlSyncFallbackEnabled = true;
-          this.scheduleUrlSyncFallback(0);
-        }
+      const urlEventsReady = await this.workspace.watchBrowserWebviewUrl(webview.label, url);
+      if (
+        !urlEventsReady &&
+        !this.disposed &&
+        generation === this.generation &&
+        this.webview === webview
+      ) {
+        this.urlSyncFallbackEnabled = true;
+        this.scheduleUrlSyncFallback(0);
       }
     } catch (error) {
       if (this.webview === webview) this.webview = null;
@@ -3986,8 +4208,10 @@ class TerminalWorkspace {
 
   private async installBrowserUrlSync(): Promise<boolean> {
     const registrationEpoch = ++this.browserUrlRegistrationEpoch;
+    const currentWebview = getCurrentWebview();
+    let urlListenerReady = false;
     try {
-      const unlisten = await getCurrentWebview().listen<BrowserWebviewUrlChanged>(
+      const unlistenUrl = await currentWebview.listen<BrowserWebviewUrlChanged>(
         "browser-webview-url-changed",
         ({ payload }) => {
           if (
@@ -4004,11 +4228,11 @@ class TerminalWorkspace {
         },
       );
       if (this.disposed || registrationEpoch !== this.browserUrlRegistrationEpoch) {
-        unlisten();
+        unlistenUrl();
         return false;
       }
-      this.browserUrlUnlisteners.push(unlisten);
-      return true;
+      this.browserUrlUnlisteners.push(unlistenUrl);
+      urlListenerReady = true;
     } catch (error) {
       if (!this.disposed) {
         this.setFooterStatus(
@@ -4019,20 +4243,91 @@ class TerminalWorkspace {
           "error",
         );
       }
-      return false;
     }
+
+    try {
+      const unlistenUiPick = await currentWebview.listen<BrowserUiPickResult>(
+        "browser-ui-pick-result",
+        ({ payload }) => {
+          if (
+            this.disposed ||
+            registrationEpoch !== this.browserUrlRegistrationEpoch ||
+            typeof payload?.label !== "string" ||
+            typeof payload?.ok !== "boolean" ||
+            typeof payload?.screenshot !== "boolean" ||
+            !Array.from(this.browserPanes.values()).some((pane) =>
+              pane.ownsWebviewLabel(payload.label),
+            )
+          ) {
+            return;
+          }
+          this.setFooterStatus(
+            payload.ok
+              ? tr(
+                  "Element context copied. Paste it into Codex or Grok.",
+                  "요소 정보를 복사했습니다. Codex 또는 Grok에 붙여넣으세요.",
+                )
+              : tr(
+                  "Could not copy the selected element context.",
+                  "선택한 요소 정보를 복사하지 못했습니다.",
+                ),
+            payload.ok ? "normal" : "error",
+          );
+        },
+      );
+      if (this.disposed || registrationEpoch !== this.browserUrlRegistrationEpoch) {
+        unlistenUiPick();
+      } else {
+        this.browserUrlUnlisteners.push(unlistenUiPick);
+      }
+    } catch {
+      // UI Pick remains available even if its optional status feedback listener
+      // could not be registered. The clipboard result is still authoritative.
+    }
+    try {
+      const unlistenPrepared = await currentWebview.listen<BrowserWebviewPrepared>(
+        "browser-webview-prepared",
+        ({ payload }) => {
+          if (
+            this.disposed ||
+            registrationEpoch !== this.browserUrlRegistrationEpoch ||
+            typeof payload?.label !== "string" ||
+            typeof payload?.ok !== "boolean" ||
+            typeof payload?.uiPickAvailable !== "boolean"
+          ) {
+            return;
+          }
+          for (const pane of this.browserPanes.values()) {
+            pane.observeWebviewPrepared(
+              payload.label,
+              payload.ok,
+              payload.uiPickAvailable,
+            );
+          }
+        },
+      );
+      if (this.disposed || registrationEpoch !== this.browserUrlRegistrationEpoch) {
+        unlistenPrepared();
+      } else {
+        this.browserUrlUnlisteners.push(unlistenPrepared);
+      }
+    } catch {
+      // The URL polling fallback still handles a missing preparation listener.
+    }
+    return urlListenerReady;
   }
 
-  async watchBrowserWebviewUrl(label: string) {
-    if (!(await this.browserUrlListenerReady)) {
-      throw new Error(
-        tr(
-          "Browser address synchronization is unavailable.",
-          "브라우저 주소 동기화를 사용할 수 없습니다.",
-        ),
-      );
-    }
-    await invoke("watch_browser_webview_url", { label });
+  async watchBrowserWebviewUrl(label: string, targetUrl: string): Promise<boolean> {
+    // Optional status listeners must never hold the first native navigation.
+    // If registration is unusually slow, open the page and use URL polling.
+    const listenerReady = await Promise.race([
+      this.browserUrlListenerReady,
+      delay(BROWSER_LISTENER_READY_TIMEOUT_MS).then(() => false),
+    ]);
+    // Native browser preparation also installs UI Pick and performs the first
+    // navigation, so it must run even when event-based URL sync is unavailable.
+    await invoke("watch_browser_webview_url", { label, targetUrl });
+    return listenerReady;
   }
 
   async unwatchBrowserWebviewUrl(label: string) {
@@ -4522,7 +4817,10 @@ class TerminalWorkspace {
     for (const pane of visible) pane.setActive(pane.id === this.activePaneId);
     this.workspaceView = "terminals";
     this.app.dataset.workspaceView = "terminals";
-    this.updateLayout();
+    // Project restore can build xterm panes while the terminal surface is
+    // still hidden. Resume every visible renderer once after the surface
+    // becomes paintable, even when the final DOM topology is a no-op.
+    this.updateLayout(true);
     this.renderActiveStatus();
     this.scheduleInactiveAgentSleepSweep();
     return true;
@@ -5492,6 +5790,7 @@ class TerminalWorkspace {
   showTerminalView() {
     this.workspaceView = this.activeProjectId ? "terminals" : "empty";
     this.app.dataset.workspaceView = this.workspaceView;
+    if (this.workspaceView === "terminals") this.updateLayout(true);
     this.renderActiveStatus();
     requestAnimationFrame(() => {
       for (const pane of this.layoutVisiblePanes()) pane.scheduleFit(0);
@@ -5549,7 +5848,7 @@ class TerminalWorkspace {
     );
   }
 
-  private updateLayout() {
+  private updateLayout(forceVisibleTerminalResume = false) {
     const allVisible = this.visiblePanes();
     let maximized = this.maximizedPaneId
       ? allVisible.find((pane) => pane.id === this.maximizedPaneId) ?? null
@@ -5563,13 +5862,26 @@ class TerminalWorkspace {
     }
     const visible = maximized ? [maximized] : allVisible;
     const { columns, rows } = layoutFor(visible.length);
+    const visibleIds = new Set(visible.map((pane) => pane.id));
+    const terminalsNeedingResume = new Set<TerminalPane>();
+    if (forceVisibleTerminalResume) {
+      for (const pane of visible) {
+        if (pane instanceof TerminalPane) terminalsNeedingResume.add(pane);
+      }
+    }
     for (const pane of this.allPanes()) {
+      pane.setResizeHandleEnabled(false);
+      if (visibleIds.has(pane.id)) continue;
       if (pane instanceof BrowserPane) pane.setLayoutVisible(false);
       pane.element.hidden = true;
-      pane.setResizeHandleEnabled(false);
-      this.inactivePaneBin.append(pane.element);
+      if (pane.element.parentElement !== this.inactivePaneBin) {
+        this.inactivePaneBin.append(pane.element);
+      }
     }
-    this.rowsHost.replaceChildren();
+    const previousRows = [...this.rowsHost.children].filter(
+      (row): row is HTMLDivElement => row instanceof HTMLDivElement,
+    );
+    const nextRows: ActiveTerminalRow[] = [];
     this.activeRows.clear();
     this.rowsHost.style.setProperty("--terminal-row-count", String(rows));
 
@@ -5582,7 +5894,7 @@ class TerminalWorkspace {
       if (rowPanes.length === 0) break;
       const key = `${columns}x${rows}:row-${rowIndex}`;
       const ratios = normalizedLayoutRatios(storedRatios[key], columns);
-      const rowElement = document.createElement("div");
+      const rowElement = previousRows[rowIndex] ?? document.createElement("div");
       rowElement.className = "terminal-row";
       rowElement.dataset.layoutKey = key;
       rowElement.dataset.row = String(rowIndex);
@@ -5594,30 +5906,56 @@ class TerminalWorkspace {
         columns,
       };
 
+      // Reuse rows by position and connect only genuinely new rows. A no-op
+      // layout therefore leaves every xterm DOM node exactly where it is.
+      if (!rowElement.isConnected) this.rowsHost.append(rowElement);
+
       for (let column = 0; column < columns; column += 1) {
         const pane = rowPanes[column];
         if (pane) {
-          pane.element.hidden = false;
-          if (pane instanceof BrowserPane) pane.setLayoutVisible(true);
+          const wasHidden = pane.element.hidden;
           pane.setResizeHandleEnabled(
             this.catalogWritable && column < rowPanes.length - 1,
           );
-          rowElement.append(pane.element);
+          const current = rowElement.children[column] ?? null;
+          const moved = current !== pane.element;
+          if (moved) rowElement.insertBefore(pane.element, current);
+          pane.element.hidden = false;
+          if (pane instanceof BrowserPane) pane.setLayoutVisible(true);
+          if (pane instanceof TerminalPane && (wasHidden || moved)) {
+            terminalsNeedingResume.add(pane);
+          }
         } else {
-          const spacer = document.createElement("div");
-          spacer.className = "terminal-row-spacer";
-          spacer.setAttribute("aria-hidden", "true");
-          rowElement.append(spacer);
+          const current = rowElement.children[column] ?? null;
+          if (
+            !(current instanceof HTMLElement) ||
+            !current.classList.contains("terminal-row-spacer")
+          ) {
+            const spacer = document.createElement("div");
+            spacer.className = "terminal-row-spacer";
+            spacer.setAttribute("aria-hidden", "true");
+            rowElement.insertBefore(spacer, current);
+          }
         }
       }
-      this.applyRowRatios(row, ratios);
+      nextRows.push(row);
       this.activeRows.set(key, row);
-      this.rowsHost.append(rowElement);
     }
+
+    // All desired panes have now moved between connected rows. Only spacers or
+    // obsolete children remain past each row's declared column count.
+    for (const row of nextRows) {
+      while (row.element.children.length > row.columns) {
+        row.element.lastElementChild?.remove();
+      }
+      this.applyRowRatios(row, row.ratios);
+    }
+    for (const row of previousRows.slice(nextRows.length)) row.remove();
 
     this.terminalSurface.dataset.empty = String(allVisible.length === 0);
     this.refreshBrowserSuspensions();
     this.updateControls();
+    for (const pane of terminalsNeedingResume) pane.resumeAfterLayout();
     requestAnimationFrame(() => {
       for (const pane of visible) pane.scheduleFit(0);
     });

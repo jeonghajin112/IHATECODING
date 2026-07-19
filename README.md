@@ -12,6 +12,7 @@ The AI Workspace for autonomous development.
 - Remaining-limit indicators for Codex five-hour and weekly limits, plus Grok usage
 - Drag-to-reorder panes, horizontal resizing, alignment snapping, and pane maximization
 - Windows IME support, terminal text copy and paste, clipboard screenshot paste, and file drag-and-drop
+- UI Pick in embedded web panels: right-click an element to copy its selector, visible styles, and a local screenshot reference for an AI CLI
 - Scroll-follow behavior that pauses while output is selected or the terminal is scrolled upward
 - Read-only import of an existing local project list
 - English and Korean user interfaces
@@ -87,6 +88,8 @@ cargo clippy --all-targets --all-features -- -D warnings
 ## Security and privacy
 
 IHATECODING stores workspace state and settings locally. The app itself does not upload terminal output, prompts, project paths, conversation identifiers, or CLI credentials to an IHATECODING server. Codex CLI, Grok CLI, and pages opened in web panels still communicate with their respective services under their own policies.
+
+UI Pick treats captured page content as untrusted data. It does not read form values, cookies, browser storage, full HTML, or URL queries and fragments, and it refuses targets that directly contain password inputs. Its bounded screenshot can still include sensitive information already visible near the selected element. Captures stay in the local application cache and are pruned on app launch and future captures.
 
 Discord notifications are optional. When enabled, IHATECODING sends the notification type together with the project and terminal names to the Discord webhook configured by the user. The webhook URL is restricted to official Discord webhook hosts and is protected locally with Windows Data Protection API (DPAPI).
 

@@ -269,9 +269,35 @@ test("terminal output coalesces adjacent TUI repaint fragments before xterm rend
   );
   assert.match(
     rendering,
+    /!this\.shouldDirectPaintOutput\(\)[\s\S]*?!this\.launchPaintWatchdog\.shouldBypassRenderTimers[\s\S]*?await delay\(OUTPUT_RENDER_COALESCE_MS\)/,
+  );
+  assert.match(
+    rendering,
     /OUTPUT_RENDER_MAX_BYTES[\s\S]*?pendingRenderBatches\.splice/,
   );
   assert.match(rendering, /batches\.map\(\(batch\) => batch\.data\)\.join\(""\)/);
+  assert.match(
+    rendering,
+    /directPaint = this\.shouldDirectPaintOutput\(\)[\s\S]*?immediateWrite = directPaint \|\| launchSensitiveWrite[\s\S]*?if \(immediateWrite\) this\.primePinnedXtermImmediateWrite\(\)[\s\S]*?terminal\.write\(data/,
+  );
+  assert.match(
+    rendering,
+    /shouldForceDirectTerminalRefresh\([\s\S]*?FOREGROUND_FORCED_REFRESH_INTERVAL_MS[\s\S]*?forceForegroundRefresh \|\|[\s\S]*?launchSensitiveWrite && observedLaunchCheckpoint[\s\S]*?resumePinnedXtermRenderer\(true\)/,
+  );
+  assert.match(
+    rendering,
+    /terminalRenderVersion = expectedRenderVersion[\s\S]*?terminal\.write\(data/,
+  );
+  assert.match(main, /OUTPUT_RENDER_MAX_BYTES = 64 \* 1024/);
+  assert.match(
+    rendering,
+    /batches\.map\(\(batch\) => batch\.data\)\.join\(""\)[\s\S]*?observeRawLaunchControl\(data\)[\s\S]*?launchSensitiveWrite = this\.launchPaintWatchdog\.shouldBypassRenderTimers[\s\S]*?terminal\.write\(data/,
+  );
+  assert.doesNotMatch(
+    rendering,
+    /for \(const item of ready\) this\.observeRawLaunchControl\(item\.data\)/,
+  );
+  assert.doesNotMatch(rendering, /terminal\.write\(""/);
   assert.doesNotMatch(rendering, /nextAnimationFrame\(\)/);
   assert.match(
     rendering,
@@ -332,7 +358,7 @@ test("interactive CLI launch recovers a missed xterm paint without polling norma
   );
   assert.match(
     rendering,
-    /bufferTypeBeforeWrite = this\.terminal\.buffer\.active\.type[\s\S]*?terminal\.write\(data[\s\S]*?terminalRenderVersion \+= batches\.length[\s\S]*?observeInteractiveLaunchOutput[\s\S]*?buffer\.active\.type === "alternate"/,
+    /bufferTypeBeforeWrite = this\.terminal\.buffer\.active\.type[\s\S]*?terminalRenderVersion = expectedRenderVersion[\s\S]*?terminal\.write\(data[\s\S]*?observeInteractiveLaunchOutput[\s\S]*?buffer\.active\.type === "alternate"/,
   );
   assert.match(
     recovery,
@@ -350,12 +376,21 @@ test("interactive CLI launch recovers a missed xterm paint without polling norma
     recovery,
     /recoverInteractiveLaunchPaint\(\)[\s\S]*?isTerminalViewportPaintable\(\)[\s\S]*?fitTerminal\(\)[\s\S]*?queueCurrentSize\(\)[\s\S]*?core\.refresh\(0,[\s\S]*?true\)/,
   );
+  assert.match(
+    recovery,
+    /synchronizedOutputMode[\s\S]*?decPrivateModes\.synchronizedOutput = false[\s\S]*?resumePinnedXtermRenderer\(true\)/,
+  );
+  assert.match(
+    recovery,
+    /_renderService\?:[\s\S]*?_handleIntersectionChange[\s\S]*?isIntersecting: true[\s\S]*?intersectionRatio: 1/,
+  );
   assert.equal(JSON.parse(packageSource).dependencies["@xterm/xterm"], "6.1.0-beta.290");
   assert.equal(
     JSON.parse(packageSource).dependencies["@xterm/addon-web-links"],
     "0.13.0-beta.290",
   );
   assert.doesNotMatch(recovery, /terminal\.write\("\\u001b\[\?2026l"/);
+  assert.doesNotMatch(recovery, /\.writeSync\(/);
   assert.match(main, /TERMINAL_LAUNCH_PROBE_TTL_MS = 12_000/);
   assert.match(main, /TERMINAL_SYNCHRONIZED_PAINT_LIMIT_MS = 1_600/);
 });
@@ -390,7 +425,7 @@ test("pane maximize is a reversible workspace view and leaves sibling sessions a
   assert.match(toggle, /this\.updateLayout\(\)/);
   assert.doesNotMatch(toggle, /dispose\(|closePane\(|panes\.delete/);
 
-  const layoutStart = main.indexOf("private updateLayout()");
+  const layoutStart = main.indexOf("private updateLayout(");
   const layoutEnd = main.indexOf("private updateControls()", layoutStart);
   assert.ok(layoutStart >= 0 && layoutEnd > layoutStart);
   const layout = main.slice(layoutStart, layoutEnd);
@@ -401,8 +436,22 @@ test("pane maximize is a reversible workspace view and leaves sibling sessions a
     /for \(const pane of this\.allPanes\(\)\) \{\s*pane\.setMaximized/,
   );
   assert.match(layout, /for \(const pane of this\.allPanes\(\)\)[\s\S]*?inactivePaneBin\.append\(pane\.element\)/);
+  assert.match(layout, /visibleIds\.has\(pane\.id\)\) continue/);
+  assert.match(layout, /previousRows\[rowIndex\] \?\? document\.createElement\("div"\)/);
+  assert.match(
+    layout,
+    /if \(!rowElement\.isConnected\) this\.rowsHost\.append\(rowElement\)[\s\S]*?current !== pane\.element[\s\S]*?rowElement\.insertBefore\(pane\.element, current\)/,
+  );
+  assert.match(layout, /terminalsNeedingResume\.add\(pane\)/);
+  assert.match(
+    layout,
+    /forceVisibleTerminalResume[\s\S]*?for \(const pane of visible\)[\s\S]*?terminalsNeedingResume\.add\(pane\)/,
+  );
+  assert.match(layout, /for \(const pane of terminalsNeedingResume\) pane\.resumeAfterLayout\(\)/);
+  assert.doesNotMatch(layout, /rowsHost\.replaceChildren\(\)/);
   assert.doesNotMatch(layout, /dispose\(|panes\.delete/);
   assert.match(main, /if \(projectChanged\) this\.maximizedPaneId = null/);
+  assert.match(main, /this\.workspaceView = "terminals"[\s\S]*?this\.updateLayout\(true\)/);
   assert.match(main, /if \(this\.maximizedPaneId === paneId\) this\.maximizedPaneId = null/);
 
   const addPaneStart = main.indexOf("  addPane(");
@@ -648,6 +697,10 @@ test("usage, unread badges, and the single native clipboard snapshot are wired",
   assert.match(clipboard, /invoke<unknown>\("read_clipboard_snapshot"\)/);
   assert.match(clipboard, /snapshot\.kind === "image"/);
   assert.match(clipboard, /snapshot\.kind === "empty"/);
+  assert.match(
+    clipboard,
+    /snapshot\.text\.startsWith\("\[IHATECODING UI PICK\]"\)[\s\S]*?detectClipboardAgent\(\)[\s\S]*?sanitizeUiPickClipboardText\(snapshot\.text\)/,
+  );
   assert.doesNotMatch(clipboard, /navigator\.clipboard\.readText/);
   assert.doesNotMatch(main, /clipboard_contains_image/);
   assert.match(main, /invoke<AgentProvider \| null>\("detect_terminal_agent"/);
@@ -1363,4 +1416,91 @@ test("application chrome stays monochrome except for completion alerts", async (
       `non-monochrome application color #${color}`,
     );
   }
+});
+
+test("browser UI Pick copies bounded element context without granting remote IPC", async () => {
+  const [main, backend, nativePicker, picker, capabilities] = await Promise.all([
+    source("src/main.ts"),
+    source("src-tauri/src/lib.rs"),
+    source("src-tauri/src/browser_ui_pick.rs"),
+    source("src-tauri/src/browser_ui_pick.js"),
+    source("src-tauri/capabilities/default.json"),
+  ]);
+
+  assert.match(backend, /mod browser_ui_pick;/);
+  assert.match(
+    backend,
+    /install_windows_browser_ui_pick\([\s\S]*move \|ui_pick_result\|/,
+  );
+  assert.match(main, /url: "about:blank"/);
+  assert.match(
+    backend,
+    /install_windows_browser_ui_pick[\s\S]*move \|ui_pick_result\|[\s\S]*completion_core\.Navigate/,
+    "remote navigation must wait for trusted document-created script completion",
+  );
+  assert.match(nativePicker, /AddScriptToExecuteOnDocumentCreated/);
+  assert.match(nativePicker, /AddScriptToExecuteOnDocumentCreatedCompletedHandler::create/);
+  assert.doesNotMatch(nativePicker, /wait_for_async_operation/);
+  assert.match(nativePicker, /complete_windows_picker_install/);
+  assert.match(backend, /if !completion_state\.claim_preparation\(&completion_label\)/);
+  assert.match(backend, /ok && ui_pick_available/);
+  assert.match(
+    backend,
+    /schedule_windows_browser_prepare_timeout[\s\S]*tokio::time::sleep\(BROWSER_WEBVIEW_PREPARE_TIMEOUT\)[\s\S]*state\.claim_preparation\(&label\)[\s\S]*\.navigate\(target\)[\s\S]*emit_browser_webview_prepared\(&app, &label, ok, false\)/,
+  );
+  assert.doesNotMatch(nativePicker, /ExecuteScript|PostWebMessageAsJson/);
+  assert.match(nativePicker, /add_WebMessageReceived/);
+  assert.match(nativePicker, /TryGetWebMessageAsString/);
+  assert.match(nativePicker, /decode_ui_pick_transport/);
+  assert.match(nativePicker, /__IHC_UI_PICK_V1__:/);
+  assert.match(nativePicker, /Page\.captureScreenshot/);
+  assert.match(nativePicker, /UNTRUSTED PAGE METADATA/);
+  assert.match(nativePicker, /terminal_platform::write_clipboard_text/);
+  assert.match(nativePicker, /format_ui_pick_clipboard_reference/);
+  assert.match(nativePicker, /Context file:/);
+  assert.match(nativePicker, /Requirement:/);
+  assert.match(nativePicker, /CAPTURE_COMMIT_LOCK/);
+  assert.match(nativePicker, /windows_capture_is_current/);
+  assert.match(nativePicker, /source_guard/);
+  assert.match(nativePicker, /spawn_blocking/);
+  assert.match(nativePicker, /set_query\(None\)/);
+  assert.match(nativePicker, /set_fragment\(None\)/);
+  assert.match(nativePicker, /percent_decode_for_classification/);
+  assert.match(nativePicker, /MAX_SCREENSHOT_BYTES/);
+  assert.match(nativePicker, /MAX_CAPTURE_WIDTH: f64 = 1600\.0/);
+  assert.match(nativePicker, /MAX_CAPTURE_HEIGHT: f64 = 1200\.0/);
+  assert.match(nativePicker, /create_new\(true\)/);
+  assert.match(nativePicker, /cleanup_capture_cache/);
+
+  assert.match(picker, /window\.addEventListener\("contextmenu"[\s\S]*\}, true\)/);
+  assert.match(picker, /event\.shiftKey \|\| !event\.isTrusted/);
+  assert.match(picker, /safeCall\(composedPath, event\)/);
+  assert.match(picker, /safeCall\(preventDefault, event\)/);
+  assert.match(picker, /safeCall\(stopImmediatePropagation, event\)/);
+  assert.match(picker, /input\[type="password"\]/);
+  assert.match(picker, /elementQuerySelector/);
+  assert.match(picker, /await new Promise\(\(resolve\) => nextFrame[\s\S]*await new Promise\(\(resolve\) => nextFrame/);
+  assert.match(picker, /generation !== captureGeneration/);
+  assert.match(picker, /Math\.min\(window\.innerWidth, 1600/);
+  assert.match(picker, /Math\.min\(window\.innerHeight, 1200/);
+  assert.match(picker, /data-ihc-ui-pick", "anchor"/);
+  assert.match(picker, /background-color/);
+  assert.match(picker, /messagePrefix = "__IHC_UI_PICK_V1__:"/);
+  assert.match(picker, /postMessage\(messagePrefix \+ JSON\.stringify\(message\)\)/);
+  assert.doesNotMatch(
+    picker,
+    /element\.value|localStorage|sessionStorage|document\.cookie|outerHTML|sourceHint|data-ihc-source/,
+  );
+  assert.doesNotMatch(picker, /createElement\("button"\)|data-ihc-ui-pick", "menu"|ihc-ui-pick-result/);
+
+  const capability = JSON.parse(capabilities);
+  assert.deepEqual(capability.webviews, ["main"]);
+  assert.doesNotMatch(capabilities, /ihc-browser/);
+  assert.match(main, /listen<BrowserUiPickResult>\(\s*"browser-ui-pick-result"/);
+  assert.match(main, /pane\.ownsWebviewLabel\(payload\.label\)/);
+  assert.match(main, /detectClipboardAgent\(\)/);
+  assert.match(
+    main,
+    /snapshot\.text\.startsWith\("\[IHATECODING UI PICK\]"\)[\s\S]*sanitizeUiPickClipboardText\(snapshot\.text\)/,
+  );
 });

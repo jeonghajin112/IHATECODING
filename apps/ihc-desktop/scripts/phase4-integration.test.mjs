@@ -124,11 +124,15 @@ test("project browser panes restore their saved title and last accepted address"
   );
   assert.match(
     main,
-    /await this\.syncBounds\(generation, webview\);[\s\S]*await this\.workspace\.watchBrowserWebviewUrl\(webview\.label\)/,
+    /await this\.syncBounds\(generation, webview\);[\s\S]*await this\.workspace\.watchBrowserWebviewUrl\(webview\.label, url\)/,
   );
   assert.match(
     main,
-    /browserUrlListenerReady = this\.installBrowserUrlSync\(\)[\s\S]*async watchBrowserWebviewUrl\(label: string\)[\s\S]*await invoke\("watch_browser_webview_url", \{ label \}\)/,
+    /browserUrlListenerReady = this\.installBrowserUrlSync\(\)[\s\S]*async watchBrowserWebviewUrl\(label: string, targetUrl: string\): Promise<boolean>[\s\S]*await invoke\("watch_browser_webview_url", \{ label, targetUrl \}\)[\s\S]*return listenerReady/,
+  );
+  assert.match(
+    main,
+    /Promise\.race\(\[[\s\S]*this\.browserUrlListenerReady[\s\S]*delay\(BROWSER_LISTENER_READY_TIMEOUT_MS\)\.then\(\(\) => false\)[\s\S]*await invoke\("watch_browser_webview_url"/,
   );
   assert.match(
     main,
@@ -160,7 +164,7 @@ test("project browser panes restore their saved title and last accepted address"
   );
   assert.match(
     main,
-    /watchBrowserWebviewUrl\(webview\.label\)[\s\S]*catch[\s\S]*urlSyncFallbackEnabled = true[\s\S]*scheduleUrlSyncFallback/,
+    /const urlEventsReady = await this\.workspace\.watchBrowserWebviewUrl\(webview\.label, url\)[\s\S]*!urlEventsReady[\s\S]*urlSyncFallbackEnabled = true[\s\S]*scheduleUrlSyncFallback/,
   );
   assert.match(
     main,

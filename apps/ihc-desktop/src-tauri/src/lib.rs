@@ -1,4 +1,5 @@
 mod agent_runtime;
+mod browser_ui_pick;
 mod codex_notify;
 mod grok_notify;
 mod legacy_import;
@@ -42,7 +43,8 @@ use tauri::{Emitter, EventTarget, Manager, State, Webview, ipc::Channel};
 use uuid::Uuid;
 #[cfg(windows)]
 use webview2_com::{
-    Microsoft::Web::WebView2::Win32::ICoreWebView2, SourceChangedEventHandler, take_pwstr,
+    CoTaskMemPWSTR, Microsoft::Web::WebView2::Win32::ICoreWebView2, SourceChangedEventHandler,
+    take_pwstr,
 };
 #[cfg(windows)]
 use windows_core::PWSTR;
@@ -62,7 +64,10 @@ const PHASE6_SMOKE_MARKER: &str = ".ihatecoding-phase6-root";
 const PRODUCTION_AGENT_BACKFILL_MARKER: &str = "productionAgentStateBackfillV1";
 const PRODUCTION_AGENT_BACKFILL_V2_MARKER: &str = "productionAgentStateBackfillV2";
 const BROWSER_WEBVIEW_URL_CHANGED_EVENT: &str = "browser-webview-url-changed";
+const BROWSER_WEBVIEW_PREPARED_EVENT: &str = "browser-webview-prepared";
 const MAX_BROWSER_WEBVIEW_URL_BYTES: usize = 16 * 1024;
+#[cfg(windows)]
+const BROWSER_WEBVIEW_PREPARE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct BrowserWebviewUrlChanged {
@@ -70,9 +75,19 @@ struct BrowserWebviewUrlChanged {
     url: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserWebviewPrepared {
+    label: String,
+    ok: bool,
+    ui_pick_available: bool,
+}
+
 #[derive(Default)]
 struct BrowserWebviewUrlWatchState {
-    registered_labels: Mutex<HashSet<String>>,
+    // true means the initial about:blank pane is still waiting to navigate.
+    // false keeps the URL watcher reservation after preparation completes.
+    registered_labels: Mutex<HashMap<String, bool>>,
 }
 
 impl BrowserWebviewUrlWatchState {
@@ -81,13 +96,31 @@ impl BrowserWebviewUrlWatchState {
             .registered_labels
             .lock()
             .map_err(|_| "The browser URL watcher registry is unavailable.".to_owned())?;
-        Ok(labels.insert(label.to_owned()))
+        if labels.contains_key(label) {
+            return Ok(false);
+        }
+        labels.insert(label.to_owned(), true);
+        Ok(true)
     }
 
     fn forget(&self, label: &str) {
         if let Ok(mut labels) = self.registered_labels.lock() {
             labels.remove(label);
         }
+    }
+
+    fn claim_preparation(&self, label: &str) -> bool {
+        let Ok(mut labels) = self.registered_labels.lock() else {
+            return false;
+        };
+        let Some(pending) = labels.get_mut(label) else {
+            return false;
+        };
+        if !*pending {
+            return false;
+        }
+        *pending = false;
+        true
     }
 }
 
@@ -118,11 +151,14 @@ fn watch_browser_webview_url(
     webview: Webview,
     state: State<'_, Arc<BrowserWebviewUrlWatchState>>,
     label: String,
+    target_url: String,
 ) -> Result<(), String> {
     ensure_agent_main_webview(&webview)?;
     if !is_browser_pane_webview_label(&label) {
         return Err("The web pane identifier is invalid.".to_owned());
     }
+    let target_url = safe_browser_webview_url_text(&target_url)
+        .ok_or_else(|| "The web pane address is invalid.".to_owned())?;
 
     let app = webview.app_handle().clone();
     let child = app
@@ -142,13 +178,17 @@ fn watch_browser_webview_url(
         let callback_label = label.clone();
         let callback_state = state.inner().clone();
         if let Err(error) = child.with_webview(move |platform_webview| {
-            if let Err(error) = install_windows_browser_url_watcher(
+            let result = install_windows_browser_url_watcher(
                 platform_webview,
-                callback_app,
+                callback_app.clone(),
+                callback_state.clone(),
                 callback_label.clone(),
-            ) {
+                target_url,
+            );
+            if let Err(error) = result {
+                eprintln!("failed to prepare browser webview for {callback_label}: {error}");
                 callback_state.forget(&callback_label);
-                eprintln!("failed to install browser URL watcher for {callback_label}: {error}");
+                let _ = emit_browser_webview_prepared(&callback_app, &callback_label, false, false);
             }
         }) {
             state.forget(&label);
@@ -161,7 +201,12 @@ fn watch_browser_webview_url(
         // SourceChanged is a WebView2 facility. Other platforms still receive
         // the current snapshot and may use the existing page-load fallback.
         state.forget(&label);
-        emit_current_browser_webview_url(&app, &child, &label)?;
+        let target = tauri::Url::parse(&target_url)
+            .map_err(|_| "The web pane address is invalid.".to_owned())?;
+        child
+            .navigate(target)
+            .map_err(|error| format!("Could not navigate the web pane: {error}"))?;
+        emit_browser_webview_prepared(&app, &label, true, false)?;
     }
 
     Ok(())
@@ -178,6 +223,7 @@ fn unwatch_browser_webview_url(
         return Err("The web pane identifier is invalid.".to_owned());
     }
     state.forget(&label);
+    browser_ui_pick::cancel_pending_capture();
     Ok(())
 }
 
@@ -229,11 +275,31 @@ fn emit_browser_webview_url_changed(
     .map_err(|error| format!("Could not publish the web pane address: {error}"))
 }
 
+fn emit_browser_webview_prepared(
+    app: &tauri::AppHandle,
+    label: &str,
+    ok: bool,
+    ui_pick_available: bool,
+) -> Result<(), String> {
+    app.emit_to(
+        EventTarget::webview(MAIN_WEBVIEW_LABEL),
+        BROWSER_WEBVIEW_PREPARED_EVENT,
+        BrowserWebviewPrepared {
+            label: label.to_owned(),
+            ok,
+            ui_pick_available,
+        },
+    )
+    .map_err(|error| format!("Could not publish the web pane status: {error}"))
+}
+
 #[cfg(windows)]
 fn install_windows_browser_url_watcher(
     platform_webview: tauri::webview::PlatformWebview,
     app: tauri::AppHandle,
+    state: Arc<BrowserWebviewUrlWatchState>,
     label: String,
+    target_url: String,
 ) -> Result<(), String> {
     let controller = platform_webview.controller();
     // SAFETY: Tauri invokes `with_webview` on the WebView2 UI thread and the
@@ -256,15 +322,83 @@ fn install_windows_browser_url_watcher(
     unsafe { core.add_SourceChanged(&handler, &mut token) }
         .map_err(|error| format!("Could not subscribe to WebView2 SourceChanged: {error}"))?;
 
-    // Subscribe first, then read Source. Since both operations execute on the
-    // WebView2 UI thread, a redirect cannot change Source between the snapshot
-    // and handler installation without producing an event.
-    if let Some(url) = read_windows_browser_webview_url(&core)
-        .map_err(|error| format!("Could not read the initial WebView2 address: {error}"))?
-    {
-        emit_browser_webview_url_changed(&app, &label, url)?;
-    }
+    // The child starts at about:blank. Schedule trusted document-created code,
+    // return to Tauri's event loop immediately, and navigate only from WebView2's
+    // asynchronous completion. Blocking this callback freezes restored layouts.
+    let completion_core = core.clone();
+    let completion_app = app.clone();
+    let completion_state = state.clone();
+    let completion_label = label.clone();
+    let completion_target_url = target_url.clone();
+    let timeout_app = completion_app.clone();
+    let timeout_label = completion_label.clone();
+    browser_ui_pick::install_windows_browser_ui_pick(&core, app, label, move |ui_pick_result| {
+        if !completion_state.claim_preparation(&completion_label) {
+            return;
+        }
+        let ui_pick_available = match ui_pick_result {
+            Ok(()) => true,
+            Err(error) => {
+                eprintln!(
+                    "failed to install browser element picker for {completion_label}: {error}"
+                );
+                false
+            }
+        };
+        let target_url = CoTaskMemPWSTR::from(completion_target_url.as_str());
+        // SAFETY: this completion runs on the WebView2 UI thread. The URL
+        // remains alive for the synchronous Navigate call and was validated
+        // before browser preparation was scheduled.
+        let navigation = unsafe { completion_core.Navigate(*target_url.as_ref().as_pcwstr()) };
+        let ok = navigation.is_ok();
+        if let Err(error) = navigation {
+            eprintln!("failed to navigate browser webview for {completion_label}: {error}");
+            completion_state.forget(&completion_label);
+        }
+        let _ = emit_browser_webview_prepared(
+            &completion_app,
+            &completion_label,
+            ok,
+            ok && ui_pick_available,
+        );
+    });
+    schedule_windows_browser_prepare_timeout(state, timeout_app, timeout_label, target_url);
     Ok(())
+}
+
+#[cfg(windows)]
+fn schedule_windows_browser_prepare_timeout(
+    state: Arc<BrowserWebviewUrlWatchState>,
+    app: tauri::AppHandle,
+    label: String,
+    target_url: String,
+) {
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(BROWSER_WEBVIEW_PREPARE_TIMEOUT).await;
+        if !state.claim_preparation(&label) {
+            return;
+        }
+        let navigation = app
+            .get_webview(&label)
+            .ok_or_else(|| "The web pane no longer exists.".to_owned())
+            .and_then(|webview| {
+                let target = tauri::Url::parse(&target_url)
+                    .map_err(|_| "The web pane address is invalid.".to_owned())?;
+                webview
+                    .navigate(target)
+                    .map_err(|error| format!("Could not navigate the web pane: {error}"))
+            });
+        let ok = navigation.is_ok();
+        if let Err(error) = navigation {
+            eprintln!("browser preparation timed out and fallback failed for {label}: {error}");
+            state.forget(&label);
+        } else {
+            eprintln!(
+                "browser UI Pick preparation timed out for {label}; continued without UI Pick"
+            );
+        }
+        let _ = emit_browser_webview_prepared(&app, &label, ok, false);
+    });
 }
 
 #[cfg(windows)]
@@ -351,8 +485,11 @@ mod browser_webview_label_tests {
     fn browser_webview_url_watcher_reservation_is_idempotent() {
         let state = BrowserWebviewUrlWatchState::default();
         assert_eq!(state.reserve("ihc-browser-1-1"), Ok(true));
+        assert!(state.claim_preparation("ihc-browser-1-1"));
+        assert!(!state.claim_preparation("ihc-browser-1-1"));
         assert_eq!(state.reserve("ihc-browser-1-1"), Ok(false));
         state.forget("ihc-browser-1-1");
+        assert!(!state.claim_preparation("ihc-browser-1-1"));
         assert_eq!(state.reserve("ihc-browser-1-1"), Ok(true));
     }
 }
@@ -2018,6 +2155,12 @@ pub fn run() {
             app.manage(Arc::new(phone_notification_service));
             app.manage(Arc::new(legacy_import_service));
             app.manage(Arc::new(production_import_service));
+
+            // UI Pick captures are short-lived local working files. Best-effort
+            // cleanup at startup prevents abandoned captures from accumulating.
+            if let Err(error) = browser_ui_pick::cleanup_capture_cache(app.handle()) {
+                eprintln!("failed to clean browser element captures: {error}");
+            }
 
             let main_config = app
                 .config()
