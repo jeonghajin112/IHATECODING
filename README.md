@@ -4,7 +4,7 @@ The AI Workspace for autonomous development.
 
 ## Features
 
-- Project-based workspaces with up to 20 PowerShell panes per project
+- Project-based workspaces without a fixed per-project PowerShell pane cap
 - Persistent pane layouts and automatic workspace restoration after a restart
 - Safe continuation of saved Codex conversations and Grok sessions
 - Tabs that can host project workspaces, terminal panes, or embedded web panels
@@ -30,7 +30,7 @@ Terminal panes use Windows PowerShell 5.1 through ConPTY.
 From PowerShell:
 
 ```powershell
-cd .\rust\apps\ihc-desktop
+cd .\apps\ihc-desktop
 $env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path"
 npm ci
 npm run tauri dev
@@ -50,8 +50,8 @@ The script restores locked frontend dependencies, runs the frontend and Rust tes
 
 Build outputs are written to:
 
-- `rust\apps\ihc-desktop\src-tauri\target\release\ihatecoding.exe`
-- `rust\apps\ihc-desktop\src-tauri\target\release\bundle\nsis\`
+- `apps\ihc-desktop\src-tauri\target\release\ihatecoding.exe`
+- `apps\ihc-desktop\src-tauri\target\release\bundle\nsis\`
 
 To build only the executable:
 
@@ -74,7 +74,7 @@ Unsigned cutover is blocked by default. `-AllowUnsignedLocalCutover` exists only
 ## Verify
 
 ```powershell
-cd .\rust\apps\ihc-desktop
+cd .\apps\ihc-desktop
 npm ci
 npm test
 npm run build

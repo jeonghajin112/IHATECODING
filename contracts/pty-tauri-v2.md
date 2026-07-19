@@ -1,8 +1,7 @@
-# Rust Tauri terminal protocol v2
+# Tauri terminal protocol v2
 
-This contract is the Phase 2 boundary between the privileged local WebView and
-the Rust ConPTY engine. It does not replace the frozen C# Node broker v1
-contract in `pty-v1.md`.
+This contract defines the boundary between the privileged local WebView and
+the Rust ConPTY engine.
 
 All JavaScript field names are camelCase. A session ID is an opaque string and
 must be routed to exactly one terminal pane.
@@ -30,7 +29,7 @@ must be routed to exactly one terminal pane.
 - `terminal_engine_status()`
   - reports lifecycle, output-budget, resize, and spawn-limit counters
 - `phase2_initial_panes()`
-  - preview-only benchmark pane count, clamped to `1..20`; this hook does not
+  - compatibility benchmark pane count, clamped to `1..20`; this hook does not
     define production workspace capacity
 
 ## Events
@@ -64,6 +63,6 @@ error for that pane.
 - Process exit waits up to three seconds for output drain, then closes flow
   control and reports a terminal error before completing shutdown.
 
-The `IHC_PHASE2_INITIAL_PANES` environment variable is a preview test hook only.
-The Phase 2 engine does not read the production project catalog or Codex/Grok
-session data.
+The `IHC_PHASE2_INITIAL_PANES` environment variable is a compatibility test hook only.
+The terminal engine does not read project catalog or Codex/Grok session data through
+this hook.

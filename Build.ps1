@@ -20,7 +20,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$desktop = Join-Path $PSScriptRoot 'rust\apps\ihc-desktop'
+$desktop = Join-Path $PSScriptRoot 'apps\ihc-desktop'
 $cargoBin = Join-Path $env:USERPROFILE '.cargo\bin'
 $defaultReleaseExecutable = Join-Path $desktop 'src-tauri\target\release\ihatecoding.exe'
 $releaseExecutable = $defaultReleaseExecutable

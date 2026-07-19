@@ -12,7 +12,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  DESKTOP_DIR: rust/apps/ihc-desktop
+  DESKTOP_DIR: apps/ihc-desktop
   CARGO_TERM_COLOR: always
 
 jobs:
@@ -30,7 +30,7 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: rust/apps/ihc-desktop/package-lock.json
+          cache-dependency-path: apps/ihc-desktop/package-lock.json
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -40,7 +40,7 @@ jobs:
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: rust/apps/ihc-desktop/src-tauri
+          workspaces: apps/ihc-desktop/src-tauri
 
       - name: Install frontend dependencies
         working-directory: ${{ env.DESKTOP_DIR }}
@@ -74,8 +74,8 @@ jobs:
           if-no-files-found: error
           retention-days: 7
           path: |
-            rust/apps/ihc-desktop/src-tauri/target/release/ihatecoding.exe
-            rust/apps/ihc-desktop/src-tauri/target/release/bundle/**
+            apps/ihc-desktop/src-tauri/target/release/ihatecoding.exe
+            apps/ihc-desktop/src-tauri/target/release/bundle/**
 
   build-signed-candidate:
     name: Build manually requested signed candidate
@@ -109,7 +109,7 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: rust/apps/ihc-desktop/package-lock.json
+          cache-dependency-path: apps/ihc-desktop/package-lock.json
 
       - name: Install Rust
         if: steps.signing.outputs.enabled == 'true'
@@ -119,7 +119,7 @@ jobs:
         if: steps.signing.outputs.enabled == 'true'
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: rust/apps/ihc-desktop/src-tauri
+          workspaces: apps/ihc-desktop/src-tauri
 
       - name: Install frontend dependencies
         if: steps.signing.outputs.enabled == 'true'
@@ -170,7 +170,7 @@ jobs:
         if: steps.signing.outputs.enabled == 'true'
         shell: pwsh
         run: |
-          $release = 'rust/apps/ihc-desktop/src-tauri/target/release'
+          $release = 'apps/ihc-desktop/src-tauri/target/release'
           $candidates = @(
             Get-Item -LiteralPath "$release/ihatecoding.exe"
             Get-ChildItem -LiteralPath "$release/bundle" -Recurse -File |
@@ -196,8 +196,8 @@ jobs:
           if-no-files-found: error
           retention-days: 7
           path: |
-            rust/apps/ihc-desktop/src-tauri/target/release/ihatecoding.exe
-            rust/apps/ihc-desktop/src-tauri/target/release/bundle/**
+            apps/ihc-desktop/src-tauri/target/release/ihatecoding.exe
+            apps/ihc-desktop/src-tauri/target/release/bundle/**
 
       - name: Remove temporary certificate material
         if: always() && steps.signing.outputs.enabled == 'true'

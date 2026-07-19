@@ -138,7 +138,7 @@ pub(crate) fn ensure_configured() -> Result<(), String> {
 
 fn configuration_executable(current_executable: &Path) -> PathBuf {
     let manifest_directory = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let Some(workspace_root) = manifest_directory.ancestors().nth(4) else {
+    let Some(workspace_root) = manifest_directory.ancestors().nth(3) else {
         return current_executable.to_path_buf();
     };
     select_configuration_executable(
@@ -1232,7 +1232,6 @@ mod tests {
     fn workspace_debug_and_release_artifacts_select_the_stable_root_executable() {
         let workspace = PathBuf::from("workspace-root");
         let target = workspace
-            .join("rust")
             .join("apps")
             .join("ihc-desktop")
             .join("src-tauri")
@@ -1252,7 +1251,6 @@ mod tests {
     fn root_and_installed_executables_remain_their_own_configuration_target() {
         let workspace = PathBuf::from("workspace-root");
         let target = workspace
-            .join("rust")
             .join("apps")
             .join("ihc-desktop")
             .join("src-tauri")
