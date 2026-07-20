@@ -107,6 +107,18 @@ test("project browser panes restore their saved title and last accepted address"
   );
   assert.match(main, /start\(\) \{[\s\S]*this\.navigate\(this\.address\.value, false\)/);
   assert.match(
+    core,
+    /isLoopbackBrowserUrl[\s\S]*hostname === "localhost"[\s\S]*Number\(octets\[0\]\) === 127/,
+  );
+  assert.match(
+    main,
+    /replaceWebview\(url: string\)[\s\S]*isLoopbackBrowserUrl\(url\)[\s\S]*invoke<boolean>\("probe_loopback_browser_endpoint", \{ url \}\)[\s\S]*scheduleLocalBrowserRetry\(request\)/,
+  );
+  assert.match(
+    main,
+    /setLayoutVisible\(visible: boolean\)[\s\S]*clearLocalRetryTimer\(\)[\s\S]*scheduleLocalBrowserRetry\(this\.localRetryRequest, 0\)/,
+  );
+  assert.match(
     main,
     /for \(const browser of projectBrowserPanes\(project\)\)[\s\S]*this\.addBrowserPane\(project\.id, browser, false\)/,
   );
@@ -188,8 +200,9 @@ test("project browser panes restore their saved title and last accepted address"
   );
   assert.match(
     backend,
-    /read_provider_usage,[\s\S]*read_browser_webview_url,[\s\S]*watch_browser_webview_url,/,
+    /async fn probe_loopback_browser_endpoint[\s\S]*ensure_agent_main_webview[\s\S]*spawn_blocking[\s\S]*probe_loopback_browser_addresses/,
   );
+  assert.match(backend, /probe_loopback_browser_endpoint,/);
 });
 
 test("pane title editing opens immediately and survives transient catalog writes", async () => {
@@ -356,7 +369,24 @@ test("manual tabs, compact project creation, and the mixed pane launcher are wir
     html,
     /class="project-section-heading"[\s\S]*id="toggle-project-list"[\s\S]*aria-controls="project-list"[\s\S]*id="create-project"[\s\S]*id="project-list"/,
   );
-  assert.match(html, /id="pane-launcher-menu"[\s\S]*id="add-powershell-pane"[\s\S]*id="add-browser-pane"/);
+  assert.match(
+    html,
+    /id="pane-launcher-menu"[\s\S]*id="add-powershell-pane"[\s\S]*id="add-codex-pane"[\s\S]*id="add-grok-pane"[\s\S]*id="add-claude-code-pane"[\s\S]*id="add-opencode-pane"[\s\S]*id="add-browser-pane"/,
+  );
+  const launcherStart = html.indexOf('id="pane-launcher-menu"');
+  const launcherEnd = html.indexOf("</div>", launcherStart);
+  assert.ok(launcherStart >= 0 && launcherEnd > launcherStart);
+  const launcher = html.slice(launcherStart, launcherEnd);
+  assert.doesNotMatch(
+    launcher,
+    /<small|AI coding CLI|AI 코딩 CLI|New terminal|새 터미널|Split pane|분할 화면/,
+  );
+  for (const icon of ["powershell", "codex", "grok", "claude-code", "opencode", "browser"]) {
+    assert.match(
+      html,
+      new RegExp(`class="pane-launcher-icon"[\\s\\S]*?src="/assets/provider-icons/${icon}\\.svg"`),
+    );
+  }
   assert.match(styles, /\.create-project\s*\{[\s\S]*width:\s*27px;[\s\S]*height:\s*27px/);
   assert.match(styles, /\.project-list-toggle\[aria-expanded="false"\] \.project-list-chevron/);
   assert.match(
@@ -448,6 +478,14 @@ test("manual tabs, compact project creation, and the mixed pane launcher are wir
   assert.match(sidebar, /button\.append\(name\)/);
   assert.doesNotMatch(sidebar, /folderPath|createElement\("small"\)/);
   assert.match(main, /class PaneLauncherController/);
+  assert.match(main, /controller\?\.addTerminal\("codex"\)/);
+  assert.match(main, /controller\?\.addTerminal\("grok"\)/);
+  assert.match(main, /controller\?\.addTerminal\("claude"\)/);
+  assert.match(main, /controller\?\.addTerminal\("opencode"\)/);
+  assert.match(
+    controller,
+    /async addTerminal\([\s\S]*launchProfile[\s\S]*createWorkspaceTerminal\([\s\S]*nextWorkspacePaneName\(project, launchProfile\)[\s\S]*launchProfile/,
+  );
   assert.match(main, /class BrowserPane[\s\S]*new Webview\(getCurrentWindow\(\), label/);
   assert.match(
     cargo,
@@ -464,16 +502,17 @@ test("manual tabs, compact project creation, and the mixed pane launcher are wir
   );
 });
 
-test("settings expose localized General, Optimization, and Notifications tabs", async () => {
-  const [html, styles] = await Promise.all([
+test("settings expose localized General, Optimization, Agents, and Notifications tabs", async () => {
+  const [html, styles, main] = await Promise.all([
     source("index.html"),
     source("src/styles.css"),
+    source("src/main.ts"),
   ]);
 
   assert.match(html, /<html lang="en">/);
   assert.match(
     html,
-    /class="settings-tabs"[\s\S]*role="tablist"[\s\S]*id="settings-general-tab"[\s\S]*aria-controls="settings-general-panel"[\s\S]*aria-selected="true"[\s\S]*id="settings-optimization-tab"[\s\S]*aria-controls="settings-optimization-panel"[\s\S]*aria-selected="false"[\s\S]*id="settings-notifications-tab"[\s\S]*aria-controls="settings-notifications-panel"[\s\S]*aria-selected="false"/,
+    /class="settings-tabs"[\s\S]*role="tablist"[\s\S]*id="settings-general-tab"[\s\S]*aria-controls="settings-general-panel"[\s\S]*aria-selected="true"[\s\S]*id="settings-optimization-tab"[\s\S]*aria-controls="settings-optimization-panel"[\s\S]*aria-selected="false"[\s\S]*id="settings-agents-tab"[\s\S]*aria-controls="settings-agents-panel"[\s\S]*aria-selected="false"[\s\S]*id="settings-notifications-tab"[\s\S]*aria-controls="settings-notifications-panel"[\s\S]*aria-selected="false"/,
   );
   assert.match(
     html,
@@ -487,6 +526,13 @@ test("settings expose localized General, Optimization, and Notifications tabs", 
     html,
     /id="auto-sleep-idle-agents"[\s\S]*role="switch"[\s\S]*class="settings-switch-track"[\s\S]*class="settings-switch-thumb"/,
   );
+  assert.match(
+    html,
+    /id="settings-agents-panel"[\s\S]*aria-labelledby="settings-agents-tab"[\s\S]*aria-busy="false"[\s\S]*id="refresh-agent-connections"[\s\S]*data-agent-provider="codex"[\s\S]*data-agent-provider="grok"[\s\S]*data-agent-provider="claudeCode"[\s\S]*data-agent-provider="openCode"/,
+  );
+  for (const icon of ["codex", "grok", "claude-code", "opencode"]) {
+    assert.match(html, new RegExp(`src="/assets/provider-icons/${icon}\\.svg"`));
+  }
   assert.match(
     html,
     /id="settings-notifications-panel"[\s\S]*role="tabpanel"[\s\S]*aria-labelledby="settings-notifications-tab"[\s\S]*hidden[\s\S]*id="discord-notification-settings-title"[\s\S]*id="phone-notification-webhook"/,
@@ -515,12 +561,31 @@ test("settings expose localized General, Optimization, and Notifications tabs", 
   assert.match(styles, /\.settings-panel\[hidden\]\s*\{[\s\S]*display:\s*none/);
   assert.match(
     styles,
+    /\.agent-connection-row\s*\{[\s\S]*grid-template-columns:[\s\S]*\.agent-connections-status\[data-tone="error"\]/,
+  );
+  assert.match(
+    styles,
     /\.settings-switch-track\s*\{[\s\S]*border-radius:\s*999px[\s\S]*\.settings-switch > input:checked \+ \.settings-switch-track[\s\S]*\.settings-switch-thumb[\s\S]*transform:\s*translateX\(14px\)/,
   );
   assert.match(
     styles,
     /@media \(max-width:\s*620px\)[\s\S]*\.settings-layout\s*\{[\s\S]*grid-template-columns:\s*minmax\(0, 1fr\)/,
   );
+  assert.match(main, /invoke<unknown>\("read_agent_cli_statuses"\)/);
+  assert.match(
+    main,
+    /const generation = \+\+this\.requestGeneration;[\s\S]*generation !== this\.requestGeneration/,
+  );
+  assert.match(
+    main,
+    /typeof candidate\.installed !== "boolean"[\s\S]*!isAgentAuthenticationState\(candidate\.status\)[\s\S]*statuses\.has\(candidate\.provider\)/,
+  );
+  assert.match(main, /this\.panel\.setAttribute\("aria-busy", String\(this\.refreshing\)\)/);
+  assert.match(
+    main,
+    /await this\.openAgent\(row\.launchProfile\);[\s\S]*this\.dialog\.close\(\)/,
+  );
+  assert.match(main, /controller\.addTerminal\(launchProfile\)/);
 });
 
 test("queued starts dynamically favor the project currently on screen", async () => {

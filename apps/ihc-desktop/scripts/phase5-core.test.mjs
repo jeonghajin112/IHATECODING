@@ -509,6 +509,8 @@ test("usage normalization computes remaining percentages and clamps provider dri
       },
       updatedAt: null,
     },
+    claudeCode: { fiveHour: null, weekly: null, updatedAt: null },
+    openCode: { fiveHour: null, weekly: null, updatedAt: null },
     readAt: "2026-07-17T04:00:10.123Z",
   };
   const normalized = core.normalizeProviderUsageResponse(raw);
@@ -598,6 +600,8 @@ test("next usage reset delay selects the nearest future limit across providers",
       },
       updatedAt: "2026-07-17T04:00:00Z",
     },
+    claudeCode: { fiveHour: null, weekly: null, updatedAt: null },
+    openCode: { fiveHour: null, weekly: null, updatedAt: null },
     readAt: "2026-07-17T04:00:00Z",
   });
 
@@ -630,6 +634,8 @@ test("next usage reset delay ignores missing and elapsed limits", () => {
       },
       updatedAt: "2026-07-16T23:00:00Z",
     },
+    claudeCode: { fiveHour: null, weekly: null, updatedAt: null },
+    openCode: { fiveHour: null, weekly: null, updatedAt: null },
     readAt: "2026-07-17T04:00:00Z",
   });
 
@@ -640,6 +646,8 @@ test("next usage reset delay rejects non-finite current times", () => {
   const usage = core.normalizeProviderUsageResponse({
     codex: { fiveHour: null, weekly: null, updatedAt: null },
     grok: { fiveHour: null, weekly: null, updatedAt: null },
+    claudeCode: { fiveHour: null, weekly: null, updatedAt: null },
+    openCode: { fiveHour: null, weekly: null, updatedAt: null },
     readAt: "2026-07-17T04:00:00Z",
   });
 
@@ -655,6 +663,8 @@ test("usage boundaries reject malformed numbers, windows, and timestamps", () =>
   const valid = {
     codex: { fiveHour: null, weekly: null, updatedAt: null },
     grok: { fiveHour: null, weekly: null, updatedAt: null },
+    claudeCode: { fiveHour: null, weekly: null, updatedAt: null },
+    openCode: { fiveHour: null, weekly: null, updatedAt: null },
     readAt: "2026-07-17T04:00:00Z",
   };
   const limit = {
@@ -1194,6 +1204,89 @@ test("foreground synchronous refresh is burst-aware and rate-limited", () => {
     ),
     true,
   );
+});
+
+test("remaining usage tone follows the inclusive warning thresholds", () => {
+  for (const [remaining, expected] of [
+    [100, "normal"],
+    [51, "normal"],
+    [50, "yellow"],
+    [31, "yellow"],
+    [30, "orange"],
+    [11, "orange"],
+    [10, "red"],
+    [0, "red"],
+  ]) {
+    assert.equal(core.providerUsageRemainingTone(remaining), expected);
+  }
+});
+
+test("Ctrl+A plans exactly the current single-row editable terminal input", () => {
+  assert.deepEqual(
+    core.planEditableTerminalSelectAll({
+      row: 42,
+      anchorColumn: 12,
+      cursorColumn: 19,
+      lineEndColumn: 24,
+    }),
+    { row: 42, startColumn: 12, endColumn: 24 },
+  );
+  assert.equal(
+    core.planEditableTerminalSelectAll({
+      row: 42,
+      anchorColumn: 12,
+      cursorColumn: 12,
+      lineEndColumn: 12,
+    }),
+    null,
+  );
+  assert.equal(
+    core.planEditableTerminalSelectAll({
+      row: 42,
+      anchorColumn: 12,
+      cursorColumn: 11,
+      lineEndColumn: 24,
+    }),
+    null,
+  );
+});
+
+test("Backspace deletion rejects output, cross-row, and stale terminal selections", () => {
+  const line = {
+    row: 42,
+    anchorColumn: 12,
+    cursorColumn: 19,
+    lineEndColumn: 24,
+  };
+  assert.deepEqual(
+    core.planEditableTerminalSelectionDelete(line, {
+      start: { x: 14, y: 42 },
+      end: { x: 20, y: 42 },
+    }),
+    { row: 42, startColumn: 14, endColumn: 20 },
+  );
+  assert.equal(
+    core.planEditableTerminalSelectionDelete(line, {
+      start: { x: 2, y: 42 },
+      end: { x: 10, y: 42 },
+    }),
+    null,
+  );
+  assert.equal(
+    core.planEditableTerminalSelectionDelete(line, {
+      start: { x: 14, y: 41 },
+      end: { x: 20, y: 42 },
+    }),
+    null,
+  );
+  assert.equal(
+    core.planEditableTerminalSelectionDelete(line, {
+      start: { x: 14, y: 42 },
+      end: { x: 25, y: 42 },
+    }),
+    null,
+  );
+  assert.equal(core.planEditableTerminalSelectionDelete(line, undefined), null);
 });
 
 test("terminal launch controls are detected across native output batch boundaries", () => {

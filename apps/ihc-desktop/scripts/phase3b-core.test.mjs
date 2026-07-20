@@ -184,6 +184,37 @@ test("canonical v1 load preserves unknown fields, order, layout, and clone isola
   assert.deepEqual(core.normalizeWorkspaceState(state), state);
 });
 
+test("terminal launch profiles survive canonical normalization and cloning", () => {
+  const source = workspace({
+    projects: [
+      project("project-a", {
+        terminals: [
+          terminal("terminal-claude", {
+            legacyExtensions: {
+              terminalLegacy: { order: 1 },
+              launchProfileV1: "claude",
+            },
+          }),
+          terminal("terminal-opencode", {
+            name: "OPEN",
+            codexThreadId: null,
+            legacyExtensions: { launchProfileV1: "opencode" },
+          }),
+        ],
+      }),
+    ],
+  });
+  const normalized = core.normalizeWorkspaceState(source);
+  const cloned = core.cloneWorkspaceState(normalized);
+  assert.equal(cloned.projects[0].terminals[0].legacyExtensions.launchProfileV1, "claude");
+  assert.equal(cloned.projects[0].terminals[1].legacyExtensions.launchProfileV1, "opencode");
+  cloned.projects[0].terminals[0].legacyExtensions.launchProfileV1 = "powershell";
+  assert.equal(
+    normalized.projects[0].terminals[0].legacyExtensions.launchProfileV1,
+    "claude",
+  );
+});
+
 test("project modification timestamps normalize legacy absence and reject invalid values", () => {
   const legacy = core.normalizeWorkspaceState(workspace());
   assert.equal(legacy.projects[0].lastModifiedAtUtc, null);

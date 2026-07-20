@@ -8,16 +8,21 @@ use std::{
     collections::{BTreeMap, HashSet},
     env,
     ffi::OsString,
-    fs::{self, File, OpenOptions},
-    io::{self, Read, Write},
+    fs, io,
     path::{Component, Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
 };
+#[cfg(test)]
+use std::{
+    fs::{File, OpenOptions},
+    io::{Read, Write},
+};
+#[cfg(test)]
 use uuid::Uuid;
 
-#[cfg(windows)]
+#[cfg(all(windows, test))]
 use std::os::windows::ffi::OsStrExt;
-#[cfg(windows)]
+#[cfg(all(windows, test))]
 use windows_sys::Win32::Storage::FileSystem::{
     MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
 };
@@ -27,6 +32,7 @@ pub(crate) const PREVIEW_PROJECTS_DIR_ENV: &str = "IHATECODING_RUST_PREVIEW_PROJ
 
 const CATALOG_FILE_NAME: &str = "projects-v1.json";
 const CSHARP_PROJECTS_PATH_ENV: &str = "POWERWORKSPACE_PROJECTS_PATH";
+#[cfg(test)]
 const MAX_CATALOG_BYTES: u64 = 16 * 1024 * 1024;
 const BACKUP_COUNT: usize = 3;
 
@@ -37,6 +43,7 @@ pub(crate) struct RequiredNullableString {
 }
 
 impl RequiredNullableString {
+    #[cfg(test)]
     fn present(value: Option<String>) -> Self {
         Self {
             value,
@@ -89,6 +96,7 @@ pub(crate) struct ProjectCatalogV1 {
 }
 
 impl ProjectCatalogV1 {
+    #[cfg(test)]
     fn empty() -> Self {
         Self {
             projects: Vec::new(),
@@ -100,6 +108,7 @@ impl ProjectCatalogV1 {
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg(test)]
 pub(crate) struct LoadProjectCatalogResponse {
     pub(crate) catalog: ProjectCatalogV1,
     pub(crate) recovery_required: bool,
@@ -152,6 +161,7 @@ pub(crate) struct SavedTerminalStateV1 {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg(test)]
 pub(crate) struct InspectProjectCatalogCopyRequest {
     pub(crate) source_path: String,
     pub(crate) source_is_detached_copy: bool,
@@ -159,6 +169,7 @@ pub(crate) struct InspectProjectCatalogCopyRequest {
 
 struct ProjectStoreInner {
     directory: PathBuf,
+    #[cfg(test)]
     blocked_import_paths: Vec<PathBuf>,
     path_probe: Arc<dyn PathProbe>,
     operation_lock: Mutex<()>,
@@ -331,9 +342,12 @@ impl ProjectStore {
         blocked_import_paths: Vec<PathBuf>,
         path_probe: Arc<dyn PathProbe>,
     ) -> Self {
+        #[cfg(not(test))]
+        drop(blocked_import_paths);
         Self {
             inner: Arc::new(ProjectStoreInner {
                 directory,
+                #[cfg(test)]
                 blocked_import_paths,
                 path_probe,
                 operation_lock: Mutex::new(()),
@@ -341,6 +355,7 @@ impl ProjectStore {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn load(&self) -> Result<LoadProjectCatalogResponse, String> {
         let _operation = self.lock()?;
         let primary = self.catalog_path();
@@ -382,6 +397,7 @@ impl ProjectStore {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn save(&self, mut catalog: ProjectCatalogV1) -> Result<(), String> {
         validate_catalog(&catalog)?;
         let _operation = self.lock()?;
@@ -412,6 +428,7 @@ impl ProjectStore {
         durable_atomic_write(&primary, &serialized, "preview catalog")
     }
 
+    #[cfg(test)]
     pub(crate) fn inspect_copy(
         &self,
         request: InspectProjectCatalogCopyRequest,
@@ -443,6 +460,7 @@ impl ProjectStore {
         read_and_parse_catalog(&canonical_source, "supplied catalog copy")
     }
 
+    #[cfg(test)]
     pub(crate) fn recover_verified_backup(&self) -> Result<ProjectCatalogV1, String> {
         let _operation = self.lock()?;
         let primary = self.catalog_path();
@@ -475,6 +493,7 @@ impl ProjectStore {
         Ok(catalog)
     }
 
+    #[cfg(test)]
     pub(crate) fn reset_corrupt(&self, confirmed: bool) -> Result<ProjectCatalogV1, String> {
         if !confirmed {
             return Err("Corrupt catalog reset requires explicit confirmation.".to_owned());
@@ -500,6 +519,7 @@ impl ProjectStore {
         Ok(empty)
     }
 
+    #[cfg(test)]
     fn lock(&self) -> Result<MutexGuard<'_, ()>, String> {
         self.inner
             .operation_lock
@@ -534,6 +554,7 @@ impl ProjectStore {
         Ok(false)
     }
 
+    #[cfg(test)]
     fn first_verified_backup(&self) -> Result<Option<(PathBuf, ProjectCatalogV1)>, String> {
         for index in 1..=BACKUP_COUNT {
             let backup = self.backup_path(index);
@@ -547,6 +568,7 @@ impl ProjectStore {
         Ok(None)
     }
 
+    #[cfg(test)]
     fn rotate_backups(&self, current_bytes: &[u8]) -> Result<(), String> {
         let oldest = self.backup_path(BACKUP_COUNT);
         if self.path_exists(&oldest, "the oldest preview backup")? {
@@ -562,6 +584,7 @@ impl ProjectStore {
         durable_atomic_write(&self.backup_path(1), current_bytes, "preview backup")
     }
 
+    #[cfg(test)]
     fn quarantine_primary(&self) -> Result<(), String> {
         let quarantine = self.inner.directory.join(format!(
             "projects-v1.corrupt-{}.json",
@@ -626,6 +649,7 @@ fn validate_preview_path_isolation(
     Ok(())
 }
 
+#[cfg(test)]
 fn merge_preserved_extras(incoming: &mut ProjectCatalogV1, existing: &ProjectCatalogV1) {
     incoming.extra.extend(existing.extra.clone());
     for incoming_project in &mut incoming.projects {
@@ -828,6 +852,7 @@ fn days_in_month(year: u32, month: u32) -> u32 {
     }
 }
 
+#[cfg(test)]
 fn serialize_catalog(catalog: &ProjectCatalogV1) -> Result<Vec<u8>, String> {
     validate_catalog(catalog)?;
     let mut bytes = serde_json::to_vec_pretty(catalog)
@@ -853,11 +878,13 @@ fn is_lower_hex_sha256(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+#[cfg(test)]
 fn read_and_parse_catalog(path: &Path, context: &str) -> Result<ProjectCatalogV1, String> {
     let bytes = read_file_limited(path, context)?;
     parse_catalog_bytes(&bytes)
 }
 
+#[cfg(test)]
 fn read_file_limited(path: &Path, context: &str) -> Result<Vec<u8>, String> {
     let file = File::open(path).map_err(|error| format!("Could not read {context}: {error}"))?;
     let mut bytes = Vec::new();
@@ -870,6 +897,7 @@ fn read_file_limited(path: &Path, context: &str) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
+#[cfg(test)]
 fn durable_atomic_write(path: &Path, bytes: &[u8], context: &str) -> Result<(), String> {
     let parent = path
         .parent()
@@ -896,14 +924,17 @@ fn durable_atomic_write(path: &Path, bytes: &[u8], context: &str) -> Result<(), 
     sync_parent_directory(parent, context)
 }
 
+#[cfg(test)]
 struct TemporaryFileGuard(PathBuf);
 
+#[cfg(test)]
 impl TemporaryFileGuard {
     fn disarm(mut self) {
         self.0.clear();
     }
 }
 
+#[cfg(test)]
 impl Drop for TemporaryFileGuard {
     fn drop(&mut self) {
         if !self.0.as_os_str().is_empty() {
@@ -912,6 +943,7 @@ impl Drop for TemporaryFileGuard {
     }
 }
 
+#[cfg(test)]
 fn durable_copy_create_new(source: &Path, destination: &Path) -> Result<(), String> {
     let mut source_file = File::open(source)
         .map_err(|error| format!("Could not read the corrupt preview catalog: {error}"))?;
@@ -927,7 +959,7 @@ fn durable_copy_create_new(source: &Path, destination: &Path) -> Result<(), Stri
         .map_err(|error| format!("Could not flush the corrupt catalog quarantine: {error}"))
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, test))]
 fn atomic_move(source: &Path, destination: &Path, context: &str) -> Result<(), String> {
     let source_wide = source
         .as_os_str()
@@ -956,19 +988,19 @@ fn atomic_move(source: &Path, destination: &Path, context: &str) -> Result<(), S
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), test))]
 fn atomic_move(source: &Path, destination: &Path, context: &str) -> Result<(), String> {
     fs::rename(source, destination)
         .map_err(|error| format!("Could not atomically replace the {context}: {error}"))
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, test))]
 fn sync_parent_directory(_directory: &Path, _context: &str) -> Result<(), String> {
     // MOVEFILE_WRITE_THROUGH provides the Windows durability barrier for the rename.
     Ok(())
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), test))]
 fn sync_parent_directory(directory: &Path, context: &str) -> Result<(), String> {
     File::open(directory)
         .and_then(|directory| directory.sync_all())

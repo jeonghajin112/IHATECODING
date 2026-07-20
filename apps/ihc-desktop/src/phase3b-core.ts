@@ -2,7 +2,6 @@ export const WORKSPACE_SCHEMA_VERSION = 1;
 export const MAX_WORKSPACE_PROJECTS = 256;
 export const MAX_WORKSPACE_TABS = 128;
 export const MAX_OPAQUE_ID_BYTES = 256;
-export const MAX_OPAQUE_ID_LENGTH = MAX_OPAQUE_ID_BYTES;
 export const MAX_WORKSPACE_NAME_BYTES = 4 * 1024;
 export const MAX_WORKSPACE_PATH_BYTES = 32 * 1024;
 export const MAX_BROWSER_URL_BYTES = 16 * 1024;
@@ -614,17 +613,6 @@ export function normalizeSaveWorkspaceResponse(value: unknown): SaveWorkspaceRes
     revision: requireRevision(response.revision, "/revision"),
     writtenAtUtc: requireRfc3339(response.writtenAtUtc, "/writtenAtUtc"),
   };
-}
-
-export function selectActiveWorkspaceTab(
-  state: WorkspaceState,
-  tabId: string,
-): WorkspaceState {
-  const normalized = normalizeWorkspaceState(state);
-  if (!normalized.tabs.some((tab) => tab.id === tabId)) {
-    throw new Error("The requested workspace tab does not exist.");
-  }
-  return { ...normalized, activeTabId: tabId };
 }
 
 export function setTerminalCompletionPending(

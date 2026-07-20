@@ -8,8 +8,11 @@ must be routed to exactly one terminal pane.
 
 ## Commands
 
-- `start_terminal({ cwd, columns, rows, onEvent })`
+- `start_terminal({ cwd, columns, rows, launch: { terminalKey, resume, launchProfile }, onEvent })`
   - asynchronous; blocking ConPTY creation runs outside the Tauri IPC thread
+  - `launchProfile` is the closed enum `powershell | claude | opencode`; it selects a fixed backend-owned command and never accepts arbitrary shell text
+  - `terminalKey`, `resume`, and `launchProfile` are nullable; an omitted or null `launchProfile` starts plain PowerShell
+  - a validated Codex/Grok `resume` binding takes precedence over `launchProfile`
   - returns `{ sessionId, processId }`
 - `write_terminal({ sessionId, data })`
   - writes UTF-8 text in pane input order
@@ -26,12 +29,6 @@ must be routed to exactly one terminal pane.
   - used by opt-in idle-agent sleep; requests termination and resolves only
     after the process tree, agent ownership, and notification routes are fully
     released, so the same saved conversation can be resumed immediately
-- `terminal_engine_status()`
-  - reports lifecycle, output-budget, resize, and spawn-limit counters
-- `phase2_initial_panes()`
-  - compatibility benchmark pane count, clamped to `1..20`; this hook does not
-    define production workspace capacity
-
 ## Events
 
 ```text
@@ -62,7 +59,3 @@ error for that pane.
   intentionally dropped.
 - Process exit waits up to three seconds for output drain, then closes flow
   control and reports a terminal error before completing shutdown.
-
-The `IHC_PHASE2_INITIAL_PANES` environment variable is a compatibility test hook only.
-The terminal engine does not read project catalog or Codex/Grok session data through
-this hook.

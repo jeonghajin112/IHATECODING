@@ -13,7 +13,7 @@ import {
 } from "@tauri-apps/api/window";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
-import { Terminal } from "@xterm/xterm";
+import { Terminal, type IBufferLine } from "@xterm/xterm";
 import {
   CumulativeAckPolicy,
   OutputSequencer,
@@ -32,10 +32,14 @@ import {
 import {
   computeHorizontalResize,
   evaluateWorkspaceRestoreCapacity,
+  isLoopbackBrowserUrl,
+  localBrowserRetryDelayMs,
   projectBrowserPanes,
+  workspaceTerminalLaunchProfile,
   type PaneGeometry,
   type PaneInsertionTarget,
   type WorkspaceBrowserPane,
+  type WorkspaceTerminalLaunchProfile,
 } from "./phase4-core";
 import {
   createPhase4WorkspaceController,
@@ -50,6 +54,9 @@ import {
   millisecondsUntilNextProviderUsageReset,
   normalizeProviderAccountListResponse,
   normalizeProviderUsageResponse,
+  providerUsageRemainingTone,
+  planEditableTerminalSelectAll,
+  planEditableTerminalSelectionDelete,
   rectanglesOverlap,
   scanTerminalLaunchControl,
   sanitizeUiPickClipboardText,
@@ -88,6 +95,22 @@ import {
   setAutoSleepIdleAgents,
   shouldReleaseAgentInputProtection,
 } from "./optimization-settings";
+import {
+  FOOTER_PROVIDER_IDS,
+  getFooterProviderSettings,
+  isFooterProviderVisible,
+  isFooterProviderId,
+  reorderFooterProvider,
+  setFooterProviderVisible,
+  subscribeFooterProviderSettings,
+  visibleFooterProviders,
+  type FooterProviderId,
+  type FooterProviderSettings,
+} from "./footer-provider-settings";
+import {
+  getUseEmbeddedBrowserTools,
+  setUseEmbeddedBrowserTools,
+} from "./agent-browser-settings";
 
 initializeAppLanguage();
 
@@ -105,7 +128,6 @@ type PaneState =
   | "error";
 
 type StatusTone = "normal" | "error";
-type BrowserState = "closed" | "opening" | "open" | "closing";
 type AgentTurnState = "unknown" | "working" | "idle";
 
 type OutputBatch = Extract<TerminalEvent, { event: "output" }>["data"];
@@ -129,6 +151,20 @@ type CursorClickSnapshot = {
   targetColumn: number;
   lineFingerprint: string;
   renderVersion: number;
+};
+
+type EditableTerminalAnchor = {
+  absoluteRow: number;
+  column: number;
+  linePrefix: string;
+};
+
+type EditableTerminalLineSnapshot = {
+  row: number;
+  anchorColumn: number;
+  cursorColumn: number;
+  lineEndColumn: number;
+  line: IBufferLine;
 };
 
 type NativeClipboardSnapshot =
@@ -180,6 +216,31 @@ type PhoneNotificationResult = {
   sent: boolean;
 };
 
+type AgentSettingsProvider = "codex" | "grok" | "claudeCode" | "openCode";
+type AgentSettingsLaunchProfile = "codex" | "grok" | "claude" | "opencode";
+type AgentAuthenticationState =
+  | "connected"
+  | "credentialsPresent"
+  | "notAuthenticated"
+  | "unknown";
+
+type AgentCliStatus = {
+  provider: AgentSettingsProvider;
+  installed: boolean;
+  authState: AgentAuthenticationState;
+  accountLabel: string | null;
+  credentialCount: number | null;
+};
+
+type AgentConnectionRowElements = {
+  provider: AgentSettingsProvider;
+  launchProfile: AgentSettingsLaunchProfile;
+  root: HTMLElement;
+  state: HTMLElement;
+  account: HTMLElement;
+  button: HTMLButtonElement;
+};
+
 type QueuedPhoneNotification = {
   kind: Exclude<PhoneNotificationKind, "test">;
   eventId: string;
@@ -201,6 +262,37 @@ type BrowserWebviewPrepared = {
   label: string;
   ok: boolean;
   uiPickAvailable: boolean;
+};
+
+type AgentBrowserCommandMethod =
+  | "list"
+  | "open"
+  | "navigate"
+  | "screenshot"
+  | "snapshot"
+  | "click"
+  | "type";
+
+type AgentBrowserCommand = {
+  id: string;
+  projectId: string;
+  terminalId: string;
+  method: AgentBrowserCommandMethod;
+  params: Record<string, unknown>;
+};
+
+type AgentBrowserCommandResponse = {
+  id: string;
+  ok: boolean;
+  result: unknown | null;
+  error: string | null;
+};
+
+type AgentBrowserPaneDescriptor = {
+  id: string;
+  title: string;
+  currentUrl: string;
+  webviewLabel: string | null;
 };
 
 const OUTPUT_SETTLED_DELAY_MS = 120;
@@ -313,8 +405,9 @@ class TerminalPane {
   private selectionGestureActive = false;
   private cursorClickSnapshot: CursorClickSnapshot | null = null;
   private webLinkActivationVersion = 0;
-  private editableAnchorColumn: number | null = null;
+  private editableAnchor: EditableTerminalAnchor | null = null;
   private capturedCursorMoveInput: string[] | null = null;
+  private editableShortcutReleasePending: "a" | "backspace" | null = null;
   private terminalRenderVersion = 0;
   private terminalPaintedVersion = 0;
   private lastForegroundOutputAt = Number.NEGATIVE_INFINITY;
@@ -334,6 +427,7 @@ class TerminalPane {
   private renderDrainScheduled = false;
   private startCompletion: Promise<void> = Promise.resolve();
   private agentProvider: AgentProvider | null;
+  private readonly launchProfile: WorkspaceTerminalLaunchProfile;
   private agentConversationId: string | null;
   private agentConversationBound: boolean;
   private agentTurnState: AgentTurnState = "unknown";
@@ -388,6 +482,7 @@ class TerminalPane {
 
   private readonly onWindowBlur = () => {
     this.copyShortcutReleasePending = false;
+    this.editableShortcutReleasePending = null;
     if (!this.selectionGestureActive) return;
     this.selectionGestureActive = false;
     this.cursorClickSnapshot = null;
@@ -402,14 +497,27 @@ class TerminalPane {
   };
 
   private readonly onWindowTerminalKeyDown = (event: KeyboardEvent) => {
+    // Synthetic Arrow/Backspace events are intentionally routed back through
+    // xterm so its active Win32/Kitty protocol performs the encoding. They must
+    // not recursively enter the user-shortcut layer.
+    if (this.capturedCursorMoveInput) return;
     if (!this.ownsTerminalKeyboardEvent(event)) return;
     if (this.consumeSelectionCopyShortcut(event, true)) return;
+    if (this.consumeEditableTerminalShortcut(event)) return;
     if (isTerminalInputIntentKey(event, this.terminal.hasSelection())) {
       this.selectionCopyGuard.invalidate();
     }
   };
 
   private readonly onWindowTerminalKeyUp = (event: KeyboardEvent) => {
+    if (this.capturedCursorMoveInput) return;
+    const releasedKey = String(event.key || "").toLowerCase();
+    if (this.editableShortcutReleasePending === releasedKey) {
+      this.editableShortcutReleasePending = null;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      return;
+    }
     if (
       !this.copyShortcutReleasePending ||
       (!isTerminalCopyShortcut(event) && !isTerminalCtrlInsertShortcut(event))
@@ -436,6 +544,7 @@ class TerminalPane {
     this.startDirectory = savedState.startDirectory;
     this.agentProvider =
       resumePlan.action === "resume" ? resumePlan.provider : null;
+    this.launchProfile = workspaceTerminalLaunchProfile(savedState);
     this.agentConversationId =
       resumePlan.action === "resume" ? resumePlan.conversationId : null;
     this.agentConversationBound = resumePlan.action === "resume";
@@ -474,7 +583,7 @@ class TerminalPane {
     this.titleEditor.className = "terminal-title-editor";
     this.titleEditor.maxLength = 80;
     this.titleEditor.hidden = true;
-    this.titleEditor.setAttribute("aria-label", tr("PowerShell name", "PowerShell 이름"));
+    this.titleEditor.setAttribute("aria-label", tr("Terminal name", "터미널 이름"));
     this.stateLabel = document.createElement("span");
     this.stateLabel.className = "terminal-state-label";
     this.stateLabel.textContent = this.statusMessage;
@@ -902,6 +1011,8 @@ class TerminalPane {
 
   private async start() {
     const epoch = ++this.lifecycleEpoch;
+    this.editableAnchor = null;
+    this.editableShortcutReleasePending = null;
     this.setState("queued", tr("Waiting to start", "시작 대기 중"));
 
     try {
@@ -909,13 +1020,21 @@ class TerminalPane {
         if (signal?.aborted || this.disposed || epoch !== this.lifecycleEpoch) {
           throw new CancelledStart();
         }
-        this.setState("starting", tr("Starting PowerShell…", "PowerShell 시작 중…"));
+        const launchName =
+          this.launchProfile === "powershell"
+            ? "PowerShell"
+            : agentLaunchProfileDisplayName(this.launchProfile);
+        this.setState("starting", tr(`Starting ${launchName}…`, `${launchName} 시작 중…`));
         await nextAnimationFrame();
         if (signal?.aborted || this.disposed || epoch !== this.lifecycleEpoch) {
           throw new CancelledStart();
         }
 
         this.fitTerminal();
+        // The first PTY output can arrive while a restored pane is still
+        // transitioning out of the hidden bin. Keep that first write off
+        // WebView2's parked timer path even when the pane is not yet active.
+        this.armInteractiveLaunchPaintProbe();
         const onEvent = new Channel<unknown>();
         this.eventChannel = onEvent;
         onEvent.onmessage = (rawMessage) => {
@@ -940,19 +1059,23 @@ class TerminalPane {
           cwd: this.startDirectory,
           columns: Math.max(2, this.terminal.cols),
           rows: Math.max(1, this.terminal.rows),
-          terminalKey: {
-            projectId: this.projectId,
-            terminalId: this.terminalId,
+          launch: {
+            terminalKey: {
+              projectId: this.projectId,
+              terminalId: this.terminalId,
+            },
+            launchProfile: this.launchProfile,
+            useEmbeddedBrowserTools: getUseEmbeddedBrowserTools(),
+            resume:
+              this.resumePlan.action === "resume" &&
+              this.resumePlan.provider &&
+              this.resumePlan.conversationId
+                ? {
+                    provider: this.resumePlan.provider,
+                    conversationId: this.resumePlan.conversationId,
+                  }
+                : null,
           },
-          resume:
-            this.resumePlan.action === "resume" &&
-            this.resumePlan.provider &&
-            this.resumePlan.conversationId
-              ? {
-                  provider: this.resumePlan.provider,
-                  conversationId: this.resumePlan.conversationId,
-                }
-              : null,
           onEvent,
         });
 
@@ -1139,6 +1262,12 @@ class TerminalPane {
     this.fitTimer = window.setTimeout(() => {
       this.fitTerminal();
       this.queueCurrentSize();
+      if (
+        this.isTerminalViewportPaintable() &&
+        this.pinnedXtermRendererNeedsResume()
+      ) {
+        this.resumePinnedXtermRenderer(true);
+      }
     }, delay);
   }
 
@@ -1148,17 +1277,24 @@ class TerminalPane {
    * public refresh method is a no-op while that state is stale.
    */
   resumeAfterLayout() {
-    if (this.disposed || !this.isTerminalViewportPaintable()) return;
-    this.fitTerminal();
-    this.queueCurrentSize();
-    this.resumePinnedXtermRenderer(true);
-    this.resumeInteractiveLaunchPaintProbeIfVisible();
-    // Let the browser deliver the real IntersectionObserver edge for the new
-    // connected layout first. Replaying visibility synchronously here can be
-    // overwritten by a stale hidden edge from the previous parent.
-    requestAnimationFrame(() => {
+    if (this.disposed) return;
+    const reconcile = () => {
       if (this.disposed || !this.isTerminalViewportPaintable()) return;
+      this.fitTerminal();
+      this.queueCurrentSize();
       this.resumePinnedXtermRenderer(true);
+      this.resumeInteractiveLaunchPaintProbeIfVisible();
+    };
+    // Always retain the post-layout attempt. During initial project restore
+    // the synchronous viewport is commonly still 0 px; returning at that point
+    // used to leave xterm paused until the whole app lost and regained focus.
+    reconcile();
+    requestAnimationFrame(() => {
+      reconcile();
+      // A late IntersectionObserver edge from the previous hidden parent can
+      // still arrive after this frame. The normal fit timer performs one final
+      // bounded reconciliation without installing a repaint loop.
+      this.scheduleFit(0);
     });
   }
 
@@ -1167,6 +1303,8 @@ class TerminalPane {
   ): Promise<void> {
     if (this.disposed) return Promise.resolve();
     this.disposed = true;
+    this.editableAnchor = null;
+    this.editableShortcutReleasePending = null;
     this.startAbortController.abort();
     this.lifecycleEpoch += 1;
     this.setState("stopping", tr("Stopping…", "종료 중…"));
@@ -1233,6 +1371,7 @@ class TerminalPane {
       if (this.consumeSelectionCopyShortcut(event)) return false;
       if (this.consumeManualTerminalInterruptShortcut(event)) return false;
       if (event.isComposing || event.keyCode === 229) return true;
+      this.noteEditableKeyboardEvent(event);
 
       const key = String(event.key || "").toLowerCase();
       const commandModifier = event.ctrlKey || event.metaKey;
@@ -1533,11 +1672,14 @@ class TerminalPane {
     }, TERMINAL_LAUNCH_PROBE_TTL_MS);
   }
 
-  private observeInteractiveLaunchOutput(enteredAlternateBuffer: boolean) {
+  private observeInteractiveLaunchOutput(
+    enteredAlternateBuffer: boolean,
+    renderVersion = this.terminalRenderVersion,
+  ) {
     if (
       !this.launchPaintWatchdog.observeOutput(
         this.lifecycleEpoch,
-        this.terminalRenderVersion,
+        renderVersion,
         enteredAlternateBuffer,
         performance.now(),
       )
@@ -1698,23 +1840,285 @@ class TerminalPane {
     }
   }
 
-  private noteEditableUserInput(data: string) {
-    if (data.includes("\r") || data.includes("\n")) {
-      this.editableAnchorColumn = null;
+  private noteEditableKeyboardEvent(event: KeyboardEvent) {
+    const key = String(event.key || "");
+    if (key.toLowerCase() === "enter") {
+      this.editableAnchor = null;
       this.cursorClickSnapshot = null;
       return;
     }
-    // Keyboard protocol records and navigation keys start with ESC. They must
-    // never arm click-to-move merely because their payload contains '[' or a
-    // printable key name.
+    if (
+      event.ctrlKey ||
+      event.metaKey ||
+      event.altKey ||
+      key.length !== 1
+    ) {
+      return;
+    }
+    // Enhanced Win32/Kitty keyboard modes encode even printable keys as ESC
+    // records. Capture the real row before xterm performs that encoding.
+    this.armEditableAnchorAtCursor();
+  }
+
+  private noteEditableUserInput(data: string) {
+    if (data.includes("\r") || data.includes("\n")) {
+      this.editableAnchor = null;
+      this.cursorClickSnapshot = null;
+      return;
+    }
+    // Keyboard protocol records and navigation keys start with ESC. The actual
+    // keydown path above arms printable enhanced-keyboard input safely.
     if (data.startsWith("\u001b")) return;
     const containsPrintable = [...data].some((character) => {
       const codePoint = character.codePointAt(0) ?? 0;
       return codePoint >= 0x20 && codePoint !== 0x7f;
     });
-    if (containsPrintable && this.editableAnchorColumn === null) {
-      this.editableAnchorColumn = this.terminal.buffer.active.cursorX;
+    if (containsPrintable) this.armEditableAnchorAtCursor();
+  }
+
+  private armEditableAnchorAtCursor() {
+    const buffer = this.terminal.buffer.active;
+    if (
+      this.disposed ||
+      this.paneState !== "running" ||
+      buffer.type !== "normal" ||
+      !this.isAtBottom() ||
+      this.terminal.modes.mouseTrackingMode !== "none" ||
+      !this.terminal.modes.showCursor
+    ) {
+      return;
     }
+    const absoluteRow = buffer.baseY + buffer.cursorY;
+    if (this.editableAnchor?.absoluteRow === absoluteRow) return;
+    const line = buffer.getLine(absoluteRow);
+    if (!line || line.isWrapped) {
+      this.editableAnchor = null;
+      return;
+    }
+    this.editableAnchor = {
+      absoluteRow,
+      column: buffer.cursorX,
+      linePrefix: line.translateToString(false, 0, buffer.cursorX),
+    };
+  }
+
+  private currentEditableTerminalLine(): EditableTerminalLineSnapshot | null {
+    const anchor = this.editableAnchor;
+    const buffer = this.terminal.buffer.active;
+    if (
+      !anchor ||
+      this.disposed ||
+      this.paneState !== "running" ||
+      buffer.type !== "normal" ||
+      !this.isAtBottom() ||
+      this.terminal.modes.mouseTrackingMode !== "none" ||
+      !this.terminal.modes.showCursor
+    ) {
+      return null;
+    }
+
+    const row = buffer.baseY + buffer.cursorY;
+    const line = buffer.getLine(row);
+    if (
+      row !== anchor.absoluteRow ||
+      buffer.cursorX < anchor.column ||
+      !line ||
+      line.isWrapped ||
+      line.translateToString(false, 0, anchor.column) !== anchor.linePrefix
+    ) {
+      this.editableAnchor = null;
+      return null;
+    }
+
+    let lineEndColumn = buffer.cursorX;
+    for (let column = anchor.column; column < this.terminal.cols; column += 1) {
+      const cell = line.getCell(column);
+      if (cell?.getChars()) {
+        lineEndColumn = Math.max(lineEndColumn, column + Math.max(1, cell.getWidth()));
+      }
+    }
+    if (lineEndColumn > this.terminal.cols) return null;
+    return {
+      row,
+      anchorColumn: anchor.column,
+      cursorColumn: buffer.cursorX,
+      lineEndColumn,
+      line,
+    };
+  }
+
+  private consumeEditableTerminalShortcut(event: KeyboardEvent) {
+    if (
+      event.isComposing ||
+      event.keyCode === 229 ||
+      this.terminal.textarea !== document.activeElement ||
+      !event.composedPath().includes(this.viewport)
+    ) {
+      return false;
+    }
+    const key = String(event.key || "").toLowerCase();
+    const selectAll =
+      key === "a" &&
+      (event.ctrlKey || event.metaKey) &&
+      !event.altKey &&
+      !event.shiftKey;
+    const deleteSelection =
+      key === "backspace" &&
+      !event.ctrlKey &&
+      !event.metaKey &&
+      !event.altKey &&
+      !event.shiftKey;
+    if (!selectAll && !deleteSelection) return false;
+
+    const consume = (releaseKey: "a" | "backspace") => {
+      this.editableShortcutReleasePending = releaseKey;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      return true;
+    };
+
+    // Once a selected range has been deleted, suppress auto-repeat until the
+    // physical Backspace is released so it cannot erase text outside the range.
+    if (
+      deleteSelection &&
+      event.repeat &&
+      this.editableShortcutReleasePending === "backspace"
+    ) {
+      return consume("backspace");
+    }
+
+    const editableLine = this.currentEditableTerminalLine();
+    if (!editableLine) return false;
+
+    if (selectAll) {
+      const existingSelection = this.terminal.getSelectionPosition();
+      if (
+        this.terminal.hasSelection() &&
+        !planEditableTerminalSelectionDelete(editableLine, existingSelection)
+      ) {
+        return false;
+      }
+      const range = planEditableTerminalSelectAll(editableLine);
+      if (!range) return false;
+      consume("a");
+      this.terminal.select(
+        range.startColumn,
+        range.row,
+        range.endColumn - range.startColumn,
+      );
+      this.selectionCopyGuard.captureLiveSelection(this.liveTerminalSelection());
+      this.pauseAutoFollow();
+      return true;
+    }
+
+    const range = planEditableTerminalSelectionDelete(
+      editableLine,
+      this.terminal.getSelectionPosition(),
+    );
+    if (!range) return false;
+    if (
+      !this.isTerminalCellBoundary(editableLine.line, range.startColumn) ||
+      !this.isTerminalCellBoundary(editableLine.line, range.endColumn) ||
+      !this.isTerminalCellBoundary(editableLine.line, editableLine.cursorColumn)
+    ) {
+      return false;
+    }
+    const movement = this.countTerminalCellKeystrokes(
+      editableLine.line,
+      Math.min(editableLine.cursorColumn, range.endColumn),
+      Math.max(editableLine.cursorColumn, range.endColumn),
+    );
+    const deletion = this.countTerminalCellKeystrokes(
+      editableLine.line,
+      range.startColumn,
+      range.endColumn,
+    );
+    if (
+      movement === null ||
+      deletion === null ||
+      deletion === 0 ||
+      movement + deletion > CURSOR_CLICK_MAX_KEYSTROKES
+    ) {
+      return false;
+    }
+
+    consume("backspace");
+    this.terminal.clearSelection();
+    this.selectionCopyGuard.invalidate();
+    this.cursorClickSnapshot = null;
+    const encodedDeletion = this.captureTerminalSelectionDeletion(
+      editableLine.cursorColumn,
+      range.endColumn,
+      movement,
+      deletion,
+    );
+    if (!encodedDeletion) {
+      this.terminal.select(
+        range.startColumn,
+        range.row,
+        range.endColumn - range.startColumn,
+      );
+      this.selectionCopyGuard.captureLiveSelection(this.liveTerminalSelection());
+      this.pauseAutoFollow();
+      return true;
+    }
+    this.resumeAutoFollowForUserIntent();
+    this.queueInput({ kind: "text", data: encodedDeletion });
+    this.scheduleAgentDiscovery(false);
+    return true;
+  }
+
+  private isTerminalCellBoundary(line: IBufferLine, column: number) {
+    return (
+      column >= 0 &&
+      column <= this.terminal.cols &&
+      (column === this.terminal.cols || (line.getCell(column)?.getWidth() ?? 1) !== 0)
+    );
+  }
+
+  private countTerminalCellKeystrokes(
+    line: IBufferLine,
+    startColumn: number,
+    endColumn: number,
+  ) {
+    if (startColumn < 0 || startColumn > endColumn || endColumn > this.terminal.cols) {
+      return null;
+    }
+    let column = startColumn;
+    let keystrokes = 0;
+    while (column < endColumn) {
+      const width = line.getCell(column)?.getWidth() ?? 1;
+      if (width === 0) return null;
+      column += Math.max(1, width);
+      keystrokes += 1;
+    }
+    return column === endColumn ? keystrokes : null;
+  }
+
+  private captureTerminalSelectionDeletion(
+    cursorColumn: number,
+    selectionEndColumn: number,
+    movementKeystrokes: number,
+    deletionKeystrokes: number,
+  ) {
+    const textarea = this.terminal.textarea;
+    if (!textarea || this.capturedCursorMoveInput) return "";
+    const captured: string[] = [];
+    const direction = selectionEndColumn < cursorColumn ? "ArrowLeft" : "ArrowRight";
+    this.capturedCursorMoveInput = captured;
+    try {
+      for (let index = 0; index < movementKeystrokes; index += 1) {
+        textarea.dispatchEvent(createTerminalArrowEvent("keydown", direction));
+        textarea.dispatchEvent(createTerminalArrowEvent("keyup", direction));
+      }
+      for (let index = 0; index < deletionKeystrokes; index += 1) {
+        textarea.dispatchEvent(createTerminalEditingKeyEvent("keydown", "Backspace"));
+        textarea.dispatchEvent(createTerminalEditingKeyEvent("keyup", "Backspace"));
+      }
+    } finally {
+      this.capturedCursorMoveInput = null;
+    }
+    return captured.join("");
   }
 
   private captureCursorClick(event: MouseEvent): CursorClickSnapshot | null {
@@ -1725,7 +2129,7 @@ class TerminalPane {
       event.ctrlKey ||
       event.metaKey ||
       event.shiftKey ||
-      this.editableAnchorColumn === null ||
+      this.editableAnchor === null ||
       this.paneState !== "running" ||
       this.terminal.hasSelection() ||
       !this.isAtBottom() ||
@@ -1754,22 +2158,16 @@ class TerminalPane {
     const screenBounds = screen.getBoundingClientRect();
     const targetRow = Math.floor((event.clientY - screenBounds.top) / cellHeight);
     if (targetRow !== buffer.cursorY) return null;
-    const line = buffer.getLine(buffer.baseY + buffer.cursorY);
-    if (!line) return null;
-
-    let lineEndColumn = buffer.cursorX;
-    for (let column = 0; column < this.terminal.cols; column += 1) {
-      const cell = line.getCell(column);
-      if (cell?.getChars()) {
-        lineEndColumn = Math.max(lineEndColumn, column + Math.max(1, cell.getWidth()));
-      }
-    }
+    const editableLine = this.currentEditableTerminalLine();
+    if (!editableLine) return null;
+    const line = editableLine.line;
+    const lineEndColumn = editableLine.lineEndColumn;
     let targetColumn = Math.round((event.clientX - screenBounds.left) / cellWidth);
     targetColumn = Math.max(
-      this.editableAnchorColumn,
+      editableLine.anchorColumn,
       Math.min(lineEndColumn, targetColumn),
     );
-    while (targetColumn > this.editableAnchorColumn) {
+    while (targetColumn > editableLine.anchorColumn) {
       const cell = line.getCell(targetColumn);
       if (!cell || cell.getWidth() !== 0) break;
       targetColumn -= 1;
@@ -2130,20 +2528,31 @@ class TerminalPane {
       writeStartedAt - this.lastForegroundOutputAt >= FOREGROUND_OUTPUT_BURST_IDLE_MS;
     if (directPaint) this.lastForegroundOutputAt = writeStartedAt;
     const expectedRenderVersion = this.terminalRenderVersion + batches.length;
-    this.terminalRenderVersion = expectedRenderVersion;
 
     // xterm normally schedules an empty write buffer through setTimeout(0).
     // Mark foreground and bounded launch writes as input-adjacent so parsing
     // starts in the current task even if WebView2 has parked render timers.
     // Full synchronous refreshes below are separately rate-limited.
     if (immediateWrite) this.primePinnedXtermImmediateWrite();
+    // Establish the checkpoint before terminal.write. If WebView2 parks the
+    // xterm write callback itself, the watchdog and visibility reconciliation
+    // must already know which render is missing. Keep the public painted
+    // version unchanged until parsing completes so an unrelated fit render
+    // cannot falsely acknowledge this output.
+    const observedPreWriteCheckpoint = launchSensitiveWrite
+      ? this.observeInteractiveLaunchOutput(false, expectedRenderVersion)
+      : false;
 
     await new Promise<void>((resolve) => {
       this.terminal.write(data, () => {
-        const observedLaunchCheckpoint = this.observeInteractiveLaunchOutput(
+        this.terminalRenderVersion = expectedRenderVersion;
+        const observedParsedCheckpoint = this.observeInteractiveLaunchOutput(
           bufferTypeBeforeWrite !== "alternate" &&
             this.terminal.buffer.active.type === "alternate",
+          expectedRenderVersion,
         );
+        const observedLaunchCheckpoint =
+          observedPreWriteCheckpoint || observedParsedCheckpoint;
         const paintCheckedAt = performance.now();
         const forceForegroundRefresh =
           directPaint &&
@@ -2342,8 +2751,19 @@ class TerminalPane {
 
   private fitTerminal() {
     if (this.disposed || this.viewport.clientWidth < 2 || this.viewport.clientHeight < 2) return;
+    const columnsBeforeFit = this.terminal.cols;
+    const rowsBeforeFit = this.terminal.rows;
     try {
       this.fitAddon.fit();
+      if (
+        this.terminal.cols !== columnsBeforeFit ||
+        this.terminal.rows !== rowsBeforeFit
+      ) {
+        // xterm may reflow wrapped buffer rows during a fit. A prompt anchor
+        // captured before that reflow can no longer prove which row is editable.
+        this.editableAnchor = null;
+        this.cursorClickSnapshot = null;
+      }
     } catch {
       // A pane may be between grid layouts while ResizeObserver is running.
     }
@@ -2445,6 +2865,7 @@ class TerminalPane {
     // Korean IME composition with its own setTimeout(0); this fence lets that
     // committed onData reserve its slot before Ctrl+V without intercepting any
     // composition event ourselves.
+    this.armEditableAnchorAtCursor();
     const clipboardRead = Promise.race([
       this.readClipboardInput(),
       delay(CLIPBOARD_READ_TIMEOUT_MS).then(() => {
@@ -2464,6 +2885,7 @@ class TerminalPane {
       void inputReady.then(({ input, error }) => {
         if (input?.kind === "text") {
           this.armInteractiveLaunchPaintProbeForSubmittedInput(input.data);
+          this.noteEditableUserInput(input.data);
         }
         commit(input);
         if (error && !this.disposed) {
@@ -2914,6 +3336,8 @@ class TerminalPane {
         if (exit.exitCode !== null && exit.exitCode !== 0) {
           this.notifyPhoneErrorOnce();
         }
+        this.editableAnchor = null;
+        this.editableShortcutReleasePending = null;
         this.setState(
           "exited",
           tr(`Exited · code ${exit.exitCode ?? "?"}`, `종료됨 · code ${exit.exitCode ?? "?"}`),
@@ -2981,6 +3405,8 @@ class TerminalPane {
     window.clearTimeout(this.resumeHealthTimer);
     this.resumeHealthTimer = 0;
     this.pendingExit = null;
+    this.editableAnchor = null;
+    this.editableShortcutReleasePending = null;
     if (this.eventChannel) this.eventChannel.onmessage = () => undefined;
     if (this.sessionId) this.workspace.releaseSession(this.sessionId, this.id);
     this.sessionId = null;
@@ -3084,7 +3510,10 @@ class BrowserPane {
   private readonly maximizeButton: HTMLButtonElement;
   private readonly closeButton: HTMLButtonElement;
   private readonly resizeHandle: HTMLDivElement;
+  private readonly placeholder: HTMLDivElement;
   private readonly resizeObserver: ResizeObserver;
+  private settingsPreviewElement: HTMLDivElement | null = null;
+  private settingsPreviewRevision = 0;
   private webview: Webview | null = null;
   private generation = 0;
   private fitTimer = 0;
@@ -3101,6 +3530,13 @@ class BrowserPane {
   private navigationRevision = 0;
   private urlSyncFallbackTimer = 0;
   private urlSyncFallbackEnabled = false;
+  private localRetryTimer = 0;
+  private localRetryRequest: {
+    url: string;
+    revision: number;
+    startedAt: number;
+    failedAttempts: number;
+  } | null = null;
   private pendingNavigation: {
     url: string;
     persist: boolean;
@@ -3193,10 +3629,10 @@ class BrowserPane {
 
     this.viewport = document.createElement("div");
     this.viewport.className = "browser-viewport";
-    const placeholder = document.createElement("div");
-    placeholder.className = "browser-placeholder";
-    placeholder.textContent = tr("Loading browser…", "브라우저를 불러오는 중입니다.");
-    this.viewport.append(placeholder);
+    this.placeholder = document.createElement("div");
+    this.placeholder.className = "browser-placeholder";
+    this.placeholder.textContent = tr("Loading browser…", "브라우저를 불러오는 중입니다.");
+    this.viewport.append(this.placeholder);
 
     this.resizeHandle = document.createElement("div");
     this.resizeHandle.className = "terminal-resize-handle";
@@ -3282,6 +3718,47 @@ class BrowserPane {
     return { message: this.statusMessage, tone: this.statusTone } as const;
   }
 
+  agentDescriptor(): AgentBrowserPaneDescriptor {
+    return {
+      id: this.persistentId,
+      title: this.title,
+      currentUrl: this.currentUrl,
+      webviewLabel: this.webview?.label ?? null,
+    };
+  }
+
+  async agentNavigate(rawUrl: string): Promise<AgentBrowserPaneDescriptor> {
+    if (this.disposed) throw new Error("The web pane is no longer available.");
+    if (!this.catalogWritable) throw new Error("The web pane catalog is not writable.");
+    const url = normalizeBrowserUrl(rawUrl);
+    this.navigate(url);
+    await this.operationQueue;
+    if (this.disposed) throw new Error("The web pane closed during navigation.");
+    if (this.currentUrl !== url) throw new Error("The web pane navigation did not complete.");
+    return this.agentDescriptor();
+  }
+
+  async agentScreenshot(): Promise<{ dataUrl: string }> {
+    const label = this.agentWebviewLabel();
+    const dataUrl = await invoke<string>("capture_browser_webview_preview", { label });
+    return { dataUrl };
+  }
+
+  async agentSnapshot(): Promise<unknown> {
+    const label = this.agentWebviewLabel();
+    return invoke<unknown>("browser_agent_snapshot", { label });
+  }
+
+  async agentClick(selector: string): Promise<unknown> {
+    const label = this.agentWebviewLabel();
+    return invoke<unknown>("browser_agent_click", { label, selector });
+  }
+
+  async agentType(selector: string, text: string): Promise<unknown> {
+    const label = this.agentWebviewLabel();
+    return invoke<unknown>("browser_agent_type", { label, selector, text });
+  }
+
   start() {
     this.navigate(this.address.value, false);
   }
@@ -3347,6 +3824,13 @@ class BrowserPane {
 
   ownsWebviewLabel(label: string) {
     return !this.disposed && this.webview?.label === label;
+  }
+
+  private agentWebviewLabel(): string {
+    if (this.disposed) throw new Error("The web pane is no longer available.");
+    const label = this.webview?.label;
+    if (!label) throw new Error("The web pane is not ready yet.");
+    return label;
   }
 
   observeWebviewPrepared(label: string, ok: boolean, uiPickAvailable: boolean) {
@@ -3424,9 +3908,11 @@ class BrowserPane {
     this.layoutVisible = visible;
     if (!visible) {
       this.clearUrlSyncFallbackTimer();
+      this.clearLocalRetryTimer();
       void this.webview?.hide().catch(() => undefined);
       return;
     }
+    if (this.localRetryRequest) this.scheduleLocalBrowserRetry(this.localRetryRequest, 0);
     this.scheduleFit(0);
     this.scheduleUrlSyncFallback(0);
   }
@@ -3436,11 +3922,130 @@ class BrowserPane {
     this.interactionSuspended = suspended;
     if (suspended) {
       this.clearUrlSyncFallbackTimer();
+      this.clearLocalRetryTimer();
       void this.webview?.hide().catch(() => undefined);
       return;
     }
+    if (this.localRetryRequest) this.scheduleLocalBrowserRetry(this.localRetryRequest, 0);
     this.scheduleFit(0);
     this.scheduleUrlSyncFallback(0);
+  }
+
+  isVisibleForSettingsPreview() {
+    return (
+      !this.disposed &&
+      this.layoutVisible &&
+      !this.element.hidden &&
+      this.element.isConnected
+    );
+  }
+
+  async prepareSettingsPreview(): Promise<void> {
+    if (!this.isVisibleForSettingsPreview()) return;
+    const revision = ++this.settingsPreviewRevision;
+    this.removeSettingsPreviewElement();
+    const webview = this.webview;
+    const preview = document.createElement("div");
+    preview.className = "browser-settings-preview";
+    preview.setAttribute("aria-live", "polite");
+
+    if (webview) {
+      try {
+        const dataUrl = await invoke<string>("capture_browser_webview_preview", {
+          label: webview.label,
+        });
+        if (!dataUrl.startsWith("data:image/png;base64,")) {
+          throw new Error("The native browser preview was invalid.");
+        }
+        const image = document.createElement("img");
+        image.className = "browser-settings-preview-image";
+        image.alt = "";
+        image.src = dataUrl;
+        await image.decode();
+        if (
+          this.disposed ||
+          revision !== this.settingsPreviewRevision ||
+          this.webview !== webview
+        ) {
+          image.src = "";
+          return;
+        }
+        preview.setAttribute(
+          "aria-label",
+          tr("Browser preview while Settings is open", "환경설정이 열려 있는 동안의 브라우저 미리보기"),
+        );
+        preview.append(image);
+      } catch (error) {
+        console.warn("Could not capture the browser pane for Settings", error);
+        this.renderSettingsPreviewUnavailable(preview);
+      }
+    } else {
+      this.renderSettingsPreviewUnavailable(preview);
+    }
+
+    if (this.disposed || revision !== this.settingsPreviewRevision) return;
+    this.settingsPreviewElement = preview;
+    this.viewport.append(preview);
+    await nextAnimationFrame();
+  }
+
+  async waitUntilNativeHiddenForSettings(): Promise<void> {
+    await this.boundsQueue.catch(() => undefined);
+    const webview = this.webview;
+    if (this.disposed || !this.interactionSuspended || !webview) return;
+    await webview.hide().catch((error) => {
+      console.warn("Could not hide the browser pane behind Settings", error);
+    });
+  }
+
+  async restoreNativeAfterSettings(): Promise<void> {
+    window.clearTimeout(this.fitTimer);
+    await this.boundsQueue.catch(() => undefined);
+    const generation = this.generation;
+    const webview = this.webview;
+    if (
+      !this.disposed &&
+      webview &&
+      this.layoutVisible &&
+      !this.interactionSuspended &&
+      !this.element.hidden &&
+      this.element.isConnected
+    ) {
+      try {
+        await this.syncBounds(generation, webview);
+        await nextAnimationFrame();
+      } catch (error) {
+        console.warn("Could not restore the browser pane after Settings", error);
+        this.scheduleFit(0);
+        return;
+      }
+    }
+    this.clearSettingsPreview();
+  }
+
+  clearSettingsPreview() {
+    this.settingsPreviewRevision += 1;
+    this.removeSettingsPreviewElement();
+  }
+
+  private renderSettingsPreviewUnavailable(preview: HTMLDivElement) {
+    preview.dataset.available = "false";
+    const title = document.createElement("strong");
+    title.textContent = tr("Browser preview unavailable", "브라우저 미리보기를 사용할 수 없음");
+    const detail = document.createElement("span");
+    detail.textContent = tr(
+      "This page will return when Settings closes.",
+      "환경설정을 닫으면 이 페이지가 다시 표시됩니다.",
+    );
+    preview.append(title, detail);
+  }
+
+  private removeSettingsPreviewElement() {
+    const preview = this.settingsPreviewElement;
+    this.settingsPreviewElement = null;
+    const image = preview?.querySelector<HTMLImageElement>("img");
+    if (image) image.src = "";
+    preview?.remove();
   }
 
   overlapsNativeOverlay(bounds: RectangleBounds) {
@@ -3512,8 +4117,11 @@ class BrowserPane {
     this.navigationRevision += 1;
     this.generation += 1;
     this.clearUrlSyncFallbackTimer();
+    this.clearLocalRetryTimer();
+    this.localRetryRequest = null;
     window.clearTimeout(this.fitTimer);
     this.resizeObserver.disconnect();
+    this.clearSettingsPreview();
     const webview = this.webview;
     this.webview = null;
     await webview?.hide().catch(() => undefined);
@@ -3647,6 +4255,8 @@ class BrowserPane {
       return;
     }
     const navigationRevision = ++this.navigationRevision;
+    this.clearLocalRetryTimer();
+    this.localRetryRequest = null;
     this.addressDirty = false;
     this.address.value = url;
     this.pendingNavigation = {
@@ -3768,6 +4378,7 @@ class BrowserPane {
     this.clearUrlSyncFallbackTimer();
     const previous = this.webview;
     this.webview = null;
+    this.placeholder.textContent = tr("Loading browser…", "브라우저를 불러오는 중입니다.");
     this.setState("starting", tr("Loading page", "페이지 불러오는 중"));
     if (previous) {
       await previous.hide().catch(() => undefined);
@@ -3776,6 +4387,46 @@ class BrowserPane {
         () => false,
       );
       if (closed) await this.workspace.unwatchBrowserWebviewUrl(previous.label);
+    }
+    if (this.disposed || generation !== this.generation) return;
+    if (isLoopbackBrowserUrl(url)) {
+      const request =
+        this.localRetryRequest?.url === url &&
+        this.localRetryRequest.revision === this.navigationRevision
+          ? this.localRetryRequest
+          : {
+              url,
+              revision: this.navigationRevision,
+              startedAt: Date.now(),
+              failedAttempts: 0,
+            };
+      this.localRetryRequest = request;
+      const ready = await invoke<boolean>("probe_loopback_browser_endpoint", { url });
+      if (
+        this.disposed ||
+        generation !== this.generation ||
+        request.revision !== this.navigationRevision ||
+        this.localRetryRequest !== request
+      ) {
+        return;
+      }
+      if (!ready) {
+        request.failedAttempts += 1;
+        const waitingMessage = tr(
+          "Waiting for the local server…",
+          "로컬 서버를 기다리는 중입니다…",
+        );
+        this.placeholder.textContent = waitingMessage;
+        this.setState("starting", waitingMessage);
+        this.scheduleLocalBrowserRetry(request);
+        return;
+      }
+      this.clearLocalRetryTimer();
+      this.localRetryRequest = null;
+      this.placeholder.textContent = tr("Loading browser…", "브라우저를 불러오는 중입니다.");
+    } else {
+      this.clearLocalRetryTimer();
+      this.localRetryRequest = null;
     }
     if (this.disposed || generation !== this.generation) return;
     await nextAnimationFrame();
@@ -3881,6 +4532,71 @@ class BrowserPane {
   private clearUrlSyncFallbackTimer() {
     window.clearTimeout(this.urlSyncFallbackTimer);
     this.urlSyncFallbackTimer = 0;
+  }
+
+  private clearLocalRetryTimer() {
+    window.clearTimeout(this.localRetryTimer);
+    this.localRetryTimer = 0;
+  }
+
+  private scheduleLocalBrowserRetry(
+    request: {
+      url: string;
+      revision: number;
+      startedAt: number;
+      failedAttempts: number;
+    },
+    overrideDelayMs?: number,
+  ) {
+    this.clearLocalRetryTimer();
+    if (
+      this.disposed ||
+      this.localRetryRequest !== request ||
+      request.revision !== this.navigationRevision ||
+      !this.layoutVisible ||
+      this.interactionSuspended ||
+      this.element.hidden
+    ) {
+      return;
+    }
+    const elapsedMs = Date.now() - request.startedAt;
+    const delayMs =
+      overrideDelayMs ?? localBrowserRetryDelayMs(request.failedAttempts, elapsedMs);
+    if (delayMs === null) {
+      this.localRetryRequest = null;
+      const stoppedMessage = tr(
+        "Local server is still offline · press → to retry",
+        "로컬 서버가 아직 꺼져 있습니다 · → 버튼으로 다시 시도",
+      );
+      this.placeholder.textContent = stoppedMessage;
+      this.setState("error", stoppedMessage, "error");
+      return;
+    }
+    this.localRetryTimer = window.setTimeout(() => {
+      this.localRetryTimer = 0;
+      if (
+        this.disposed ||
+        this.localRetryRequest !== request ||
+        request.revision !== this.navigationRevision
+      ) {
+        return;
+      }
+      this.operationQueue = this.operationQueue
+        .then(() => this.replaceWebview(request.url))
+        .catch((error) => {
+          if (!this.disposed && this.localRetryRequest === request) {
+            this.localRetryRequest = null;
+            this.setState(
+              "error",
+              tr(
+                `Failed to restore local browser: ${errorMessage(error)}`,
+                `로컬 브라우저 복원 실패: ${errorMessage(error)}`,
+              ),
+              "error",
+            );
+          }
+        });
+    }, Math.max(0, delayMs));
   }
 
   private scheduleUrlSyncFallback(delay = BROWSER_URL_FALLBACK_SYNC_INTERVAL_MS) {
@@ -4034,6 +4750,8 @@ class TerminalWorkspace {
   private readonly insertionLine = document.createElement("div");
   private readonly snapGuide = document.createElement("div");
   private readonly browserSuspensionReasons = new Set<string>();
+  private readonly settingsPreviewPanes = new Set<BrowserPane>();
+  private settingsPreviewEpoch = 0;
   private providerUsageOverlayBounds: RectangleBounds | null = null;
   private activePaneId: string | null = null;
   private activeProjectId: string | null = null;
@@ -4051,6 +4769,8 @@ class TerminalWorkspace {
   private browserUrlRegistrationEpoch = 0;
   private browserUrlListenerReady: Promise<boolean> = Promise.resolve(false);
   private browserUrlUpdateTail: Promise<void> = Promise.resolve();
+  private agentBrowserCommandRegistrationEpoch = 0;
+  private agentBrowserCommandUnlisten: (() => void) | null = null;
   private dragState: PaneDragState | null = null;
   private resizeState: PaneResizeState | null = null;
   private stopBarrier: Promise<void> = Promise.resolve();
@@ -4149,7 +4869,7 @@ class TerminalWorkspace {
     private readonly onTerminalWebLinkOpenedCallback: (
       projectId: string,
       url: string,
-    ) => Promise<void>,
+    ) => Promise<string | null>,
     private readonly onPaneReorderedCallback: (
       projectId: string,
       paneId: string,
@@ -4204,6 +4924,160 @@ class TerminalWorkspace {
     window.addEventListener("blur", this.onLayoutWindowBlur);
     this.installNativeFileDrop();
     this.browserUrlListenerReady = this.installBrowserUrlSync();
+  }
+
+  async installAgentBrowserCommands(initialization: Promise<unknown>): Promise<void> {
+    const registrationEpoch = ++this.agentBrowserCommandRegistrationEpoch;
+    try {
+      const unlisten = await getCurrentWebview().listen<unknown>(
+        "agent-browser-command",
+        ({ payload }) => {
+          void this.handleAgentBrowserCommand(payload, initialization);
+        },
+      );
+      if (this.disposed || registrationEpoch !== this.agentBrowserCommandRegistrationEpoch) {
+        unlisten();
+        return;
+      }
+      this.agentBrowserCommandUnlisten?.();
+      this.agentBrowserCommandUnlisten = unlisten;
+    } catch (error) {
+      if (!this.disposed && registrationEpoch === this.agentBrowserCommandRegistrationEpoch) {
+        console.error("Unable to register the embedded-browser agent bridge", error);
+      }
+    }
+  }
+
+  listAgentBrowserPanes(projectId: string): AgentBrowserPaneDescriptor[] {
+    this.assertAgentBrowserProjectScope(projectId);
+    return [...this.browserPanes.values()]
+      .filter((pane) => pane.projectId === projectId)
+      .map((pane) => pane.agentDescriptor());
+  }
+
+  findAgentBrowserPane(projectId: string, paneId: string): BrowserPane {
+    this.assertAgentBrowserProjectScope(projectId);
+    const pane = this.browserPanes.get(browserPaneRuntimeId(projectId, paneId));
+    if (!pane || pane.projectId !== projectId) {
+      throw new Error("The requested web pane does not belong to this project.");
+    }
+    return pane;
+  }
+
+  private async handleAgentBrowserCommand(
+    payload: unknown,
+    initialization: Promise<unknown>,
+  ): Promise<void> {
+    const id = isRecord(payload) && typeof payload.id === "string" ? payload.id : "";
+    let response: AgentBrowserCommandResponse;
+    try {
+      const command = this.parseAgentBrowserCommand(payload);
+      await initialization;
+      const result = await this.executeAgentBrowserCommand(command);
+      response = { id: command.id, ok: true, result, error: null };
+    } catch (error) {
+      response = { id, ok: false, result: null, error: errorMessage(error) };
+    }
+
+    try {
+      await invoke("complete_agent_browser_command", { response });
+    } catch (error) {
+      if (!this.disposed) {
+        console.error("Unable to complete the embedded-browser agent command", error);
+      }
+    }
+  }
+
+  private parseAgentBrowserCommand(payload: unknown): AgentBrowserCommand {
+    if (!isRecord(payload)) throw new Error("The browser command payload is invalid.");
+    const { id, projectId, terminalId, method, params } = payload;
+    if (typeof id !== "string" || id.length === 0) {
+      throw new Error("The browser command id is missing.");
+    }
+    if (typeof projectId !== "string" || projectId.length === 0) {
+      throw new Error("The browser command project is missing.");
+    }
+    if (typeof terminalId !== "string" || terminalId.length === 0) {
+      throw new Error("The browser command terminal is missing.");
+    }
+    const normalizedMethod =
+      typeof method === "string" && method.startsWith("browser_")
+        ? method.slice("browser_".length)
+        : method;
+    if (
+      normalizedMethod !== "list" &&
+      normalizedMethod !== "open" &&
+      normalizedMethod !== "navigate" &&
+      normalizedMethod !== "screenshot" &&
+      normalizedMethod !== "snapshot" &&
+      normalizedMethod !== "click" &&
+      normalizedMethod !== "type"
+    ) {
+      throw new Error("The browser command method is not supported.");
+    }
+    if (!isRecord(params)) throw new Error("The browser command parameters are invalid.");
+    return { id, projectId, terminalId, method: normalizedMethod, params };
+  }
+
+  private async executeAgentBrowserCommand(command: AgentBrowserCommand): Promise<unknown> {
+    this.assertAgentBrowserCommandScope(command.projectId, command.terminalId);
+    const paneFor = () =>
+      this.findAgentBrowserPane(
+        command.projectId,
+        this.agentBrowserStringParam(command.params, "paneId"),
+      );
+
+    switch (command.method) {
+      case "list":
+        return this.listAgentBrowserPanes(command.projectId);
+      case "open": {
+        const url = this.agentBrowserStringParam(command.params, "url");
+        const paneId = await this.onTerminalWebLinkOpenedCallback(command.projectId, url);
+        if (!paneId) throw new Error("The web pane could not be opened.");
+        return this.findAgentBrowserPane(command.projectId, paneId).agentDescriptor();
+      }
+      case "navigate":
+        return paneFor().agentNavigate(this.agentBrowserStringParam(command.params, "url"));
+      case "screenshot":
+        return paneFor().agentScreenshot();
+      case "snapshot":
+        return paneFor().agentSnapshot();
+      case "click":
+        return paneFor().agentClick(this.agentBrowserStringParam(command.params, "selector"));
+      case "type":
+        return paneFor().agentType(
+          this.agentBrowserStringParam(command.params, "selector"),
+          this.agentBrowserStringParam(command.params, "text", true),
+        );
+    }
+  }
+
+  private agentBrowserStringParam(
+    params: Record<string, unknown>,
+    key: string,
+    allowEmpty = false,
+  ): string {
+    const value = params[key];
+    if (typeof value !== "string" || (!allowEmpty && value.trim().length === 0)) {
+      throw new Error(`The browser command requires a ${key} string.`);
+    }
+    return value;
+  }
+
+  private assertAgentBrowserCommandScope(projectId: string, terminalId: string) {
+    this.assertAgentBrowserProjectScope(projectId);
+    const sourcePane = this.panes.get(paneRuntimeId(projectId, terminalId));
+    if (!sourcePane || sourcePane.projectId !== projectId) {
+      throw new Error("The browser command terminal does not belong to this project.");
+    }
+  }
+
+  private assertAgentBrowserProjectScope(projectId: string) {
+    if (this.disposed) throw new Error("The workspace is closing.");
+    if (!this.catalogWritable) throw new Error("The workspace is not ready for browser commands.");
+    if (!projectId || projectId !== this.activeProjectId) {
+      throw new Error("The requested project is not active in IHATECODING.");
+    }
   }
 
   private async installBrowserUrlSync(): Promise<boolean> {
@@ -5767,34 +6641,18 @@ class TerminalWorkspace {
         ...entries,
         [state.row.key]: [...state.previewRatios],
       });
-      if (!state.row.paneIds.some((paneId) => this.browserPanes.has(paneId))) {
-        this.onPaneRatiosChangedCallback(
-          state.projectId,
-          state.row.key,
-          [...state.previewRatios],
-        );
-      }
+      // Width ratios describe the rendered row, regardless of whether it is
+      // made of terminals, browsers, or both. Persist every mixed row so a
+      // project switch cannot replace the live layout with equal-width defaults.
+      this.onPaneRatiosChangedCallback(
+        state.projectId,
+        state.row.key,
+        [...state.previewRatios],
+      );
     }
     this.setBrowserSuspensionReason("layout-interaction", false);
     requestAnimationFrame(() => {
       for (const paneId of state.row.paneIds) this.layoutPane(paneId)?.scheduleFit(0);
-    });
-  }
-
-  // Kept only as a compatibility seam for the removed full-surface browser PoC.
-  // New browser instances are BrowserPane items inside the mixed project grid.
-  showBrowserView() {
-    this.cancelLayoutInteraction();
-  }
-
-  showTerminalView() {
-    this.workspaceView = this.activeProjectId ? "terminals" : "empty";
-    this.app.dataset.workspaceView = this.workspaceView;
-    if (this.workspaceView === "terminals") this.updateLayout(true);
-    this.renderActiveStatus();
-    requestAnimationFrame(() => {
-      for (const pane of this.layoutVisiblePanes()) pane.scheduleFit(0);
-      this.layoutPane(this.activePaneId ?? "")?.focus();
     });
   }
 
@@ -5817,9 +6675,12 @@ class TerminalWorkspace {
     this.cancelLayoutInteraction();
     this.nativeFileDropRegistrationEpoch += 1;
     this.browserUrlRegistrationEpoch += 1;
+    this.agentBrowserCommandRegistrationEpoch += 1;
     this.clearNativeFileDropTarget();
     for (const unlisten of this.nativeFileDropUnlisteners.splice(0)) unlisten();
     for (const unlisten of this.browserUrlUnlisteners.splice(0)) unlisten();
+    this.agentBrowserCommandUnlisten?.();
+    this.agentBrowserCommandUnlisten = null;
     this.app.removeEventListener("pointerdown", this.onAppPointerDown);
     window.removeEventListener("pointermove", this.onLayoutPointerMove, true);
     window.removeEventListener("pointerup", this.onLayoutPointerUp, true);
@@ -6007,13 +6868,6 @@ class TerminalWorkspace {
     );
   }
 
-  private layoutVisiblePanes(): LayoutPane[] {
-    const visible = this.visiblePanes();
-    if (!this.maximizedPaneId) return visible;
-    const maximized = visible.find((pane) => pane.id === this.maximizedPaneId);
-    return maximized ? [maximized] : visible;
-  }
-
   private visiblePanes(): LayoutPane[] {
     if (!this.activeProjectId) return [];
     const candidates = this.allPanes().filter(
@@ -6043,6 +6897,40 @@ class TerminalWorkspace {
 
   setModalOverlayOpen(reason: string, open: boolean) {
     this.setBrowserSuspensionReason(`modal:${reason}`, open);
+  }
+
+  async prepareSettingsModal(): Promise<void> {
+    const epoch = ++this.settingsPreviewEpoch;
+    for (const pane of this.settingsPreviewPanes) pane.clearSettingsPreview();
+    this.settingsPreviewPanes.clear();
+    const visiblePanes = [...this.browserPanes.values()].filter((pane) =>
+      pane.isVisibleForSettingsPreview(),
+    );
+    for (const pane of visiblePanes) this.settingsPreviewPanes.add(pane);
+    await Promise.all(visiblePanes.map((pane) => pane.prepareSettingsPreview()));
+    if (this.disposed || epoch !== this.settingsPreviewEpoch) {
+      for (const pane of visiblePanes) pane.clearSettingsPreview();
+      return;
+    }
+
+    this.setBrowserSuspensionReason("modal:settings", true);
+    await Promise.all(
+      [...this.browserPanes.values()].map((pane) =>
+        pane.waitUntilNativeHiddenForSettings(),
+      ),
+    );
+  }
+
+  async restoreSettingsModal(): Promise<void> {
+    this.settingsPreviewEpoch += 1;
+    this.setBrowserSuspensionReason("modal:settings", false);
+    const previewPanes = [...this.settingsPreviewPanes];
+    this.settingsPreviewPanes.clear();
+    if (this.disposed) {
+      for (const pane of previewPanes) pane.clearSettingsPreview();
+      return;
+    }
+    await Promise.all(previewPanes.map((pane) => pane.restoreNativeAfterSettings()));
   }
 
   private projectPaneCount(projectId: string) {
@@ -6212,243 +7100,6 @@ class TerminalWorkspace {
   }
 }
 
-class BrowserController {
-  private state: BrowserState = "closed";
-  private webview: Webview | null = null;
-  private label: string | null = null;
-  private generation = 0;
-  private boundsSyncPending = false;
-  private shuttingDown = false;
-  private boundsSyncQueue: Promise<void> = Promise.resolve();
-  private activeOperation: Promise<void> = Promise.resolve();
-  private readonly resizeObserver: ResizeObserver;
-
-  constructor(
-    private readonly workspace: TerminalWorkspace,
-    private readonly surface: HTMLElement,
-    private readonly button: HTMLButtonElement,
-  ) {
-    this.button.addEventListener("click", () => {
-      const operation = this.toggle();
-      this.activeOperation = operation;
-      void operation.catch((error) => {
-        this.workspace.setFooterStatus(String(error), "error");
-      });
-    });
-    this.resizeObserver = new ResizeObserver(() => this.scheduleBoundsSync());
-    this.resizeObserver.observe(this.surface);
-    window.addEventListener("resize", () => this.scheduleBoundsSync());
-  }
-
-  async toggle() {
-    if (this.shuttingDown) return;
-    if (this.state === "opening" || this.state === "closing") return;
-    if (this.state === "open") await this.close();
-    else await this.open();
-  }
-
-  beginShutdown() {
-    this.shuttingDown = true;
-    this.button.disabled = true;
-  }
-
-  async dispose() {
-    this.shuttingDown = true;
-    this.generation += 1;
-    this.resizeObserver.disconnect();
-    await this.activeOperation.catch(() => undefined);
-    const current = this.webview;
-    this.webview = null;
-    this.label = null;
-    this.state = "closed";
-    await this.boundsSyncQueue.catch(() => undefined);
-    if (current) {
-      await current.hide().catch(() => undefined);
-      await current.close().catch(() => undefined);
-    }
-  }
-
-  private async open() {
-    const generation = ++this.generation;
-    const label = `phase2-browser-${Date.now()}-${generation}`;
-    this.state = "opening";
-    this.label = label;
-    this.button.disabled = true;
-    this.button.textContent = tr("Opening browser…", "브라우저 여는 중…");
-    this.workspace.showBrowserView();
-    this.workspace.setFooterStatus(
-      tr("Preparing an isolated child WebView…", "격리된 child WebView를 준비하는 중…"),
-    );
-    let webview: Webview | null = null;
-    let removeCreatedListener: () => void = () => undefined;
-    let removeErrorListener: () => void = () => undefined;
-    try {
-      await nextAnimationFrame();
-      const bounds = this.surface.getBoundingClientRect();
-      webview = new Webview(getCurrentWindow(), label, {
-        url: "https://example.com",
-        x: Math.round(bounds.left),
-        y: Math.round(bounds.top),
-        width: Math.max(1, Math.round(bounds.width)),
-        height: Math.max(1, Math.round(bounds.height)),
-        focus: true,
-      });
-      this.webview = webview;
-
-      let markCreated: () => void = () => undefined;
-      let markFailed: (error: Error) => void = () => undefined;
-      const creationEvent = new Promise<void>((resolve, reject) => {
-        markCreated = resolve;
-        markFailed = reject;
-      });
-      [removeCreatedListener, removeErrorListener] = await Promise.all([
-        webview.once("tauri://created", markCreated),
-        webview.once<string>("tauri://error", (event) => {
-          markFailed(new Error(String(event.payload)));
-        }),
-      ]);
-      const missedEventFallback = delay(250).then(() => waitForWebview(label, 5_750));
-      await Promise.race([creationEvent, missedEventFallback]);
-      if (
-        generation !== this.generation ||
-        this.webview !== webview ||
-        this.label !== label
-      ) {
-        await webview.close().catch(() => undefined);
-        return;
-      }
-
-      this.state = "open";
-      this.button.textContent = tr("Close browser", "브라우저 닫기");
-      await this.syncBounds(generation, webview);
-      this.workspace.setFooterStatus(
-        tr(
-          "Browser PoC · terminal sessions continue running in the background",
-          "브라우저 PoC · 터미널 세션은 뒤에서 계속 실행 중",
-        ),
-      );
-    } catch (error) {
-      if (generation === this.generation) {
-        this.webview = null;
-        this.label = null;
-        this.state = "closed";
-        this.button.textContent = tr("Browser PoC", "브라우저 PoC");
-        this.workspace.showTerminalView();
-      }
-      if (webview) {
-        await webview.hide().catch(() => undefined);
-        await webview.close().catch(() => undefined);
-      }
-      throw new Error(
-        tr(`Failed to create browser: ${String(error)}`, `브라우저 생성 실패: ${String(error)}`),
-      );
-    } finally {
-      removeCreatedListener();
-      removeErrorListener();
-      if (generation === this.generation && !this.shuttingDown) {
-        this.button.disabled = false;
-      }
-    }
-  }
-
-  private async close() {
-    const webview = this.webview;
-    if (!webview) {
-      this.finishClosedState();
-      return;
-    }
-
-    const generation = ++this.generation;
-    this.state = "closing";
-    this.button.disabled = true;
-    this.button.textContent = tr("Closing browser…", "브라우저 닫는 중…");
-    try {
-      // A native child WebView must be hidden before terminal DOM is revealed.
-      await webview.hide();
-      if (generation !== this.generation) return;
-      this.workspace.showTerminalView();
-      await webview.close();
-      if (generation === this.generation) this.finishClosedState();
-    } catch (error) {
-      const stillExists = this.label ? await Webview.getByLabel(this.label) : null;
-      if (!stillExists) {
-        this.finishClosedState();
-        return;
-      }
-      this.state = "open";
-      this.webview = stillExists;
-      this.button.textContent = tr("Close browser", "브라우저 닫기");
-      this.workspace.showBrowserView();
-      await stillExists.show().catch(() => undefined);
-      throw new Error(
-        tr(`Failed to close browser: ${String(error)}`, `브라우저 종료 실패: ${String(error)}`),
-      );
-    } finally {
-      if (generation === this.generation && !this.shuttingDown) {
-        this.button.disabled = false;
-      }
-    }
-  }
-
-  private finishClosedState() {
-    this.webview = null;
-    this.label = null;
-    this.state = "closed";
-    this.button.disabled = this.shuttingDown;
-    this.button.textContent = tr("Browser PoC", "브라우저 PoC");
-    this.workspace.showTerminalView();
-  }
-
-  private scheduleBoundsSync() {
-    if (this.boundsSyncPending || this.state !== "open") return;
-    this.boundsSyncPending = true;
-    requestAnimationFrame(() => {
-      this.boundsSyncPending = false;
-      const generation = this.generation;
-      const webview = this.webview;
-      if (!webview || this.state !== "open") return;
-      this.boundsSyncQueue = this.boundsSyncQueue
-        .then(() => this.syncBounds(generation, webview))
-        .catch((error) => {
-          if (generation === this.generation && this.webview === webview) {
-            this.workspace.setFooterStatus(
-              tr(
-                `Failed to position browser: ${String(error)}`,
-                `브라우저 배치 실패: ${String(error)}`,
-              ),
-              "error",
-            );
-          }
-        });
-    });
-  }
-
-  private async syncBounds(generation: number, webview: Webview) {
-    if (
-      generation !== this.generation ||
-      this.state !== "open" ||
-      this.webview !== webview
-    ) {
-      return;
-    }
-
-    const bounds = this.surface.getBoundingClientRect();
-    if (bounds.width < 2 || bounds.height < 2) {
-      await webview.hide();
-      return;
-    }
-    await webview.setPosition(
-      new LogicalPosition(Math.round(bounds.left), Math.round(bounds.top)),
-    );
-    if (generation !== this.generation || this.webview !== webview) return;
-    await webview.setSize(
-      new LogicalSize(Math.round(bounds.width), Math.round(bounds.height)),
-    );
-    if (generation !== this.generation || this.webview !== webview) return;
-    await webview.show();
-  }
-}
-
 class PaneLauncherController {
   private readonly listeners = new AbortController();
   private shuttingDown = false;
@@ -6458,8 +7109,16 @@ class PaneLauncherController {
     private readonly toggleButton: HTMLButtonElement,
     private readonly menu: HTMLElement,
     powershellButton: HTMLButtonElement,
+    codexButton: HTMLButtonElement,
+    grokButton: HTMLButtonElement,
+    claudeButton: HTMLButtonElement,
+    openCodeButton: HTMLButtonElement,
     browserButton: HTMLButtonElement,
     addPowerShell: () => void,
+    addCodex: () => void,
+    addGrok: () => void,
+    addClaude: () => void,
+    addOpenCode: () => void,
     addBrowser: () => void,
   ) {
     const signal = this.listeners.signal;
@@ -6477,6 +7136,38 @@ class PaneLauncherController {
       () => {
         this.setOpen(false);
         addPowerShell();
+      },
+      { signal },
+    );
+    codexButton.addEventListener(
+      "click",
+      () => {
+        this.setOpen(false);
+        addCodex();
+      },
+      { signal },
+    );
+    grokButton.addEventListener(
+      "click",
+      () => {
+        this.setOpen(false);
+        addGrok();
+      },
+      { signal },
+    );
+    claudeButton.addEventListener(
+      "click",
+      () => {
+        this.setOpen(false);
+        addClaude();
+      },
+      { signal },
+    );
+    openCodeButton.addEventListener(
+      "click",
+      () => {
+        this.setOpen(false);
+        addOpenCode();
       },
       { signal },
     );
@@ -6525,6 +7216,33 @@ class PaneLauncherController {
   }
 }
 
+type FooterProviderLimitMap = Readonly<
+  Record<
+    FooterProviderId,
+    Readonly<{
+      fiveHour: ProviderUsageLimitElements | null;
+      weekly: ProviderUsageLimitElements;
+    }>
+  >
+>;
+
+function isManagedFooterProvider(provider: FooterProviderId): provider is AgentProvider {
+  return provider === "codex" || provider === "grok";
+}
+
+function footerProviderName(provider: FooterProviderId) {
+  switch (provider) {
+    case "codex":
+      return "Codex";
+    case "grok":
+      return "Grok";
+    case "claudeCode":
+      return "Claude Code";
+    case "openCode":
+      return "OpenCode";
+  }
+}
+
 class ProviderUsageController {
   private timer = 0;
   private resetTimer = 0;
@@ -6532,7 +7250,7 @@ class ProviderUsageController {
   private disposed = false;
   private latestUsage: ProviderUsageResponse | null = null;
   private usageStale = false;
-  private activeDetailProvider: AgentProvider | null = null;
+  private activeDetailProvider: FooterProviderId | null = null;
   private detailOpener: HTMLButtonElement | null = null;
   private detailAccounts: ProviderAccountListResponse | null | undefined;
   private accountBusy = false;
@@ -6541,13 +7259,18 @@ class ProviderUsageController {
   private accountRequestSequence = 0;
   private readonly listeners = new AbortController();
   private readonly detailResizeObserver: ResizeObserver;
+  private readonly unsubscribeFooterSettings: () => void;
+  private draggedProvider: FooterProviderId | null = null;
+  private dropTargetProvider: FooterProviderId | null = null;
+  private dropPosition: "before" | "after" | null = null;
+  private suppressNextTriggerClick = false;
 
   constructor(
-    private readonly codexTrigger: HTMLButtonElement,
-    private readonly grokTrigger: HTMLButtonElement,
-    private readonly codexFiveHour: ProviderUsageLimitElements,
-    private readonly codexWeekly: ProviderUsageLimitElements,
-    private readonly grokWeekly: ProviderUsageLimitElements,
+    private readonly usageRoot: HTMLElement,
+    private readonly triggers: Readonly<Record<FooterProviderId, HTMLButtonElement>>,
+    private readonly limits: FooterProviderLimitMap,
+    private readonly visibilityInputs: Readonly<Record<FooterProviderId, HTMLInputElement>>,
+    private readonly orderStatus: HTMLElement,
     private readonly detail: ProviderUsageDetailElements,
     private readonly setNativeOverlayOpen: (bounds: RectangleBounds | null) => void,
     private readonly ensureAccountSwitchReady: () => Promise<void>,
@@ -6557,16 +7280,31 @@ class ProviderUsageController {
     const signal = this.listeners.signal;
     this.detailResizeObserver = new ResizeObserver(() => this.syncNativeOverlayBounds());
     this.detailResizeObserver.observe(this.detail.popover);
-    this.codexTrigger.addEventListener(
-      "click",
-      () => this.toggleDetail("codex", this.codexTrigger),
-      { signal },
+    for (const provider of FOOTER_PROVIDER_IDS) {
+      const trigger = this.triggers[provider];
+      trigger.addEventListener("click", () => {
+        if (this.suppressNextTriggerClick) return;
+        this.toggleDetail(provider, trigger);
+      }, { signal });
+      trigger.addEventListener("dragstart", (event) => this.onProviderDragStart(provider, event), {
+        signal,
+      });
+      trigger.addEventListener("keydown", (event) => this.onProviderKeyDown(provider, event), {
+        signal,
+      });
+      this.visibilityInputs[provider].addEventListener("change", () => {
+        setFooterProviderVisible(provider, this.visibilityInputs[provider].checked);
+      }, { signal });
+    }
+    this.usageRoot.addEventListener("dragover", (event) => this.onProviderDragOver(event), {
+      signal,
+    });
+    this.usageRoot.addEventListener("drop", (event) => this.onProviderDrop(event), { signal });
+    this.usageRoot.addEventListener("dragend", () => this.finishProviderDrag(), { signal });
+    this.unsubscribeFooterSettings = subscribeFooterProviderSettings((settings) =>
+      this.applyFooterSettings(settings, true),
     );
-    this.grokTrigger.addEventListener(
-      "click",
-      () => this.toggleDetail("grok", this.grokTrigger),
-      { signal },
-    );
+    this.applyFooterSettings(getFooterProviderSettings(), false);
     this.detail.closeButton.addEventListener("click", () => this.requestCloseDetail(true), {
       signal,
     });
@@ -6597,6 +7335,7 @@ class ProviderUsageController {
 
   refreshLocalizedUi() {
     this.setUsageStale(this.usageStale);
+    this.renderTriggerAria(this.activeDetailProvider);
     this.renderLatestUsage();
   }
 
@@ -6606,9 +7345,11 @@ class ProviderUsageController {
     window.clearTimeout(this.resetTimer);
     this.accountRequestSequence += 1;
     this.listeners.abort();
+    this.unsubscribeFooterSettings();
     this.detailResizeObserver.disconnect();
-    this.codexTrigger.setAttribute("aria-expanded", "false");
-    this.grokTrigger.setAttribute("aria-expanded", "false");
+    for (const trigger of Object.values(this.triggers)) {
+      trigger.setAttribute("aria-expanded", "false");
+    }
     this.detailOpener = null;
     this.activeDetailProvider = null;
     this.detail.popover.hidden = true;
@@ -6671,7 +7412,7 @@ class ProviderUsageController {
           "사용량 갱신에 실패했습니다. 마지막으로 확인한 값을 표시합니다.",
         )
       : "";
-    for (const trigger of [this.codexTrigger, this.grokTrigger]) {
+    for (const trigger of Object.values(this.triggers)) {
       trigger.dataset.stale = String(stale);
       trigger.title = title;
     }
@@ -6681,10 +7422,182 @@ class ProviderUsageController {
   private renderLatestUsage() {
     const usage = this.latestUsage;
     if (!usage) return;
-    this.renderLimit(this.codexFiveHour, usage.codex.fiveHour, tr("Codex 5-hour", "Codex 5시간"));
-    this.renderLimit(this.codexWeekly, usage.codex.weekly, tr("Codex weekly", "Codex 주간"));
-    this.renderLimit(this.grokWeekly, usage.grok.weekly, tr("Grok weekly", "Grok 주간"));
+    this.renderLimit(this.limits.codex.fiveHour!, usage.codex.fiveHour, tr("Codex 5-hour", "Codex 5시간"));
+    this.renderLimit(this.limits.codex.weekly, usage.codex.weekly, tr("Codex weekly", "Codex 주간"));
+    this.renderLimit(this.limits.grok.weekly, usage.grok.weekly, tr("Grok weekly", "Grok 주간"));
+    this.renderUnsupportedLimit(this.limits.claudeCode.weekly, "Claude Code");
+    this.renderUnsupportedLimit(this.limits.openCode.weekly, "OpenCode");
     this.renderDetail();
+  }
+
+  private renderUnsupportedLimit(elements: ProviderUsageLimitElements, providerName: string) {
+    elements.root.dataset.available = "false";
+    delete elements.root.dataset.remainingTone;
+    elements.root.setAttribute(
+      "aria-label",
+      tr(
+        `${providerName} does not expose a stable local remaining-limit value`,
+        `${providerName}에서 안정적인 로컬 남은 한도 정보를 제공하지 않음`,
+      ),
+    );
+    elements.meter.hidden = true;
+    elements.meter.value = 0;
+    elements.value.textContent = tr("Unavailable", "정보 없음");
+    elements.reset.hidden = true;
+    elements.reset.textContent = "";
+  }
+
+  private renderTriggerAria(activeProvider: FooterProviderId | null) {
+    for (const provider of FOOTER_PROVIDER_IDS) {
+      const active = provider === activeProvider;
+      const name = footerProviderName(provider);
+      const trigger = this.triggers[provider];
+      trigger.setAttribute("aria-expanded", String(active));
+      trigger.setAttribute(
+        "aria-label",
+        active
+          ? tr(`Close ${name} usage details`, `${name} 사용량 상세 닫기`)
+          : tr(`View ${name} usage details`, `${name} 사용량 상세 보기`),
+      );
+    }
+  }
+
+  private applyFooterSettings(settings: FooterProviderSettings, closeOpenDetail: boolean) {
+    // Respect an in-flight account operation. In particular, an OAuth add flow
+    // must be cancelled and settled before its popover can safely disappear.
+    if (closeOpenDetail && !this.detail.popover.hidden) this.requestCloseDetail(false);
+    const visible = new Set(settings.visible);
+    for (const provider of settings.order) {
+      const trigger = this.triggers[provider];
+      trigger.hidden = !visible.has(provider);
+      trigger.draggable = visible.has(provider);
+      delete trigger.dataset.firstVisible;
+      this.visibilityInputs[provider].checked = visible.has(provider);
+      this.usageRoot.append(trigger);
+    }
+    const firstVisible = visibleFooterProviders(settings)[0];
+    if (firstVisible) this.triggers[firstVisible].dataset.firstVisible = "true";
+    this.clearProviderDropIndicators();
+  }
+
+  private onProviderDragStart(provider: FooterProviderId, event: DragEvent) {
+    if (this.accountBusy || !isFooterProviderVisible(getFooterProviderSettings(), provider)) {
+      event.preventDefault();
+      return;
+    }
+    this.requestCloseDetail(false);
+    this.draggedProvider = provider;
+    this.suppressNextTriggerClick = true;
+    if (event.dataTransfer) {
+      event.dataTransfer.effectAllowed = "move";
+      event.dataTransfer.setData("text/plain", provider);
+    }
+    requestAnimationFrame(() => {
+      if (this.draggedProvider === provider) this.triggers[provider].dataset.dragging = "true";
+    });
+  }
+
+  private onProviderDragOver(event: DragEvent) {
+    const dragged = this.draggedProvider;
+    if (!dragged) return;
+    event.preventDefault();
+    if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+    const element = event.target instanceof Element
+      ? event.target.closest<HTMLElement>(".provider-usage-item")
+      : null;
+    const target = element?.dataset.provider;
+    this.clearProviderDropIndicators();
+    if (target === dragged) {
+      this.dropTargetProvider = dragged;
+      this.dropPosition = null;
+      return;
+    }
+    if (!element || !isFooterProviderId(target) || element.hidden) {
+      this.dropTargetProvider = null;
+      this.dropPosition = "after";
+      return;
+    }
+    const rect = element.getBoundingClientRect();
+    const position = event.clientX < rect.left + rect.width / 2 ? "before" : "after";
+    this.dropTargetProvider = target;
+    this.dropPosition = position;
+    element.dataset.dropPosition = position;
+  }
+
+  private onProviderDrop(event: DragEvent) {
+    const dragged = this.draggedProvider;
+    if (!dragged) return;
+    event.preventDefault();
+    const target = this.dropTargetProvider;
+    const position = this.dropPosition;
+    if (target === dragged && position === null) {
+      // Dropping back onto the source keeps the current order.
+    } else if (target && position) {
+      this.reorderProviderRelative(dragged, target, position);
+    } else {
+      this.requestCloseDetail(false);
+      reorderFooterProvider(dragged, null);
+    }
+    this.announceProviderOrder(dragged);
+    this.finishProviderDrag();
+  }
+
+  private onProviderKeyDown(provider: FooterProviderId, event: KeyboardEvent) {
+    if (!event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+    const offset = event.key === "ArrowLeft" ? -1 : event.key === "ArrowRight" ? 1 : 0;
+    if (offset === 0) return;
+    // The shortcut belongs to the status bar even at either edge. Consume it
+    // before checking for a neighbour so the WebView cannot navigate back/forward.
+    event.preventDefault();
+    event.stopPropagation();
+    const visible = visibleFooterProviders(getFooterProviderSettings());
+    const index = visible.indexOf(provider);
+    const target = visible[index + offset];
+    if (!target) return;
+    this.reorderProviderRelative(provider, target, offset < 0 ? "before" : "after");
+    this.announceProviderOrder(provider);
+    this.triggers[provider].focus();
+  }
+
+  private reorderProviderRelative(
+    provider: FooterProviderId,
+    target: FooterProviderId,
+    position: "before" | "after",
+  ) {
+    this.requestCloseDetail(false);
+    const remaining = getFooterProviderSettings().order.filter((candidate) => candidate !== provider);
+    const targetIndex = remaining.indexOf(target);
+    if (targetIndex < 0) return;
+    const beforeProvider = position === "before" ? target : (remaining[targetIndex + 1] ?? null);
+    reorderFooterProvider(provider, beforeProvider);
+  }
+
+  private announceProviderOrder(provider: FooterProviderId) {
+    const visible = visibleFooterProviders(getFooterProviderSettings());
+    const index = visible.indexOf(provider);
+    if (index < 0) return;
+    const name = footerProviderName(provider);
+    this.orderStatus.textContent = tr(
+      `${name} moved to position ${index + 1} of ${visible.length}.`,
+      `${name} 항목을 ${visible.length}개 중 ${index + 1}번째로 이동했습니다.`,
+    );
+  }
+
+  private clearProviderDropIndicators() {
+    for (const trigger of Object.values(this.triggers)) {
+      delete trigger.dataset.dropPosition;
+    }
+  }
+
+  private finishProviderDrag() {
+    if (this.draggedProvider) delete this.triggers[this.draggedProvider].dataset.dragging;
+    this.draggedProvider = null;
+    this.dropTargetProvider = null;
+    this.dropPosition = null;
+    this.clearProviderDropIndicators();
+    window.setTimeout(() => {
+      this.suppressNextTriggerClick = false;
+    }, 0);
   }
 
   private renderLimit(
@@ -6694,6 +7607,7 @@ class ProviderUsageController {
   ) {
     if (!limit) {
       elements.root.dataset.available = "false";
+      delete elements.root.dataset.remainingTone;
       elements.root.setAttribute(
         "aria-label",
         tr(`${label} remaining limit unavailable`, `${label} 남은 한도 정보 없음`),
@@ -6708,6 +7622,7 @@ class ProviderUsageController {
     const rounded = Math.round(limit.remainingPercent);
     const reset = formatProviderResetCountdown(limit.resetsAt);
     elements.root.dataset.available = "true";
+    elements.root.dataset.remainingTone = providerUsageRemainingTone(limit.remainingPercent);
     elements.root.setAttribute(
       "aria-label",
       tr(`${label}, ${rounded}% remaining, ${reset}`, `${label}, ${rounded}% 남음, ${reset}`),
@@ -6719,7 +7634,7 @@ class ProviderUsageController {
     elements.reset.textContent = "";
   }
 
-  private toggleDetail(provider: AgentProvider, opener: HTMLButtonElement) {
+  private toggleDetail(provider: FooterProviderId, opener: HTMLButtonElement) {
     if (this.disposed) return;
     if (!this.detail.popover.hidden && this.activeDetailProvider === provider) {
       this.requestCloseDetail(false);
@@ -6728,42 +7643,24 @@ class ProviderUsageController {
     if (this.accountBusy) return;
     this.activeDetailProvider = provider;
     this.detailOpener = opener;
-    this.codexTrigger.setAttribute("aria-expanded", String(provider === "codex"));
-    this.grokTrigger.setAttribute("aria-expanded", String(provider === "grok"));
-    this.codexTrigger.setAttribute(
-      "aria-label",
-      provider === "codex"
-        ? tr("Close Codex usage details", "Codex 남은 한도 상세 닫기")
-        : tr("View Codex usage details", "Codex 남은 한도 상세 보기"),
-    );
-    this.grokTrigger.setAttribute(
-      "aria-label",
-      provider === "grok"
-        ? tr("Close Grok usage details", "Grok 남은 한도 상세 닫기")
-        : tr("View Grok usage details", "Grok 남은 한도 상세 보기"),
-    );
+    this.renderTriggerAria(provider);
     this.detailAccounts = undefined;
     this.detail.popover.hidden = false;
     this.positionDetail();
     this.renderDetail();
     void this.refresh();
-    void this.refreshAccount(provider);
+    if (isManagedFooterProvider(provider)) {
+      void this.refreshAccount(provider);
+    } else {
+      this.detailAccounts = null;
+    }
   }
 
   private closeDetail(restoreFocus: boolean) {
     if (this.detail.popover.hidden) return;
     const opener = this.detailOpener;
     this.detail.popover.hidden = true;
-    this.codexTrigger.setAttribute("aria-expanded", "false");
-    this.grokTrigger.setAttribute("aria-expanded", "false");
-    this.codexTrigger.setAttribute(
-      "aria-label",
-      tr("View Codex usage details", "Codex 남은 한도 상세 보기"),
-    );
-    this.grokTrigger.setAttribute(
-      "aria-label",
-      tr("View Grok usage details", "Grok 남은 한도 상세 보기"),
-    );
+    this.renderTriggerAria(null);
     this.detailOpener = null;
     this.activeDetailProvider = null;
     this.accountRequestSequence += 1;
@@ -6783,7 +7680,7 @@ class ProviderUsageController {
 
   private async cancelAccountAddAndClose(restoreFocus: boolean) {
     const provider = this.activeDetailProvider;
-    if (!provider || this.accountOperation !== "adding") return;
+    if (!provider || !isManagedFooterProvider(provider) || this.accountOperation !== "adding") return;
     const pendingAdd = this.pendingAccountAdd;
     this.accountOperation = "cancelling";
     this.accountRequestSequence += 1;
@@ -6817,8 +7714,7 @@ class ProviderUsageController {
     if (!(target instanceof Node)) return;
     if (
       this.detail.popover.contains(target) ||
-      this.codexTrigger.contains(target) ||
-      this.grokTrigger.contains(target)
+      Object.values(this.triggers).some((trigger) => trigger.contains(target))
     ) {
       return;
     }
@@ -6898,6 +7794,7 @@ class ProviderUsageController {
     const accounts = this.detailAccounts;
     if (
       !provider ||
+      !isManagedFooterProvider(provider) ||
       !accounts ||
       this.accountBusy ||
       accountId === accounts.activeAccountId ||
@@ -7033,7 +7930,13 @@ class ProviderUsageController {
   private async addAccount() {
     const provider = this.activeDetailProvider;
     const accounts = this.detailAccounts;
-    if (!provider || !accounts || this.accountBusy || accounts.accounts.length >= 32) return;
+    if (
+      !provider ||
+      !isManagedFooterProvider(provider) ||
+      !accounts ||
+      this.accountBusy ||
+      accounts.accounts.length >= 32
+    ) return;
     const previousAccountId = accounts.activeAccountId;
     const existingAccountIds = new Set(accounts.accounts.map((account) => account.id));
     const providerName = provider === "codex" ? "Codex" : "Grok";
@@ -7132,12 +8035,22 @@ class ProviderUsageController {
     const provider = this.activeDetailProvider;
     if (!provider || this.detail.popover.hidden) return;
 
-    const providerName = provider === "codex" ? "CODEX" : "GROK";
+    const providerName = footerProviderName(provider).toUpperCase();
     this.detail.popover.dataset.provider = provider;
     this.detail.title.textContent = providerName;
     this.renderDetailAccount();
 
     const usage = this.latestUsage?.[provider] ?? null;
+    if (!isManagedFooterProvider(provider)) {
+      this.detail.fiveHour.root.hidden = true;
+      this.detail.weekly.root.hidden = true;
+      this.detail.popover.setAttribute("aria-busy", "false");
+      this.detail.usageState.textContent = tr(
+        `${footerProviderName(provider)} does not expose a stable local remaining-limit or reset-time value.`,
+        `${footerProviderName(provider)}에서는 안정적인 로컬 남은 한도나 초기화 시각 정보를 제공하지 않습니다.`,
+      );
+      return;
+    }
     const showFiveHour = provider === "codex" || usage?.fiveHour != null;
     this.detail.fiveHour.root.hidden = !showFiveHour;
     if (showFiveHour) {
@@ -7172,8 +8085,16 @@ class ProviderUsageController {
     const adding = this.accountOperation === "adding";
     const cancelling = this.accountOperation === "cancelling";
     const switching = this.accountOperation === "switching";
-    this.codexTrigger.disabled = switching || cancelling || (adding && provider !== "codex");
-    this.grokTrigger.disabled = switching || cancelling || (adding && provider !== "grok");
+    for (const candidate of FOOTER_PROVIDER_IDS) {
+      this.triggers[candidate].disabled =
+        switching || cancelling || (adding && provider !== candidate);
+    }
+    const managedProvider = provider !== null && isManagedFooterProvider(provider);
+    this.detail.accountSection.hidden = !managedProvider;
+    if (!managedProvider) {
+      this.detail.closeButton.disabled = false;
+      return;
+    }
     this.detail.closeButton.disabled = switching || cancelling;
     this.detail.closeButton.title = adding
       ? tr("Cancel account addition and close", "계정 추가 취소하고 닫기")
@@ -7267,6 +8188,162 @@ class ProviderUsageController {
   }
 }
 
+class AgentConnectionsController {
+  private statuses: Map<AgentSettingsProvider, AgentCliStatus> | null = null;
+  private lastError: string | null = null;
+  private requestGeneration = 0;
+  private refreshing = false;
+  private launching: AgentSettingsLaunchProfile | null = null;
+  private disposed = false;
+
+  constructor(
+    private readonly dialog: HTMLDialogElement,
+    private readonly panel: HTMLElement,
+    private readonly refreshButton: HTMLButtonElement,
+    private readonly statusElement: HTMLElement,
+    private readonly rows: readonly AgentConnectionRowElements[],
+    private readonly openAgent: (
+      launchProfile: AgentSettingsLaunchProfile,
+    ) => Promise<void> | void,
+  ) {
+    this.refreshButton.addEventListener("click", () => void this.refresh());
+    for (const row of this.rows) {
+      row.button.addEventListener("click", () => void this.launch(row));
+    }
+    this.render();
+  }
+
+  refresh() {
+    const generation = ++this.requestGeneration;
+    this.refreshing = true;
+    this.lastError = null;
+    this.render();
+    return invoke<unknown>("read_agent_cli_statuses")
+      .then((value) => {
+        const statuses = normalizeAgentCliStatuses(value);
+        if (this.disposed || generation !== this.requestGeneration) return;
+        this.statuses = new Map(statuses.map((status) => [status.provider, status]));
+      })
+      .catch((error: unknown) => {
+        if (this.disposed || generation !== this.requestGeneration) return;
+        this.lastError = error instanceof Error ? error.message : String(error);
+      })
+      .finally(() => {
+        if (this.disposed || generation !== this.requestGeneration) return;
+        this.refreshing = false;
+        this.render();
+      });
+  }
+
+  refreshLocalizedUi() {
+    this.render();
+  }
+
+  dispose() {
+    this.disposed = true;
+    this.requestGeneration += 1;
+  }
+
+  private async launch(row: AgentConnectionRowElements) {
+    const status = this.statuses?.get(row.provider);
+    if (this.disposed || this.launching || !status?.installed) return;
+    this.launching = row.launchProfile;
+    this.lastError = null;
+    this.render();
+    try {
+      await this.openAgent(row.launchProfile);
+      if (!this.disposed) this.dialog.close();
+    } catch (error) {
+      if (this.disposed) return;
+      this.lastError = error instanceof Error ? error.message : String(error);
+    } finally {
+      if (!this.disposed) {
+        this.launching = null;
+        this.render();
+      }
+    }
+  }
+
+  private render() {
+    this.panel.setAttribute("aria-busy", String(this.refreshing));
+    this.refreshButton.disabled = this.refreshing || this.launching !== null;
+
+    for (const row of this.rows) {
+      const status = this.statuses?.get(row.provider) ?? null;
+      const installed = status?.installed === true;
+      row.root.dataset.installed = String(installed);
+      row.root.dataset.authState = status?.authState ?? "unknown";
+      row.state.textContent = this.agentStateLabel(status);
+      row.account.textContent = this.agentAccountLabel(status);
+
+      const shouldConnect = status?.authState === "notAuthenticated";
+      const action = shouldConnect ? tr("Connect", "연결") : tr("Open", "열기");
+      row.button.textContent = action;
+      row.button.disabled =
+        this.refreshing || this.launching !== null || status === null || !installed;
+      row.button.setAttribute(
+        "aria-label",
+        tr(
+          `${action} ${agentProviderDisplayName(row.provider)} in the current project`,
+          `현재 프로젝트에서 ${agentProviderDisplayName(row.provider)} ${action}`,
+        ),
+      );
+    }
+
+    this.statusElement.dataset.tone = this.lastError ? "error" : "normal";
+    this.statusElement.textContent = this.launching
+      ? tr(
+          `Opening ${agentLaunchProfileDisplayName(this.launching)}…`,
+          `${agentLaunchProfileDisplayName(this.launching)} 여는 중…`,
+        )
+      : this.refreshing
+        ? tr("Checking installed agent CLIs…", "설치된 에이전트 CLI 확인 중…")
+        : this.lastError
+          ? tr(
+              `Could not refresh agent status: ${localizeBackendMessage(this.lastError)}`,
+              `에이전트 상태를 새로고침하지 못했습니다: ${localizeBackendMessage(this.lastError)}`,
+            )
+          : this.statuses
+            ? tr("Agent status is up to date.", "에이전트 상태가 최신입니다.")
+            : tr(
+                "Refresh to check installed agents.",
+                "새로고침하여 설치된 에이전트를 확인하세요.",
+              );
+  }
+
+  private agentStateLabel(status: AgentCliStatus | null) {
+    if (!status) return tr("Checking…", "확인 중…");
+    if (!status.installed) return tr("Not installed", "설치되지 않음");
+    switch (status.authState) {
+      case "connected":
+        return tr("Connected", "연결됨");
+      case "credentialsPresent":
+        return tr("Credentials found", "인증 정보 있음");
+      case "notAuthenticated":
+        return tr("Sign-in required", "로그인 필요");
+      case "unknown":
+        return tr("Connection status unknown", "연결 상태 확인 불가");
+    }
+  }
+
+  private agentAccountLabel(status: AgentCliStatus | null) {
+    if (!status?.installed) return "";
+    const details: string[] = [];
+    if (status.accountLabel) {
+      details.push(tr(`Account: ${status.accountLabel}`, `계정: ${status.accountLabel}`));
+    }
+    if (status.credentialCount !== null) {
+      details.push(
+        tr(
+          `${formatAppNumber(status.credentialCount)} credential${status.credentialCount === 1 ? "" : "s"}`,
+          `인증 정보 ${formatAppNumber(status.credentialCount)}개`,
+        ),
+      );
+    }
+    return details.join(" · ");
+  }
+}
+
 class PhoneNotificationController {
   private settings: PhoneNotificationSettings | null = null;
   private loadPromise: Promise<void> | null = null;
@@ -7276,7 +8353,9 @@ class PhoneNotificationController {
   private busy = false;
   private disposed = false;
   private settingsLoadError: string | null = null;
-  private activeSettingsTab: "general" | "optimization" | "notifications" = "general";
+  private activeSettingsTab: "general" | "optimization" | "agents" | "notifications" =
+    "general";
+  private settingsOpening = false;
   private readonly saveButton: HTMLButtonElement;
 
   constructor(
@@ -7285,10 +8364,13 @@ class PhoneNotificationController {
     private readonly form: HTMLFormElement,
     private readonly generalTab: HTMLButtonElement,
     private readonly optimizationTab: HTMLButtonElement,
+    private readonly agentsTab: HTMLButtonElement,
     private readonly notificationsTab: HTMLButtonElement,
     private readonly generalPanel: HTMLElement,
     private readonly optimizationPanel: HTMLElement,
+    private readonly agentsPanel: HTMLElement,
     private readonly notificationsPanel: HTMLElement,
+    private readonly agentConnections: AgentConnectionsController,
     private readonly languageSelect: HTMLSelectElement,
     private readonly autoSleepIdleAgentsInput: HTMLInputElement,
     private readonly enabledInput: HTMLInputElement,
@@ -7300,7 +8382,7 @@ class PhoneNotificationController {
     private readonly testButton: HTMLButtonElement,
     private readonly closeButton: HTMLButtonElement,
     private readonly status: HTMLElement,
-    private readonly setModalOpen: (open: boolean) => void,
+    private readonly setModalOpen: (open: boolean) => Promise<void> | void,
     private readonly setAutoSleepIdleAgentsEnabled: (enabled: boolean) => void,
   ) {
     const saveButton = this.form.querySelector<HTMLButtonElement>(".dialog-submit");
@@ -7309,16 +8391,24 @@ class PhoneNotificationController {
     // General settings are local-only and must remain available even while
     // the optional Discord backend is loading or unavailable.
     this.openButton.disabled = false;
-    this.openButton.addEventListener("click", () => this.open());
+    this.openButton.addEventListener("click", () => void this.open());
     this.closeButton.addEventListener("click", () => this.dialog.close());
     this.generalTab.addEventListener("click", () => this.setActiveSettingsTab("general", true));
     this.optimizationTab.addEventListener("click", () =>
       this.setActiveSettingsTab("optimization", true),
     );
+    this.agentsTab.addEventListener("click", () =>
+      this.setActiveSettingsTab("agents", true),
+    );
     this.notificationsTab.addEventListener("click", () =>
       this.setActiveSettingsTab("notifications", true),
     );
-    for (const tab of [this.generalTab, this.optimizationTab, this.notificationsTab]) {
+    for (const tab of [
+      this.generalTab,
+      this.optimizationTab,
+      this.agentsTab,
+      this.notificationsTab,
+    ]) {
       tab.addEventListener("keydown", (event) => this.onSettingsTabKeyDown(event));
     }
     this.languageSelect.addEventListener("change", () => {
@@ -7336,7 +8426,7 @@ class PhoneNotificationController {
       event.preventDefault();
       void this.save(true);
     });
-    this.dialog.addEventListener("close", () => this.setModalOpen(false));
+    this.dialog.addEventListener("close", () => void this.setModalOpen(false));
     this.languageSelect.value = getAppLanguage();
     this.autoSleepIdleAgentsInput.checked = getAutoSleepIdleAgents();
     this.setActiveSettingsTab("general", false);
@@ -7353,11 +8443,12 @@ class PhoneNotificationController {
     this.autoSleepIdleAgentsInput.checked = getAutoSleepIdleAgents();
     this.renderButton();
     this.renderWebhookState();
+    this.agentConnections.refreshLocalizedUi();
   }
 
   dispose() {
     this.disposed = true;
-    this.setModalOpen(false);
+    void this.setModalOpen(false);
     this.deliveryQueue.length = 0;
     for (const [timer, resolve] of this.retryWaiters) {
       window.clearTimeout(timer);
@@ -7452,9 +8543,10 @@ class PhoneNotificationController {
     }
   }
 
-  private open() {
+  private async open() {
     const settings = this.settings;
-    if (this.dialog.open) return;
+    if (this.dialog.open || this.settingsOpening) return;
+    this.settingsOpening = true;
     this.languageSelect.value = getAppLanguage();
     this.autoSleepIdleAgentsInput.checked = getAutoSleepIdleAgents();
     if (settings) {
@@ -7474,24 +8566,31 @@ class PhoneNotificationController {
       this.settingsLoadError ? "error" : "normal",
     );
     this.setActiveSettingsTab("general", false);
-    this.setModalOpen(true);
     try {
+      await this.setModalOpen(true);
+      if (this.disposed) {
+        await this.setModalOpen(false);
+        return;
+      }
       this.dialog.showModal();
     } catch (error) {
-      this.setModalOpen(false);
+      await this.setModalOpen(false);
       throw error;
+    } finally {
+      this.settingsOpening = false;
     }
     this.generalTab.focus();
   }
 
   private setActiveSettingsTab(
-    tab: "general" | "optimization" | "notifications",
+    tab: "general" | "optimization" | "agents" | "notifications",
     focus: boolean,
   ) {
     this.activeSettingsTab = tab;
     const entries = [
       ["general", this.generalTab, this.generalPanel],
       ["optimization", this.optimizationTab, this.optimizationPanel],
+      ["agents", this.agentsTab, this.agentsPanel],
       ["notifications", this.notificationsTab, this.notificationsPanel],
     ] as const;
     for (const [name, tabElement, panel] of entries) {
@@ -7503,11 +8602,12 @@ class PhoneNotificationController {
     const notificationsActive = tab === "notifications";
     this.testButton.hidden = !notificationsActive;
     this.saveButton.hidden = !notificationsActive;
+    if (tab === "agents") void this.agentConnections.refresh();
     if (focus) entries.find(([name]) => name === tab)?.[1].focus();
   }
 
   private onSettingsTabKeyDown(event: KeyboardEvent) {
-    const tabs = ["general", "optimization", "notifications"] as const;
+    const tabs = ["general", "optimization", "agents", "notifications"] as const;
     if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
     event.preventDefault();
     const currentIndex = tabs.indexOf(this.activeSettingsTab);
@@ -8256,7 +9356,14 @@ function createTerminalArrowEvent(
   type: "keydown" | "keyup",
   key: "ArrowLeft" | "ArrowRight",
 ) {
-  const keyCode = key === "ArrowLeft" ? 37 : 39;
+  return createTerminalEditingKeyEvent(type, key);
+}
+
+function createTerminalEditingKeyEvent(
+  type: "keydown" | "keyup",
+  key: "ArrowLeft" | "ArrowRight" | "Backspace",
+) {
+  const keyCode = key === "ArrowLeft" ? 37 : key === "ArrowRight" ? 39 : 8;
   const event = new KeyboardEvent(type, {
     key,
     code: key,
@@ -8307,6 +9414,97 @@ function normalizePhoneNotificationSettings(value: unknown): PhoneNotificationSe
     notifyOnSuccess: value.notifyOnSuccess,
     notifyOnError: value.notifyOnError,
   };
+}
+
+const AGENT_SETTINGS_PROVIDER_ORDER = [
+  "codex",
+  "grok",
+  "claudeCode",
+  "openCode",
+] as const satisfies readonly AgentSettingsProvider[];
+
+function normalizeAgentCliStatuses(value: unknown): AgentCliStatus[] {
+  if (
+    !isRecord(value) ||
+    !Array.isArray(value.agents) ||
+    value.agents.length !== AGENT_SETTINGS_PROVIDER_ORDER.length
+  ) {
+    throw new Error(tr("The agent status format is invalid.", "에이전트 상태 형식이 올바르지 않습니다."));
+  }
+  const statuses = new Map<AgentSettingsProvider, AgentCliStatus>();
+  for (const candidate of value.agents) {
+    if (
+      !isRecord(candidate) ||
+      !isAgentSettingsProvider(candidate.provider) ||
+      typeof candidate.installed !== "boolean" ||
+      !isAgentAuthenticationState(candidate.status) ||
+      (candidate.email !== undefined &&
+        (typeof candidate.email !== "string" || candidate.email.length > 254)) ||
+      (candidate.credentialCount !== undefined &&
+        (!isSafeNonNegativeInteger(candidate.credentialCount) ||
+          candidate.credentialCount > 4_294_967_295)) ||
+      statuses.has(candidate.provider)
+    ) {
+      throw new Error(
+        tr("The agent status format is invalid.", "에이전트 상태 형식이 올바르지 않습니다."),
+      );
+    }
+    const accountLabel =
+      typeof candidate.email === "string" && candidate.email.trim().length > 0
+        ? candidate.email.trim()
+        : null;
+    statuses.set(candidate.provider, {
+      provider: candidate.provider,
+      installed: candidate.installed,
+      authState: candidate.status,
+      accountLabel,
+      credentialCount:
+        candidate.credentialCount === undefined ? null : candidate.credentialCount,
+    });
+  }
+  if (
+    statuses.size !== AGENT_SETTINGS_PROVIDER_ORDER.length ||
+    AGENT_SETTINGS_PROVIDER_ORDER.some((provider) => !statuses.has(provider))
+  ) {
+    throw new Error(tr("The agent status format is invalid.", "에이전트 상태 형식이 올바르지 않습니다."));
+  }
+  return AGENT_SETTINGS_PROVIDER_ORDER.map((provider) => statuses.get(provider)!);
+}
+
+function isAgentSettingsProvider(value: unknown): value is AgentSettingsProvider {
+  return AGENT_SETTINGS_PROVIDER_ORDER.some((provider) => provider === value);
+}
+
+function isAgentAuthenticationState(value: unknown): value is AgentAuthenticationState {
+  return (
+    value === "connected" ||
+    value === "credentialsPresent" ||
+    value === "notAuthenticated" ||
+    value === "unknown"
+  );
+}
+
+function agentProviderDisplayName(provider: AgentSettingsProvider) {
+  switch (provider) {
+    case "codex":
+      return "Codex";
+    case "grok":
+      return "Grok";
+    case "claudeCode":
+      return "Claude Code";
+    case "openCode":
+      return "OpenCode";
+  }
+}
+
+function agentLaunchProfileDisplayName(profile: AgentSettingsLaunchProfile) {
+  return profile === "claude"
+    ? "Claude Code"
+    : profile === "opencode"
+      ? "OpenCode"
+      : profile === "codex"
+        ? "Codex"
+        : "Grok";
 }
 
 function normalizeClipboardSnapshot(value: unknown): NativeClipboardSnapshot {
@@ -8365,6 +9563,30 @@ function requireDialog(id: string): HTMLDialogElement {
   return element;
 }
 
+function requireAgentConnectionRows(panel: HTMLElement): AgentConnectionRowElements[] {
+  const configurations = [
+    ["codex", "codex"],
+    ["grok", "grok"],
+    ["claudeCode", "claude"],
+    ["openCode", "opencode"],
+  ] as const satisfies readonly (readonly [
+    AgentSettingsProvider,
+    AgentSettingsLaunchProfile,
+  ])[];
+  return configurations.map(([provider, launchProfile]) => {
+    const root = panel.querySelector<HTMLElement>(`[data-agent-provider="${provider}"]`);
+    const state = root?.querySelector<HTMLElement>("[data-agent-state]");
+    const account = root?.querySelector<HTMLElement>("[data-agent-account]");
+    const button = root?.querySelector<HTMLButtonElement>(
+      `[data-agent-connect="${launchProfile}"]`,
+    );
+    if (!root || !state || !account || !(button instanceof HTMLButtonElement)) {
+      throw new Error(`Missing agent connection row for ${provider}`);
+    }
+    return { provider, launchProfile, root, state, account, button };
+  });
+}
+
 type ProviderUsageLimitElements = {
   root: HTMLElement;
   meter: HTMLProgressElement;
@@ -8383,6 +9605,7 @@ type ProviderUsageDetailElements = {
   popover: HTMLElement;
   title: HTMLElement;
   closeButton: HTMLButtonElement;
+  accountSection: HTMLElement;
   accountSelect: HTMLSelectElement;
   addAccount: HTMLButtonElement;
   accountState: HTMLElement;
@@ -8439,6 +9662,7 @@ function requireProviderUsageDetail(): ProviderUsageDetailElements {
     popover: requireElement("provider-usage-popover"),
     title: requireElement("provider-usage-detail-title"),
     closeButton: requireButton("close-provider-usage"),
+    accountSection: requireElement("provider-account-detail"),
     accountSelect: requireSelect("provider-account-select"),
     addAccount: requireButton("add-provider-account"),
     accountState: requireElement("provider-account-state"),
@@ -8454,6 +9678,10 @@ const addButton = requireButton("add-terminal");
 const paneLauncherRoot = requireElement("pane-launcher");
 const paneLauncherMenu = requireElement("pane-launcher-menu");
 const addPowerShellButton = requireButton("add-powershell-pane");
+const addCodexButton = requireButton("add-codex-pane");
+const addGrokButton = requireButton("add-grok-pane");
+const addClaudeCodeButton = requireButton("add-claude-code-pane");
+const addOpenCodeButton = requireButton("add-opencode-pane");
 const addBrowserButton = requireButton("add-browser-pane");
 const statusElement = requireElement("status");
 const projectList = requireElement("project-list");
@@ -8475,23 +9703,43 @@ const upgradeSourceSha = requireElement("phase3-upgrade-source-sha");
 const commitUpgradeButton = requireButton("commit-phase3-upgrade");
 const closeUpgradeButton = requireButton("close-phase3-upgrade");
 const upgradeError = requireElement("phase3-upgrade-error");
+const providerUsageRoot = requireElement("provider-usage");
 const codexUsageTrigger = requireButton("codex-usage-trigger");
 const grokUsageTrigger = requireButton("grok-usage-trigger");
+const claudeCodeUsageTrigger = requireButton("claude-code-usage-trigger");
+const openCodeUsageTrigger = requireButton("opencode-usage-trigger");
 const codexFiveHourUsage = requireProviderUsageLimit("codex-five-hour-usage");
 const codexWeeklyUsage = requireProviderUsageLimit("codex-weekly-usage");
 const grokWeeklyUsage = requireProviderUsageLimit("grok-weekly-usage");
+const claudeCodeWeeklyUsage = requireProviderUsageLimit("claude-code-weekly-usage");
+const openCodeWeeklyUsage = requireProviderUsageLimit("opencode-weekly-usage");
+const footerProviderVisibilityInputs: Record<FooterProviderId, HTMLInputElement> = {
+  codex: requireInput("show-statusbar-codex"),
+  grok: requireInput("show-statusbar-grok"),
+  claudeCode: requireInput("show-statusbar-claude-code"),
+  openCode: requireInput("show-statusbar-opencode"),
+};
+const statusbarOrderStatus = requireElement("statusbar-order-status");
 const providerUsageDetail = requireProviderUsageDetail();
 const openSettingsButton = requireButton("open-settings");
 const settingsDialog = requireDialog("settings-dialog");
 const settingsForm = requireForm("settings-form");
 const settingsGeneralTab = requireButton("settings-general-tab");
 const settingsOptimizationTab = requireButton("settings-optimization-tab");
+const settingsAgentsTab = requireButton("settings-agents-tab");
 const settingsNotificationsTab = requireButton("settings-notifications-tab");
 const settingsGeneralPanel = requireElement("settings-general-panel");
 const settingsOptimizationPanel = requireElement("settings-optimization-panel");
+const settingsAgentsPanel = requireElement("settings-agents-panel");
 const settingsNotificationsPanel = requireElement("settings-notifications-panel");
+const refreshAgentConnectionsButton = requireButton("refresh-agent-connections");
+const agentConnectionsStatus = requireElement("agent-connections-status");
+const agentConnectionRows = requireAgentConnectionRows(settingsAgentsPanel);
 const appLanguageSelect = requireSelect("app-language");
 const autoSleepIdleAgentsInput = requireInput("auto-sleep-idle-agents");
+const useEmbeddedBrowserAgentToolsInput = requireInput(
+  "use-embedded-browser-agent-tools",
+);
 const phoneNotificationEnabled = requireInput("phone-notification-enabled");
 const phoneNotificationWebhook = requireInput("phone-notification-webhook");
 const phoneNotificationWebhookState = requireElement("phone-notification-webhook-state");
@@ -8524,7 +9772,7 @@ const workspace = new TerminalWorkspace(
     controller?.onBrowserPaneUrlChanged(projectId, paneId, url) ??
     Promise.resolve(false),
   (projectId, url) =>
-    controller?.addBrowserPaneFromLink(projectId, url) ?? Promise.resolve(),
+    controller?.addBrowserPaneFromLink(projectId, url) ?? Promise.resolve(null),
   (projectId, paneId, target) =>
     controller?.onPaneReordered(projectId, paneId, target),
   (projectId, layoutKey, ratios) =>
@@ -8545,16 +9793,41 @@ const workspace = new TerminalWorkspace(
     Promise.resolve(false),
 );
 workspace.setAutoSleepIdleAgents(getAutoSleepIdleAgents());
+useEmbeddedBrowserAgentToolsInput.checked = getUseEmbeddedBrowserTools();
+useEmbeddedBrowserAgentToolsInput.addEventListener("change", () => {
+  setUseEmbeddedBrowserTools(useEmbeddedBrowserAgentToolsInput.checked);
+});
+const agentConnections = new AgentConnectionsController(
+  settingsDialog,
+  settingsAgentsPanel,
+  refreshAgentConnectionsButton,
+  agentConnectionsStatus,
+  agentConnectionRows,
+  async (launchProfile) => {
+    if (addButton.disabled || !controller) {
+      throw new Error(
+        tr(
+          "Open a project tab before starting an agent.",
+          "에이전트를 시작하려면 먼저 프로젝트 탭을 여세요.",
+        ),
+      );
+    }
+    await controller.addTerminal(launchProfile);
+  },
+);
 phoneNotifications = new PhoneNotificationController(
   openSettingsButton,
   settingsDialog,
   settingsForm,
   settingsGeneralTab,
   settingsOptimizationTab,
+  settingsAgentsTab,
   settingsNotificationsTab,
   settingsGeneralPanel,
   settingsOptimizationPanel,
+  settingsAgentsPanel,
   settingsNotificationsPanel,
+  agentConnections,
   appLanguageSelect,
   autoSleepIdleAgentsInput,
   phoneNotificationEnabled,
@@ -8566,7 +9839,8 @@ phoneNotifications = new PhoneNotificationController(
   testPhoneNotificationsButton,
   closeSettingsButton,
   phoneNotificationStatus,
-  (open) => workspace.setModalOverlayOpen("settings", open),
+  (open) =>
+    open ? workspace.prepareSettingsModal() : workspace.restoreSettingsModal(),
   (enabled) => workspace.setAutoSleepIdleAgents(enabled),
 );
 void phoneNotifications.start();
@@ -8575,11 +9849,21 @@ const agentEvents = new AgentEventController(workspace, (message) =>
 );
 const agentEventsReady = agentEvents.start();
 const providerUsage = new ProviderUsageController(
-  codexUsageTrigger,
-  grokUsageTrigger,
-  codexFiveHourUsage,
-  codexWeeklyUsage,
-  grokWeeklyUsage,
+  providerUsageRoot,
+  {
+    codex: codexUsageTrigger,
+    grok: grokUsageTrigger,
+    claudeCode: claudeCodeUsageTrigger,
+    openCode: openCodeUsageTrigger,
+  },
+  {
+    codex: { fiveHour: codexFiveHourUsage, weekly: codexWeeklyUsage },
+    grok: { fiveHour: null, weekly: grokWeeklyUsage },
+    claudeCode: { fiveHour: null, weekly: claudeCodeWeeklyUsage },
+    openCode: { fiveHour: null, weekly: openCodeWeeklyUsage },
+  },
+  footerProviderVisibilityInputs,
+  statusbarOrderStatus,
   providerUsageDetail,
   (bounds) => workspace.setNativeOverlayOpen(bounds),
   ensureProviderAccountSwitchReady,
@@ -8618,13 +9902,18 @@ const paneLauncher = new PaneLauncherController(
   addButton,
   paneLauncherMenu,
   addPowerShellButton,
+  addCodexButton,
+  addGrokButton,
+  addClaudeCodeButton,
+  addOpenCodeButton,
   addBrowserButton,
   () => void controller?.addTerminal(),
+  () => void controller?.addTerminal("codex"),
+  () => void controller?.addTerminal("grok"),
+  () => void controller?.addTerminal("claude"),
+  () => void controller?.addTerminal("opencode"),
   () => void controller?.addBrowserPane(),
 );
-// The old full-surface implementation is intentionally unreachable; browser
-// instances now live inside the mixed project grid.
-void BrowserController;
 let productionMigrationError: string | null = null;
 const productionMigrationPromise = invoke("import_discovered_production_catalog").catch(
   (error) => {
@@ -8643,6 +9932,7 @@ const initializationPromise = Promise.all([productionMigrationPromise, agentEven
     return result;
   });
 void initializationPromise;
+void workspace.installAgentBrowserCommands(initializationPromise);
 
 async function ensureProviderAccountSwitchReady() {
   await initializationPromise;
@@ -8700,6 +9990,7 @@ void currentAppWindow.onCloseRequested(async (event) => {
     // the application process exits.
     agentEvents.dispose();
     providerUsage.dispose();
+    agentConnections.dispose();
     phoneNotifications.dispose();
     unsubscribeAppLanguage();
     controller?.dispose();
@@ -8719,6 +10010,7 @@ void currentAppWindow.onCloseRequested(async (event) => {
     await controller?.flushSaves();
     agentEvents.dispose();
     providerUsage.dispose();
+    agentConnections.dispose();
     phoneNotifications.dispose();
     unsubscribeAppLanguage();
     controller?.dispose();
@@ -8743,6 +10035,7 @@ window.addEventListener("beforeunload", () => {
   if (closeBarrierRunning) return;
   agentEvents.dispose();
   providerUsage.dispose();
+  agentConnections.dispose();
   phoneNotifications.dispose();
   unsubscribeAppLanguage();
   controller?.dispose();

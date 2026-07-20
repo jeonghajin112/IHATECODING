@@ -25,8 +25,14 @@ The canonical workspace is stored under Tauri `app_local_data_dir()/state/worksp
   unsafe aggregate load.
 - Backend-owned Job Object cleanup and a single graceful shutdown barrier.
 - Exact provider-bound Codex/Grok resume ownership; duplicate bindings fail closed.
+- Persisted PowerShell, Claude Code, and OpenCode launch profiles use a closed
+  backend enum and fixed commands rather than frontend-supplied shell text.
+- The Agents settings tab reports a closed, redacted local status contract for
+  Codex, Grok, Claude Code, and OpenCode; it never returns tokens, executable
+  paths, or raw authentication command output.
 - Optional inactive-session sleep is off by default and never unloads the
-  visible project, working or input-active agents, or plain PowerShell. It
+  visible project, working or input-active agents, or any pane without a
+  durable Codex/Grok conversation binding. It
   resumes only durably bound Codex/Grok conversations and restores browser
   panes from their last saved addresses when a project is reopened. Turning
   the option off immediately restores sleeping panes behind their per-pane

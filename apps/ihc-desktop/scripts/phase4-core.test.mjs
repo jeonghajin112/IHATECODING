@@ -450,6 +450,37 @@ test("browser pane restore ignores malformed entries and persists sixty-four mix
   );
 });
 
+test("local browser restore probes only loopback URLs with a bounded retry policy", () => {
+  for (const url of [
+    "http://localhost:5173/login",
+    "https://LOCALHOST/",
+    "http://127.0.0.1:3000/",
+    "http://127.255.12.4:8080/",
+    "http://[::1]:4173/",
+  ]) {
+    assert.equal(core.isLoopbackBrowserUrl(url), true, url);
+  }
+  for (const url of [
+    "https://example.com/",
+    "http://192.168.0.2/",
+    "http://localhost.example.com/",
+    "http://user:secret@localhost:3000/",
+    "not a URL",
+  ]) {
+    assert.equal(core.isLoopbackBrowserUrl(url), false, url);
+  }
+
+  assert.equal(core.localBrowserRetryDelayMs(1, 0), 500);
+  assert.equal(core.localBrowserRetryDelayMs(2, 500), 1_000);
+  assert.equal(core.localBrowserRetryDelayMs(3, 1_500), 2_000);
+  assert.equal(core.localBrowserRetryDelayMs(4, 3_500), 4_000);
+  assert.equal(core.localBrowserRetryDelayMs(5, 7_500), 8_000);
+  assert.equal(core.localBrowserRetryDelayMs(6, 15_500), 15_000);
+  assert.equal(core.localBrowserRetryDelayMs(25, 299_999), 15_000);
+  assert.equal(core.localBrowserRetryDelayMs(25, 300_000), null);
+  assert.equal(core.localBrowserRetryDelayMs(0, 0), null);
+});
+
 test("project and terminal helpers create, append, rename, remove, and name deterministically", () => {
   const createdProject = core.createWorkspaceProject(
     "project-new",
@@ -487,17 +518,76 @@ test("project and terminal helpers create, append, rename, remove, and name dete
   assert.equal(createdPane.codexThreadId, null);
   assert.equal(createdPane.grokSessionId, null);
   assert.equal(createdPane.completionPending, false);
+  assert.equal(core.workspaceTerminalLaunchProfile(createdPane), "powershell");
+
+  const codexPane = core.createWorkspaceTerminal(
+    "pane-codex",
+    "Codex 1",
+    "C:/Work/Gamma",
+    "2026-07-17T01:02:04Z",
+    "codex",
+  );
+  const grokPane = core.createWorkspaceTerminal(
+    "pane-grok",
+    "Grok 1",
+    "C:/Work/Gamma",
+    "2026-07-17T01:02:04Z",
+    "grok",
+  );
+  const claudePane = core.createWorkspaceTerminal(
+    "pane-claude",
+    "Claude Code 1",
+    "C:/Work/Gamma",
+    "2026-07-17T01:02:04Z",
+    "claude",
+  );
+  const openCodePane = core.createWorkspaceTerminal(
+    "pane-opencode",
+    "OpenCode 1",
+    "C:/Work/Gamma",
+    "2026-07-17T01:02:05Z",
+    "opencode",
+  );
+  assert.equal(codexPane.legacyExtensions.launchProfileV1, "codex");
+  assert.equal(grokPane.legacyExtensions.launchProfileV1, "grok");
+  assert.equal(claudePane.legacyExtensions.launchProfileV1, "claude");
+  assert.equal(openCodePane.legacyExtensions.launchProfileV1, "opencode");
+  assert.equal(core.workspaceTerminalLaunchProfile(codexPane), "codex");
+  assert.equal(core.workspaceTerminalLaunchProfile(grokPane), "grok");
+  assert.equal(core.workspaceTerminalLaunchProfile(claudePane), "claude");
+  assert.equal(core.workspaceTerminalLaunchProfile(openCodePane), "opencode");
+  assert.equal(
+    core.workspaceTerminalLaunchProfile({
+      ...createdPane,
+      legacyExtensions: { launchProfileV1: "untrusted-command" },
+    }),
+    "powershell",
+  );
 
   state = core.appendProjectPane(state, "project-new", createdPane);
+  state = core.appendProjectPane(state, "project-new", codexPane);
+  state = core.appendProjectPane(state, "project-new", grokPane);
+  state = core.appendProjectPane(state, "project-new", claudePane);
+  state = core.appendProjectPane(state, "project-new", openCodePane);
   state = core.appendProjectPane(state, "project-new", pane("pane-worker-2", {
     name: "PowerShell 1",
     startDirectory: "C:\\Work\\Gamma",
   }));
   assert.equal(core.nextWorkspacePaneName(state.projects.at(-1)), "PowerShell 2");
+  assert.equal(core.nextWorkspacePaneName(state.projects.at(-1), "codex"), "Codex 2");
+  assert.equal(core.nextWorkspacePaneName(state.projects.at(-1), "grok"), "Grok 2");
+  assert.equal(core.nextWorkspacePaneName(state.projects.at(-1), "claude"), "Claude Code 2");
+  assert.equal(core.nextWorkspacePaneName(state.projects.at(-1), "opencode"), "OpenCode 2");
   state = core.renameProjectPane(state, "project-new", "pane-new", "  Coordinator  ");
   assert.equal(state.projects.at(-1).terminals[0].name, "Coordinator");
   state = core.removeProjectPane(state, "project-new", "pane-new");
-  assert.deepEqual(state.projects.at(-1).terminals.map((item) => item.id), ["pane-worker-2"]);
+  assert.deepEqual(state.projects.at(-1).terminals.map((item) => item.id), [
+    "pane-codex",
+    "pane-grok",
+    "pane-claude",
+    "pane-opencode",
+    "pane-worker-2",
+  ]);
 
   assert.throws(
     () => core.appendWorkspaceProject(state, { ...createdProject, id: "another-id" }),

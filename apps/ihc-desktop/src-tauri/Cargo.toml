@@ -1,7 +1,7 @@
 [package]
 name = "ihatecoding"
 version = "1.0.0"
-description = "Lightweight multi-terminal workspace for Codex and Grok"
+description = "The AI workspace for autonomous development"
 authors = ["IHATECODING contributors"]
 edition = "2024"
 

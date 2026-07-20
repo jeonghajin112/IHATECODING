@@ -51,6 +51,66 @@ function Get-AvailablePreviousBuildPath {
     return $candidate
 }
 
+function Remove-StalePreviousBuilds {
+    param(
+        [Parameter()]
+        [ValidateRange(1, 10)]
+        [int] $Keep = 2
+    )
+
+    $resolvedRoot = [System.IO.Path]::GetFullPath($PSScriptRoot).TrimEnd('\', '/')
+    $backups = @(
+        Get-ChildItem -LiteralPath $resolvedRoot -File -Filter 'IHATECODING.previous-build*.exe' |
+            Where-Object { $_.Name -match '^IHATECODING\.previous-build(?:\.\d+)?\.exe$' } |
+            Sort-Object LastWriteTimeUtc -Descending
+    )
+
+    foreach ($backup in @($backups | Select-Object -Skip $Keep)) {
+        $resolvedBackup = [System.IO.Path]::GetFullPath($backup.FullName)
+        $backupParent = [System.IO.Path]::GetDirectoryName($resolvedBackup).TrimEnd('\', '/')
+        if (-not [System.StringComparer]::OrdinalIgnoreCase.Equals($backupParent, $resolvedRoot)) {
+            Write-Warning "Skipped a previous-build path outside the repository root: $resolvedBackup"
+            continue
+        }
+
+        try {
+            Remove-Item -LiteralPath $resolvedBackup -Force -ErrorAction Stop
+        }
+        catch {
+            # A still-running Windows executable can remain locked. Keep it and
+            # retry naturally on the next successful cutover.
+            Write-Warning "Could not remove stale previous build '$resolvedBackup': $($_.Exception.Message)"
+        }
+    }
+}
+
+function Remove-StaleCutoverArtifacts {
+    $resolvedRoot = [System.IO.Path]::GetFullPath($PSScriptRoot).TrimEnd('\', '/')
+    $candidates = @(
+        Get-ChildItem -LiteralPath $resolvedRoot -File |
+            Where-Object {
+                $_.Name -ceq 'IHATECODING.next.exe' -or
+                $_.Name -match '^IHATECODING\.running-build(?:\.\d+)?\.exe$'
+            }
+    )
+
+    foreach ($candidate in $candidates) {
+        $resolvedCandidate = [System.IO.Path]::GetFullPath($candidate.FullName)
+        $candidateParent = [System.IO.Path]::GetDirectoryName($resolvedCandidate).TrimEnd('\', '/')
+        if (-not [System.StringComparer]::OrdinalIgnoreCase.Equals($candidateParent, $resolvedRoot)) {
+            Write-Warning "Skipped a cutover artifact outside the repository root: $resolvedCandidate"
+            continue
+        }
+
+        try {
+            Remove-Item -LiteralPath $resolvedCandidate -Force -ErrorAction Stop
+        }
+        catch {
+            Write-Warning "Could not remove stale cutover artifact '$resolvedCandidate': $($_.Exception.Message)"
+        }
+    }
+}
+
 function Test-IHATECODINGRustCandidate {
     param([Parameter(Mandatory)] [string] $Path)
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
@@ -164,3 +224,5 @@ catch [System.UnauthorizedAccessException] {
 }
 
 Write-Host "Cut over: $target" -ForegroundColor Green
+Remove-StalePreviousBuilds
+Remove-StaleCutoverArtifacts

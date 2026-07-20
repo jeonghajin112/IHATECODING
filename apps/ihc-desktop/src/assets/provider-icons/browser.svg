@@ -1,0 +1,11 @@
+<!-- Original generic browser-window icon for IHATECODING. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none">
+  <title>Web browser</title>
+  <rect x="2.5" y="3.5" width="19" height="17" rx="2.5" stroke="#E8E8E8" stroke-width="1.5"/>
+  <path d="M3 8h18" stroke="#E8E8E8" stroke-width="1.5"/>
+  <circle cx="6" cy="5.75" r=".75" fill="#E8E8E8"/>
+  <circle cx="8.75" cy="5.75" r=".75" fill="#E8E8E8"/>
+  <circle cx="11.5" cy="5.75" r=".75" fill="#E8E8E8"/>
+  <circle cx="12" cy="14" r="3.5" stroke="#E8E8E8" stroke-width="1.25"/>
+  <path d="M8.5 14h7M12 10.5c1.15 1.05 1.72 2.22 1.72 3.5S13.15 16.45 12 17.5M12 10.5c-1.15 1.05-1.72 2.22-1.72 3.5S10.85 16.45 12 17.5" stroke="#E8E8E8" stroke-width="1.1" stroke-linecap="round"/>
+</svg>

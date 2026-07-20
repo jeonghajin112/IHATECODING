@@ -17,7 +17,6 @@ use std::time::SystemTime;
 use uuid::Uuid;
 
 pub(crate) const LEGACY_SOURCE_FORMAT: &str = "powerWorkspace.projects/1";
-pub(crate) const PHASE3_PREVIEW_SOURCE_FORMAT: &str = "ihatecoding.phase3-preview/1";
 pub(crate) const MAX_LEGACY_SOURCE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_STABLE_READ_ATTEMPTS: usize = 3;
 const MAX_JSON_DEPTH: usize = 64;

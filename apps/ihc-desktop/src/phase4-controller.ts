@@ -47,6 +47,7 @@ import {
   type RestoreCapacityDecision,
   type WorkspaceBrowserPane,
   type WorkspaceAgentProvider,
+  type WorkspaceTerminalLaunchProfile,
 } from "./phase4-core";
 import {
   ProjectActivityTracker,
@@ -1065,7 +1066,9 @@ export class Phase4WorkspaceController {
     }
   }
 
-  async addTerminal(): Promise<void> {
+  async addTerminal(
+    launchProfile: WorkspaceTerminalLaunchProfile = "powershell",
+  ): Promise<void> {
     const state = this.currentState();
     if (!state || !this.canMutate()) return;
     const tab = state.tabs.find((item) => item.id === state.activeTabId);
@@ -1075,8 +1078,8 @@ export class Phase4WorkspaceController {
     if (!this.runtime.canAddPane(project.id)) {
       this.runtime.setFooterStatus(
         tr(
-          "A PowerShell pane cannot be added right now.",
-          "지금은 PowerShell 화면을 추가할 수 없습니다.",
+          "A terminal pane cannot be added right now.",
+          "지금은 터미널 화면을 추가할 수 없습니다.",
         ),
         "error",
       );
@@ -1084,21 +1087,22 @@ export class Phase4WorkspaceController {
     }
     const terminal = createWorkspaceTerminal(
       this.idFactory(),
-      nextWorkspacePaneName(project),
+      nextWorkspacePaneName(project, launchProfile),
       project.folderPath,
       new Date().toISOString(),
+      launchProfile,
     );
     const next = appendProjectPane(state, project.id, terminal);
     if (
-      !(await this.persist(next, tr("Could not save the PowerShell state", "PowerShell 상태를 저장하지 못했습니다")))
+      !(await this.persist(next, tr("Could not save the terminal state", "터미널 상태를 저장하지 못했습니다")))
     ) {
       return;
     }
     if (!this.runtime.addPane(project.id, terminal, true)) {
       this.runtime.setFooterStatus(
         tr(
-          "The PowerShell state was saved, but no runtime slot could be reserved.",
-          "PowerShell 상태는 저장했지만 실행 슬롯을 확보하지 못했습니다.",
+          "The terminal state was saved, but no runtime slot could be reserved.",
+          "터미널 상태는 저장했지만 실행 슬롯을 확보하지 못했습니다.",
         ),
         "error",
       );
@@ -1141,13 +1145,13 @@ export class Phase4WorkspaceController {
     }
   }
 
-  async addBrowserPaneFromLink(projectId: string, url: string): Promise<void> {
+  async addBrowserPaneFromLink(projectId: string, url: string): Promise<string | null> {
     const state = this.currentState();
-    if (!state || !this.canMutate()) return;
+    if (!state || !this.canMutate()) return null;
     const project = state.projects.find((item) => item.id === projectId);
     const activeTab = state.tabs.find((item) => item.id === state.activeTabId);
     if (!project || activeTab?.kind !== "project" || activeTab.projectId !== projectId) {
-      return;
+      return null;
     }
     if (!this.runtime.canAddPane(project.id)) {
       this.runtime.setFooterStatus(
@@ -1157,7 +1161,7 @@ export class Phase4WorkspaceController {
         ),
         "error",
       );
-      return;
+      return null;
     }
 
     let browser: WorkspaceBrowserPane;
@@ -1168,7 +1172,7 @@ export class Phase4WorkspaceController {
         tr("The selected link cannot be opened.", "선택한 링크를 열 수 없습니다."),
         "error",
       );
-      return;
+      return null;
     }
 
     const next = appendProjectBrowserPane(state, project.id, browser);
@@ -1178,7 +1182,7 @@ export class Phase4WorkspaceController {
         tr("Could not save the web pane state", "웹 패널 상태를 저장하지 못했습니다"),
       ))
     ) {
-      return;
+      return null;
     }
     if (!this.runtime.addBrowserPane(project.id, browser, true)) {
       this.runtime.setFooterStatus(
@@ -1188,7 +1192,9 @@ export class Phase4WorkspaceController {
         ),
         "error",
       );
+      return null;
     }
+    return browser.id;
   }
 
   private async persist(next: WorkspaceState, context: string): Promise<boolean> {

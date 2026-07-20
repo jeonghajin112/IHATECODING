@@ -15,6 +15,11 @@ export const DEFAULT_MIN_PANE_WIDTH_PX = 160;
 export const DEFAULT_INSERTION_HYSTERESIS_PX = 14;
 export const DEFAULT_SNAP_DISTANCE_PX = 8;
 export const PROJECT_BROWSER_PANES_EXTENSION = "browserPanesV1";
+export const TERMINAL_LAUNCH_PROFILE_EXTENSION = "launchProfileV1";
+export const LOCAL_BROWSER_RETRY_WINDOW_MS = 5 * 60 * 1_000;
+
+const LOCAL_BROWSER_RETRY_RAMP_MS = [500, 1_000, 2_000, 4_000, 8_000] as const;
+const LOCAL_BROWSER_RETRY_TAIL_MS = 15_000;
 
 const MAX_BROWSER_PANE_TITLE_LENGTH = 80;
 const MAX_BROWSER_PANE_URL_BYTES = 16 * 1024;
@@ -25,6 +30,51 @@ export type WorkspaceBrowserPane = {
   title: string;
   url: string;
 };
+
+export type WorkspaceTerminalLaunchProfile =
+  | "powershell"
+  | "codex"
+  | "grok"
+  | "claude"
+  | "opencode";
+
+export function isLoopbackBrowserUrl(rawUrl: string) {
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    return false;
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return false;
+  if (parsed.username || parsed.password) return false;
+
+  const hostname = parsed.hostname.replace(/^\[|\]$/gu, "").toLowerCase();
+  if (hostname === "localhost" || hostname === "::1") return true;
+  const octets = hostname.split(".");
+  return (
+    octets.length === 4 &&
+    octets.every((octet) => /^\d{1,3}$/u.test(octet) && Number(octet) <= 255) &&
+    Number(octets[0]) === 127
+  );
+}
+
+/**
+ * Returns the delay after the latest failed local-server probe. The first
+ * probe is immediate; retries ramp quickly and then settle at one lightweight
+ * TCP attempt every 15 seconds until the bounded restore window expires.
+ */
+export function localBrowserRetryDelayMs(
+  failedAttempts: number,
+  elapsedMs: number,
+): number | null {
+  if (!Number.isSafeInteger(failedAttempts) || failedAttempts < 1) return null;
+  if (!Number.isFinite(elapsedMs) || elapsedMs < 0 || elapsedMs >= LOCAL_BROWSER_RETRY_WINDOW_MS) {
+    return null;
+  }
+  return (
+    LOCAL_BROWSER_RETRY_RAMP_MS[failedAttempts - 1] ?? LOCAL_BROWSER_RETRY_TAIL_MS
+  );
+}
 
 export type LinearMoveCommand = "previous" | "next" | "first" | "last";
 
@@ -620,6 +670,7 @@ export function createWorkspaceTerminal(
   name: string,
   startDirectory: string,
   createdAtUtc: string,
+  launchProfile: WorkspaceTerminalLaunchProfile = "powershell",
 ): WorkspaceTerminal {
   assertOpaqueLocalId(id, "pane");
   const normalizedName = name.trim();
@@ -627,6 +678,9 @@ export function createWorkspaceTerminal(
   const normalizedDirectory = normalizeWindowsFolder(startDirectory);
   if (!isAbsoluteWindowsPath(normalizedDirectory)) {
     throw new Error("A pane start directory must be an absolute Windows path.");
+  }
+  if (!isWorkspaceTerminalLaunchProfile(launchProfile)) {
+    throw new Error("The terminal launch profile is invalid.");
   }
   return {
     id,
@@ -636,8 +690,18 @@ export function createWorkspaceTerminal(
     grokSessionId: null,
     createdAtUtc,
     completionPending: false,
-    legacyExtensions: {},
+    legacyExtensions:
+      launchProfile === "powershell"
+        ? {}
+        : { [TERMINAL_LAUNCH_PROFILE_EXTENSION]: launchProfile },
   };
+}
+
+export function workspaceTerminalLaunchProfile(
+  terminal: Pick<WorkspaceTerminal, "legacyExtensions">,
+): WorkspaceTerminalLaunchProfile {
+  const candidate = terminal.legacyExtensions[TERMINAL_LAUNCH_PROFILE_EXTENSION];
+  return isWorkspaceTerminalLaunchProfile(candidate) ? candidate : "powershell";
 }
 
 export function validateWorkspaceProjectDraft(
@@ -717,12 +781,40 @@ export function uniqueWorkspaceProjectName(
   }
 }
 
-export function nextWorkspacePaneName(project: WorkspaceProject): string {
+export function nextWorkspacePaneName(
+  project: WorkspaceProject,
+  launchProfile: WorkspaceTerminalLaunchProfile = "powershell",
+): string {
+  if (!isWorkspaceTerminalLaunchProfile(launchProfile)) {
+    throw new Error("The terminal launch profile is invalid.");
+  }
   const names = new Set(project.terminals.map((pane) => pane.name.toLocaleLowerCase()));
+  const prefix =
+    launchProfile === "codex"
+      ? "Codex"
+      : launchProfile === "grok"
+        ? "Grok"
+        : launchProfile === "claude"
+          ? "Claude Code"
+          : launchProfile === "opencode"
+            ? "OpenCode"
+            : "PowerShell";
   for (let index = 1; ; index += 1) {
-    const candidate = `PowerShell ${index}`;
+    const candidate = `${prefix} ${index}`;
     if (!names.has(candidate.toLocaleLowerCase())) return candidate;
   }
+}
+
+function isWorkspaceTerminalLaunchProfile(
+  value: unknown,
+): value is WorkspaceTerminalLaunchProfile {
+  return (
+    value === "powershell" ||
+    value === "codex" ||
+    value === "grok" ||
+    value === "claude" ||
+    value === "opencode"
+  );
 }
 
 export function evaluateWorkspaceRestoreCapacity(

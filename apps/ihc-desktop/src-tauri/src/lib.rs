@@ -1,4 +1,8 @@
+mod agent_browser_bridge;
+mod agent_cli_status;
 mod agent_runtime;
+mod browser_agent_automation;
+mod browser_preview;
 mod browser_ui_pick;
 mod codex_notify;
 mod grok_notify;
@@ -12,32 +16,33 @@ mod pty;
 mod terminal_platform;
 mod workspace_store;
 
+use agent_browser_bridge::{AgentBrowserBridge, complete_agent_browser_command};
 use agent_runtime::{
     AgentBindingSnapshot, AgentDiscovery, AgentDiscoveryRequest, AgentEvent, AgentProvider,
     AgentResumeBinding, AgentRuntime, StableTerminalKey,
 };
+use browser_agent_automation::{browser_agent_click, browser_agent_snapshot, browser_agent_type};
+use browser_preview::capture_browser_webview_preview;
 use legacy_import::{
     CommitLegacyCatalogRequest, InspectLegacyCatalogRequest, LegacyImportError,
     LegacyImportErrorCode, LegacyImportMode, LegacyImportPolicy, LegacyImportService,
     LegacyInspection, LegacyTabKind, LegacyTerminalDraft, LegacyWorkspaceDraft,
-    PHASE3_PREVIEW_SOURCE_FORMAT,
 };
 use production_import::{
     ProductionImportError, ProductionImportErrorCode, ProductionImportPolicy,
     ProductionImportService,
 };
-use project_store::{
-    InspectProjectCatalogCopyRequest, LoadProjectCatalogResponse, PROJECT_CATALOG_SCHEMA_VERSION,
-    Phase3PreviewUpgradeInspection, ProjectCatalogV1, ProjectStore,
-};
-use pty::{StartTerminalResponse, TerminalEngineStatus, TerminalEvent, TerminalManager};
+use project_store::{Phase3PreviewUpgradeInspection, ProjectStore};
+use pty::{StartTerminalResponse, TerminalEvent, TerminalManager};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     env, io,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 use tauri::{Emitter, EventTarget, Manager, State, Webview, ipc::Channel};
 use uuid::Uuid;
@@ -49,10 +54,10 @@ use webview2_com::{
 #[cfg(windows)]
 use windows_core::PWSTR;
 use workspace_store::{
-    ImportProvenanceV1, RecoveryCandidateSummary, RecoveryPreview, SaveWorkspaceRequest,
-    SaveWorkspaceResponse, StorageError, StorageErrorCode, StorageMode, StorageResult,
-    WorkspaceProjectV1, WorkspaceSnapshot, WorkspaceStateV1, WorkspaceStore, WorkspaceTabV1,
-    WorkspaceTerminalV1,
+    ImportProvenanceV1, PHASE3_PREVIEW_SOURCE_FORMAT, RecoveryCandidateSummary, RecoveryPreview,
+    SaveWorkspaceRequest, SaveWorkspaceResponse, StorageError, StorageErrorCode, StorageMode,
+    StorageResult, WorkspaceProjectV1, WorkspaceSnapshot, WorkspaceStateV1, WorkspaceStore,
+    WorkspaceTabV1, WorkspaceTerminalV1,
 };
 
 const MAIN_WEBVIEW_LABEL: &str = "main";
@@ -66,6 +71,7 @@ const PRODUCTION_AGENT_BACKFILL_V2_MARKER: &str = "productionAgentStateBackfillV
 const BROWSER_WEBVIEW_URL_CHANGED_EVENT: &str = "browser-webview-url-changed";
 const BROWSER_WEBVIEW_PREPARED_EVENT: &str = "browser-webview-prepared";
 const MAX_BROWSER_WEBVIEW_URL_BYTES: usize = 16 * 1024;
+const LOOPBACK_BROWSER_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
 #[cfg(windows)]
 const BROWSER_WEBVIEW_PREPARE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
 
@@ -127,6 +133,16 @@ impl BrowserWebviewUrlWatchState {
 #[tauri::command]
 fn read_provider_usage() -> provider_usage::ProviderUsageResponse {
     provider_usage::read_provider_usage()
+}
+
+#[tauri::command]
+async fn read_agent_cli_statuses(
+    webview: Webview,
+) -> Result<agent_cli_status::AgentCliStatusesResponse, String> {
+    ensure_agent_main_webview(&webview)?;
+    tauri::async_runtime::spawn_blocking(agent_cli_status::read_agent_cli_statuses)
+        .await
+        .map_err(|_| "The agent status worker did not complete.".to_owned())
 }
 
 #[tauri::command]
@@ -225,6 +241,74 @@ fn unwatch_browser_webview_url(
     state.forget(&label);
     browser_ui_pick::cancel_pending_capture();
     Ok(())
+}
+
+#[tauri::command]
+async fn probe_loopback_browser_endpoint(webview: Webview, url: String) -> Result<bool, String> {
+    ensure_agent_main_webview(&webview)?;
+    tauri::async_runtime::spawn_blocking(move || -> Result<bool, String> {
+        let addresses = loopback_browser_probe_addresses(&url)?;
+        Ok(probe_loopback_browser_addresses(&addresses))
+    })
+    .await
+    .map_err(|_| "The local web endpoint probe did not complete.".to_owned())?
+}
+
+fn loopback_browser_probe_addresses(raw_url: &str) -> Result<Vec<SocketAddr>, String> {
+    if raw_url.len() > MAX_BROWSER_WEBVIEW_URL_BYTES {
+        return Err("The local web endpoint address is too long.".to_owned());
+    }
+    let url = tauri::Url::parse(raw_url)
+        .map_err(|_| "The local web endpoint address is invalid.".to_owned())?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err("Only HTTP or HTTPS local web endpoints can be probed.".to_owned());
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("Local web endpoint credentials are not allowed.".to_owned());
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| "The local web endpoint host is missing.".to_owned())?;
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| "The local web endpoint port is missing.".to_owned())?;
+
+    if host == "localhost" {
+        return Ok(vec![
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
+        ]);
+    }
+
+    let ip_text = host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(host);
+    let ip = ip_text
+        .parse::<IpAddr>()
+        .map_err(|_| "Only localhost or a loopback IP address can be probed.".to_owned())?;
+    if !ip.is_loopback() {
+        return Err("Only localhost or a loopback IP address can be probed.".to_owned());
+    }
+    Ok(vec![SocketAddr::new(ip, port)])
+}
+
+fn probe_loopback_browser_addresses(addresses: &[SocketAddr]) -> bool {
+    let deadline = Instant::now() + LOOPBACK_BROWSER_PROBE_TIMEOUT;
+    for (index, address) in addresses.iter().enumerate() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        // Divide the remaining budget so one address family cannot consume the
+        // complete localhost probe and starve the other family.
+        let attempts_left = (addresses.len() - index) as u32;
+        let timeout = remaining / attempts_left;
+        if TcpStream::connect_timeout(address, timeout).is_ok() {
+            return true;
+        }
+    }
+    false
 }
 
 fn safe_browser_webview_url(url: &tauri::Url) -> Option<String> {
@@ -432,8 +516,10 @@ fn is_browser_pane_webview_label(label: &str) -> bool {
 mod browser_webview_label_tests {
     use super::{
         BrowserWebviewUrlWatchState, MAX_BROWSER_WEBVIEW_URL_BYTES, is_browser_pane_webview_label,
+        loopback_browser_probe_addresses, probe_loopback_browser_addresses,
         safe_browser_webview_url_text,
     };
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener};
 
     #[test]
     fn browser_webview_labels_are_narrow_and_generated_only() {
@@ -492,15 +578,55 @@ mod browser_webview_label_tests {
         assert!(!state.claim_preparation("ihc-browser-1-1"));
         assert_eq!(state.reserve("ihc-browser-1-1"), Ok(true));
     }
-}
 
-#[tauri::command]
-fn read_provider_account(
-    webview: Webview,
-    provider: String,
-) -> Result<Option<provider_usage::ProviderAccountSummary>, String> {
-    ensure_agent_main_webview(&webview)?;
-    provider_usage::read_provider_account(&provider)
+    #[test]
+    fn loopback_browser_probe_accepts_localhost_and_loopback_ips() {
+        assert_eq!(
+            loopback_browser_probe_addresses("http://localhost/dashboard").unwrap(),
+            vec![
+                SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 80),
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 80),
+            ]
+        );
+        assert_eq!(
+            loopback_browser_probe_addresses("https://127.0.0.2/status").unwrap(),
+            vec![SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)),
+                443
+            )]
+        );
+        assert_eq!(
+            loopback_browser_probe_addresses("http://[::1]:5173/").unwrap(),
+            vec![SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 5173)]
+        );
+    }
+
+    #[test]
+    fn loopback_browser_probe_refuses_credentials_and_non_loopback_hosts() {
+        for rejected in [
+            "ftp://localhost/",
+            "http://user@localhost/",
+            "http://user:password@localhost/",
+            "http://localhost.example.com/",
+            "http://localhost./",
+            "http://192.168.0.1/",
+            "https://example.com/",
+        ] {
+            assert!(
+                loopback_browser_probe_addresses(rejected).is_err(),
+                "{rejected}"
+            );
+        }
+    }
+
+    #[test]
+    fn loopback_browser_probe_reports_a_listening_tcp_endpoint() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let addresses =
+            loopback_browser_probe_addresses(&format!("http://127.0.0.1:{port}/")).unwrap();
+        assert!(probe_loopback_browser_addresses(&addresses));
+    }
 }
 
 #[tauri::command]
@@ -877,13 +1003,12 @@ async fn start_terminal(
     cwd: Option<String>,
     columns: u16,
     rows: u16,
-    terminal_key: Option<StableTerminalKey>,
-    resume: Option<AgentResumeBinding>,
+    launch: agent_runtime::TerminalLaunchRequest,
     on_event: Channel<TerminalEvent>,
 ) -> Result<StartTerminalResponse, String> {
     let manager = manager.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        manager.start(cwd, columns, rows, terminal_key, resume, on_event)
+        manager.start(cwd, columns, rows, launch, on_event)
     })
     .await
     .map_err(|error| format!("Terminal start worker failed: {error}"))?
@@ -981,16 +1106,6 @@ fn ack_terminal_output(
 }
 
 #[tauri::command]
-fn terminal_engine_status(manager: State<'_, TerminalManager>) -> TerminalEngineStatus {
-    manager.status()
-}
-
-#[tauri::command]
-fn phase2_initial_panes() -> u8 {
-    pty::phase2_initial_panes()
-}
-
-#[tauri::command]
 fn stop_terminal(manager: State<'_, TerminalManager>, session_id: String) -> Result<(), String> {
     manager.stop(&session_id)
 }
@@ -1004,64 +1119,6 @@ async fn stop_terminal_and_wait(
     tauri::async_runtime::spawn_blocking(move || manager.stop_and_wait(&session_id))
         .await
         .map_err(|error| format!("Terminal stop worker failed: {error}"))?
-}
-
-#[tauri::command]
-async fn load_project_catalog(
-    store: State<'_, ProjectStore>,
-) -> Result<LoadProjectCatalogResponse, String> {
-    let store = store.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || store.load())
-        .await
-        .map_err(|error| format!("Project catalog load worker failed: {error}"))?
-}
-
-#[tauri::command]
-async fn save_project_catalog(
-    store: State<'_, ProjectStore>,
-    catalog: ProjectCatalogV1,
-) -> Result<(), String> {
-    let store = store.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || store.save(catalog))
-        .await
-        .map_err(|error| format!("Project catalog save worker failed: {error}"))?
-}
-
-#[tauri::command]
-async fn inspect_project_catalog_copy(
-    store: State<'_, ProjectStore>,
-    request: InspectProjectCatalogCopyRequest,
-) -> Result<ProjectCatalogV1, String> {
-    let store = store.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || store.inspect_copy(request))
-        .await
-        .map_err(|error| format!("Project catalog inspection worker failed: {error}"))?
-}
-
-#[tauri::command]
-async fn recover_project_catalog_backup(
-    store: State<'_, ProjectStore>,
-) -> Result<ProjectCatalogV1, String> {
-    let store = store.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || store.recover_verified_backup())
-        .await
-        .map_err(|error| format!("Project catalog recovery worker failed: {error}"))?
-}
-
-#[tauri::command]
-async fn reset_corrupt_project_catalog(
-    store: State<'_, ProjectStore>,
-    confirmed: bool,
-) -> Result<ProjectCatalogV1, String> {
-    let store = store.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || store.reset_corrupt(confirmed))
-        .await
-        .map_err(|error| format!("Project catalog reset worker failed: {error}"))?
-}
-
-#[tauri::command]
-fn project_catalog_schema_version() -> u32 {
-    PROJECT_CATALOG_SCHEMA_VERSION
 }
 
 #[tauri::command]
@@ -2123,10 +2180,18 @@ pub fn run() {
         let _ = codex_notify::ensure_configured();
         let _ = grok_notify::ensure_configured();
     }
+    // Bind before AgentRuntime, Tauri, or PTY worker threads exist so the
+    // loopback address can be inherited safely by agent subprocesses.
+    let browser_bridge =
+        AgentBrowserBridge::bind().expect("the IHATECODING browser agent bridge is unavailable");
     let agent_runtime = AgentRuntime::default();
-    let terminal_manager = TerminalManager::with_agent_runtime(agent_runtime.clone());
+    let terminal_manager = TerminalManager::with_agent_runtime_and_browser_bridge(
+        agent_runtime.clone(),
+        browser_bridge.clone(),
+    );
     let shutdown_manager = terminal_manager.clone();
     let shutdown_agent_runtime = agent_runtime.clone();
+    let shutdown_browser_bridge = browser_bridge.clone();
     let project_store = ProjectStore::preview_default()
         .expect("the isolated IHATECODING migration store path is invalid");
     let setup_app_local_data_dir = app_local_data_dir.clone();
@@ -2135,10 +2200,12 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(terminal_manager)
         .manage(agent_runtime)
+        .manage(browser_bridge.clone())
         .manage(project_store)
         .manage(provider_account_service)
         .manage(Arc::new(BrowserWebviewUrlWatchState::default()))
         .setup(move |app| {
+            browser_bridge.start(app.handle().clone())?;
             let app_local_data_dir = setup_app_local_data_dir.clone();
             let workspace_store = WorkspaceStore::open(&app_local_data_dir)?;
             let phone_notification_service =
@@ -2184,10 +2251,16 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             read_provider_usage,
+            read_agent_cli_statuses,
+            complete_agent_browser_command,
+            browser_agent_snapshot,
+            browser_agent_click,
+            browser_agent_type,
+            capture_browser_webview_preview,
             read_browser_webview_url,
             watch_browser_webview_url,
             unwatch_browser_webview_url,
-            read_provider_account,
+            probe_loopback_browser_endpoint,
             list_provider_accounts,
             add_provider_account,
             cancel_provider_account_login,
@@ -2212,16 +2285,8 @@ pub fn run() {
             shutdown_terminal_engine,
             resize_terminal,
             ack_terminal_output,
-            terminal_engine_status,
-            phase2_initial_panes,
             stop_terminal,
             stop_terminal_and_wait,
-            load_project_catalog,
-            save_project_catalog,
-            inspect_project_catalog_copy,
-            recover_project_catalog_backup,
-            reset_corrupt_project_catalog,
-            project_catalog_schema_version,
             storage_status,
             load_workspace_state,
             save_workspace_state,
@@ -2237,11 +2302,14 @@ pub fn run() {
         .expect("error while building IHATECODING")
         .run(move |_app, event| {
             if matches!(event, tauri::RunEvent::Exit) {
+                shutdown_browser_bridge.shutdown();
                 let _ = shutdown_manager.shutdown_for_exit();
                 shutdown_agent_runtime.shutdown();
             }
         });
 }
+
+pub use agent_browser_bridge::run_browser_mcp_if_requested;
 
 pub fn run_codex_notifier_if_requested() -> Option<i32> {
     codex_notify::run_if_requested()
