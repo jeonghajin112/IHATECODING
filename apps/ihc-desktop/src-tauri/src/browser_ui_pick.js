@@ -1116,6 +1116,24 @@
   window.addEventListener("scroll", cancelSelection, true);
   window.addEventListener("pagehide", cancelSelection);
   window.addEventListener("keydown", (event) => {
+    if (
+      event.isTrusted &&
+      event.ctrlKey &&
+      !event.metaKey &&
+      !event.altKey &&
+      !event.shiftKey &&
+      (event.code === "Space" || event.key === " ")
+    ) {
+      suppressEvent(event);
+      if (!event.repeat) {
+        postMessage(messagePrefix + jsonStringify({
+          type: "ihc-media-drawer-toggle",
+          version: 1,
+          nonce,
+        }));
+      }
+      return;
+    }
     if (event.key === "Escape") cancelSelection();
   }, true);
 })();

@@ -35,6 +35,10 @@ await copyFile(
   new URL("../index.html", import.meta.url),
   new URL("../dist/index.html", import.meta.url),
 );
+await copyFile(
+  new URL("../src-tauri/icons/32x32.png", import.meta.url),
+  new URL("../dist/assets/app-icon.png", import.meta.url),
+);
 await Promise.all(
   providerIconNames.map((name) =>
     copyFile(

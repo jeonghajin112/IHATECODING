@@ -7,8 +7,10 @@ mod browser_ui_pick;
 mod codex_notify;
 mod grok_notify;
 mod legacy_import;
+mod media_browser;
 mod phone_notify;
 mod production_import;
+mod project_files;
 mod project_store;
 mod provider_accounts;
 mod provider_usage;
@@ -28,17 +30,23 @@ use legacy_import::{
     LegacyImportErrorCode, LegacyImportMode, LegacyImportPolicy, LegacyImportService,
     LegacyInspection, LegacyTabKind, LegacyTerminalDraft, LegacyWorkspaceDraft,
 };
+use media_browser::{
+    MediaBrowserService, delete_content_file, list_media_directory, list_media_volumes,
+    open_content_entry, open_media_location, resolve_content_entry_path, resolve_media_files,
+    reveal_content_entry,
+};
 use production_import::{
     ProductionImportError, ProductionImportErrorCode, ProductionImportPolicy,
     ProductionImportService,
 };
+use project_files::{list_project_directory, open_project_file};
 use project_store::{Phase3PreviewUpgradeInspection, ProjectStore};
 use pty::{StartTerminalResponse, TerminalEvent, TerminalManager};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    env, io,
+    env, fs, io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -71,6 +79,7 @@ const PRODUCTION_AGENT_BACKFILL_V2_MARKER: &str = "productionAgentStateBackfillV
 const BROWSER_WEBVIEW_URL_CHANGED_EVENT: &str = "browser-webview-url-changed";
 const BROWSER_WEBVIEW_PREPARED_EVENT: &str = "browser-webview-prepared";
 const MAX_BROWSER_WEBVIEW_URL_BYTES: usize = 16 * 1024;
+const MAX_PROJECT_DIRECTORY_NAME_UTF16_UNITS: usize = 50;
 const LOOPBACK_BROWSER_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
 #[cfg(windows)]
 const BROWSER_WEBVIEW_PREPARE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
@@ -94,6 +103,196 @@ struct BrowserWebviewUrlWatchState {
     // true means the initial about:blank pane is still waiting to navigate.
     // false keeps the URL watcher reservation after preparation completes.
     registered_labels: Mutex<HashMap<String, bool>>,
+}
+
+fn validate_project_directory_leaf(project_name: &str) -> Result<&str, String> {
+    let name = project_name.trim();
+    if name.is_empty() {
+        return Err("Enter a project name.".to_owned());
+    }
+    if name.encode_utf16().count() > MAX_PROJECT_DIRECTORY_NAME_UTF16_UNITS {
+        return Err("Project names must be 50 characters or fewer.".to_owned());
+    }
+    if matches!(name, "." | "..") {
+        return Err("The project name cannot be a relative path component.".to_owned());
+    }
+    if name.ends_with([' ', '.']) {
+        return Err("The project name cannot end with a space or period.".to_owned());
+    }
+    if name.chars().any(|character| {
+        character <= '\u{1f}'
+            || character == '\u{7f}'
+            || matches!(
+                character,
+                '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'
+            )
+    }) {
+        return Err(
+            "The project name contains characters that Windows does not allow in folder names."
+                .to_owned(),
+        );
+    }
+    if is_windows_reserved_project_leaf(name) {
+        return Err("The project name is reserved by Windows.".to_owned());
+    }
+    Ok(name)
+}
+
+fn is_windows_reserved_project_leaf(name: &str) -> bool {
+    let base = name
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches([' ', '.'])
+        .to_uppercase();
+    if matches!(
+        base.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CLOCK$" | "CONIN$" | "CONOUT$"
+    ) {
+        return true;
+    }
+    ["COM", "LPT"].iter().any(|prefix| {
+        base.strip_prefix(prefix).is_some_and(|suffix| {
+            matches!(
+                suffix,
+                "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+            )
+        })
+    })
+}
+
+fn normal_absolute_path(path: &Path) -> Result<String, String> {
+    let value = path
+        .to_str()
+        .ok_or_else(|| "The project folder path cannot be represented as Unicode.".to_owned())?;
+    #[cfg(windows)]
+    let value = if let Some(without_prefix) = value.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{without_prefix}")
+    } else if let Some(without_prefix) = value.strip_prefix(r"\\?\") {
+        without_prefix.to_owned()
+    } else {
+        value.to_owned()
+    };
+    #[cfg(not(windows))]
+    let value = value.to_owned();
+
+    if !Path::new(&value).is_absolute() {
+        return Err("The project folder did not resolve to an absolute path.".to_owned());
+    }
+    Ok(value)
+}
+
+fn create_documents_project_directory_in(
+    documents_directory: &Path,
+    project_name: &str,
+) -> Result<String, String> {
+    let name = validate_project_directory_leaf(project_name)?;
+    let metadata = fs::metadata(documents_directory)
+        .map_err(|_| "The Documents folder is unavailable.".to_owned())?;
+    if !metadata.is_dir() {
+        return Err("The configured Documents path is not a folder.".to_owned());
+    }
+    let canonical_documents = fs::canonicalize(documents_directory)
+        .map_err(|_| "The Documents folder could not be resolved safely.".to_owned())?;
+    let candidate = canonical_documents.join(name);
+    match fs::create_dir(&candidate) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            return Err(
+                "A file or folder with that project name already exists in Documents.".to_owned(),
+            );
+        }
+        Err(_) => return Err("The project folder could not be created in Documents.".to_owned()),
+    }
+
+    let canonical_candidate = match fs::canonicalize(&candidate) {
+        Ok(path) => path,
+        Err(_) => {
+            let _ = fs::remove_dir(&candidate);
+            return Err("The new project folder could not be resolved safely.".to_owned());
+        }
+    };
+    if canonical_candidate.parent() != Some(canonical_documents.as_path()) {
+        let _ = fs::remove_dir(&candidate);
+        return Err("The new project folder resolved outside Documents.".to_owned());
+    }
+    normal_absolute_path(&canonical_candidate)
+}
+
+#[cfg(windows)]
+fn metadata_is_reparse_point(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    metadata.file_attributes() & 0x400 != 0
+}
+
+#[cfg(not(windows))]
+fn metadata_is_reparse_point(_metadata: &fs::Metadata) -> bool {
+    false
+}
+
+fn remove_empty_documents_project_directory_in(
+    documents_directory: &Path,
+    project_name: &str,
+) -> Result<(), String> {
+    let name = validate_project_directory_leaf(project_name)?;
+    let canonical_documents = fs::canonicalize(documents_directory)
+        .map_err(|_| "The Documents folder could not be resolved safely.".to_owned())?;
+    let candidate = canonical_documents.join(name);
+    let metadata = match fs::symlink_metadata(&candidate) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err("The new project folder could not be inspected safely.".to_owned()),
+    };
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata_is_reparse_point(&metadata)
+    {
+        return Err("The new project folder is not a safe regular directory.".to_owned());
+    }
+    let canonical_candidate = fs::canonicalize(&candidate)
+        .map_err(|_| "The new project folder could not be resolved safely.".to_owned())?;
+    if canonical_candidate.parent() != Some(canonical_documents.as_path()) {
+        return Err("The new project folder resolved outside Documents.".to_owned());
+    }
+    fs::remove_dir(&candidate).map_err(|error| {
+        if error.kind() == io::ErrorKind::DirectoryNotEmpty {
+            "The new project folder is no longer empty and was left unchanged.".to_owned()
+        } else {
+            "The empty project folder could not be removed safely.".to_owned()
+        }
+    })
+}
+
+#[tauri::command]
+async fn create_documents_project_directory(
+    webview: Webview,
+    project_name: String,
+) -> Result<String, String> {
+    ensure_agent_main_webview(&webview)?;
+    drop(webview);
+    tauri::async_runtime::spawn_blocking(move || {
+        let documents = dirs::document_dir()
+            .ok_or_else(|| "The Documents folder could not be located.".to_owned())?;
+        create_documents_project_directory_in(&documents, &project_name)
+    })
+    .await
+    .map_err(|_| "The project folder creation worker did not complete.".to_owned())?
+}
+
+#[tauri::command]
+async fn remove_empty_documents_project_directory(
+    webview: Webview,
+    project_name: String,
+) -> Result<(), String> {
+    ensure_agent_main_webview(&webview)?;
+    drop(webview);
+    tauri::async_runtime::spawn_blocking(move || {
+        let documents = dirs::document_dir()
+            .ok_or_else(|| "The Documents folder could not be located.".to_owned())?;
+        remove_empty_documents_project_directory_in(&documents, &project_name)
+    })
+    .await
+    .map_err(|_| "The project folder cleanup worker did not complete.".to_owned())?
 }
 
 impl BrowserWebviewUrlWatchState {
@@ -2201,6 +2400,7 @@ pub fn run() {
         .manage(terminal_manager)
         .manage(agent_runtime)
         .manage(browser_bridge.clone())
+        .manage(MediaBrowserService::default())
         .manage(project_store)
         .manage(provider_account_service)
         .manage(Arc::new(BrowserWebviewUrlWatchState::default()))
@@ -2252,6 +2452,18 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             read_provider_usage,
             read_agent_cli_statuses,
+            open_media_location,
+            list_media_volumes,
+            list_media_directory,
+            resolve_media_files,
+            open_content_entry,
+            reveal_content_entry,
+            resolve_content_entry_path,
+            delete_content_file,
+            create_documents_project_directory,
+            remove_empty_documents_project_directory,
+            list_project_directory,
+            open_project_file,
             complete_agent_browser_command,
             browser_agent_snapshot,
             browser_agent_click,
@@ -2317,6 +2529,110 @@ pub fn run_codex_notifier_if_requested() -> Option<i32> {
 
 pub fn run_grok_notifier_if_requested() -> Option<i32> {
     grok_notify::run_if_requested()
+}
+
+#[cfg(test)]
+mod documents_project_directory_tests {
+    use super::*;
+
+    #[test]
+    fn project_directory_leaf_validation_rejects_unsafe_windows_names() {
+        for name in [
+            "",
+            "   ",
+            ".",
+            "..",
+            "nested/project",
+            r"nested\project",
+            "bad:name",
+            "trailing.",
+            "trailing ",
+            "CON",
+            "con.txt",
+            "PRN.log",
+            "COM1",
+            "com¹.txt",
+            "LPT9.data",
+            "CONIN$",
+            "line\nbreak",
+        ] {
+            assert!(
+                validate_project_directory_leaf(name).is_err(),
+                "{name:?} must be rejected"
+            );
+        }
+        assert!(validate_project_directory_leaf(&"🚀".repeat(26)).is_err());
+    }
+
+    #[test]
+    fn project_directory_leaf_validation_keeps_valid_unicode_and_trims_outer_space() {
+        assert_eq!(
+            validate_project_directory_leaf("  프로젝트 🚀  ").unwrap(),
+            "프로젝트 🚀"
+        );
+        assert_eq!(
+            validate_project_directory_leaf(&"🚀".repeat(25)).unwrap(),
+            "🚀".repeat(25)
+        );
+    }
+
+    #[test]
+    fn creates_exactly_one_named_directory_below_documents_and_returns_normal_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let documents = temp.path().join("Documents");
+        fs::create_dir(&documents).unwrap();
+
+        let returned =
+            create_documents_project_directory_in(&documents, "  Fresh Project  ").unwrap();
+        let expected = fs::canonicalize(documents.join("Fresh Project")).unwrap();
+
+        assert!(expected.is_dir());
+        assert_eq!(returned, normal_absolute_path(&expected).unwrap());
+        assert_eq!(
+            expected.parent(),
+            Some(fs::canonicalize(documents).unwrap().as_path())
+        );
+    }
+
+    #[test]
+    fn refuses_existing_files_and_directories_without_reusing_them() {
+        let temp = tempfile::tempdir().unwrap();
+        let documents = temp.path().join("Documents");
+        fs::create_dir(&documents).unwrap();
+        let existing_directory = documents.join("Existing Directory");
+        fs::create_dir(&existing_directory).unwrap();
+        let existing_file = documents.join("Existing File");
+        fs::write(&existing_file, b"keep").unwrap();
+
+        let directory_error =
+            create_documents_project_directory_in(&documents, "Existing Directory").unwrap_err();
+        let file_error =
+            create_documents_project_directory_in(&documents, "Existing File").unwrap_err();
+
+        assert!(directory_error.contains("already exists"));
+        assert!(file_error.contains("already exists"));
+        assert!(existing_directory.is_dir());
+        assert_eq!(fs::read(existing_file).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn cleanup_removes_only_the_exact_empty_directory_and_preserves_nonempty_content() {
+        let temp = tempfile::tempdir().unwrap();
+        let documents = temp.path().join("Documents");
+        fs::create_dir(&documents).unwrap();
+
+        create_documents_project_directory_in(&documents, "Retry Project").unwrap();
+        remove_empty_documents_project_directory_in(&documents, "Retry Project").unwrap();
+        assert!(!documents.join("Retry Project").exists());
+
+        create_documents_project_directory_in(&documents, "Keep Project").unwrap();
+        fs::write(documents.join("Keep Project").join("keep.txt"), b"keep").unwrap();
+        assert!(remove_empty_documents_project_directory_in(&documents, "Keep Project").is_err());
+        assert_eq!(
+            fs::read(documents.join("Keep Project").join("keep.txt")).unwrap(),
+            b"keep"
+        );
+    }
 }
 
 #[cfg(test)]

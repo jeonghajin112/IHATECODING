@@ -10,17 +10,41 @@
   <body>
     <main id="app" class="shell" data-workspace-view="empty">
       <aside
+        id="project-sidebar"
         class="project-sidebar"
         aria-label="Projects"
         data-i18n-aria-label-en="Projects"
         data-i18n-aria-label-ko="프로젝트"
       >
+        <div class="sidebar-brand">
+          <div class="sidebar-brand-identity" aria-label="IHATECODING">
+            <img src="/assets/app-icon.png" alt="" aria-hidden="true" />
+          </div>
+          <button
+            id="toggle-project-sidebar"
+            class="sidebar-collapse-toggle"
+            type="button"
+            aria-controls="project-sidebar"
+            aria-expanded="true"
+            aria-label="Collapse sidebar"
+            title="Collapse sidebar"
+            data-i18n-aria-label-en="Collapse sidebar"
+            data-i18n-aria-label-ko="사이드바 접기"
+            data-i18n-title-en="Collapse sidebar"
+            data-i18n-title-ko="사이드바 접기"
+          >
+            <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+              <rect x="2.5" y="3" width="11" height="10" rx="1.25"></rect>
+              <path d="M6 3v10M10.25 5.5 8 8l2.25 2.5"></path>
+            </svg>
+          </button>
+        </div>
         <div class="project-section-heading">
           <button
             id="toggle-project-list"
             class="project-list-toggle"
             type="button"
-            aria-controls="project-list"
+            aria-controls="project-sidebar-content"
             aria-expanded="true"
             aria-label="Collapse project list"
             title="Collapse project list"
@@ -36,28 +60,51 @@
               </svg>
             </span>
           </button>
-          <button
-            id="create-project"
-            class="create-project"
-            type="button"
-            title="New project"
-            aria-label="New project"
-            data-i18n-title-en="New project"
-            data-i18n-title-ko="새 프로젝트"
-            data-i18n-aria-label-en="New project"
-            data-i18n-aria-label-ko="새 프로젝트"
-            disabled
-          >
-            ＋
-          </button>
+          <div class="project-create-menu-root">
+            <button
+              id="create-project"
+              class="create-project"
+              type="button"
+              title="Add project"
+              aria-label="Add project"
+              aria-haspopup="menu"
+              aria-controls="project-create-menu"
+              aria-expanded="false"
+              data-i18n-title-en="Add project"
+              data-i18n-title-ko="프로젝트 추가"
+              data-i18n-aria-label-en="Add project"
+              data-i18n-aria-label-ko="프로젝트 추가"
+              disabled
+            >
+              ＋
+            </button>
+            <div id="project-create-menu" class="project-create-menu" role="menu" hidden>
+              <button
+                id="use-existing-project-folder"
+                type="button"
+                role="menuitem"
+                data-i18n-en="Use existing folder"
+                data-i18n-ko="기존 폴더 사용"
+              >Use existing folder</button>
+              <button
+                id="start-project-from-scratch"
+                type="button"
+                role="menuitem"
+                data-i18n-en="Start from scratch"
+                data-i18n-ko="처음부터 시작"
+              >Start from scratch</button>
+            </div>
+          </div>
         </div>
-        <nav
-          id="project-list"
-          class="project-list"
-          aria-label="Saved projects"
-          data-i18n-aria-label-en="Saved projects"
-          data-i18n-aria-label-ko="저장된 프로젝트"
-        ></nav>
+        <div id="project-sidebar-content" class="project-sidebar-content">
+          <nav
+            id="project-list"
+            class="project-list"
+            aria-label="Saved projects"
+            data-i18n-aria-label-en="Saved projects"
+            data-i18n-aria-label-ko="저장된 프로젝트"
+          ></nav>
+        </div>
         <div class="sidebar-footer">
           <button
             id="open-settings"
@@ -232,6 +279,105 @@
             </div>
           </section>
 
+          <section
+            id="media-drawer-layer"
+            class="media-drawer-layer"
+            data-pane-interaction="media-picker"
+            aria-hidden="true"
+            hidden
+          >
+            <section
+              id="media-drawer"
+              class="media-drawer"
+              role="region"
+              tabindex="-1"
+              aria-labelledby="media-drawer-title"
+              aria-keyshortcuts="Control+Space"
+            >
+              <header class="media-drawer-header">
+                <div class="media-drawer-heading">
+                  <strong
+                    id="media-drawer-title"
+                    data-i18n-en="Content browser"
+                    data-i18n-ko="콘텐츠 브라우저"
+                  >Content browser</strong>
+                  <form id="media-drawer-path-form" class="media-drawer-path-form">
+                    <input
+                      id="media-drawer-path"
+                      class="media-drawer-path"
+                      type="text"
+                      autocomplete="off"
+                      autocapitalize="off"
+                      spellcheck="false"
+                      aria-label="Content browser path"
+                      data-i18n-aria-label-en="Content browser path"
+                      data-i18n-aria-label-ko="콘텐츠 브라우저 경로"
+                      placeholder="Paste a file or folder path"
+                      data-i18n-placeholder-en="Paste a file or folder path"
+                      data-i18n-placeholder-ko="파일 또는 폴더 경로 붙여넣기"
+                    />
+                  </form>
+                </div>
+                <button
+                  id="media-drawer-collapse"
+                  class="media-drawer-collapse"
+                  type="button"
+                  aria-label="Collapse content browser"
+                  title="Collapse content browser"
+                  data-i18n-aria-label-en="Collapse content browser"
+                  data-i18n-aria-label-ko="콘텐츠 브라우저 접기"
+                  data-i18n-title-en="Collapse content browser"
+                  data-i18n-title-ko="콘텐츠 브라우저 접기"
+                >ㅡ</button>
+              </header>
+              <div
+                id="media-drawer-grid"
+                class="media-drawer-grid"
+                role="listbox"
+                aria-label="Files and media"
+                tabindex="-1"
+                data-i18n-aria-label-en="Files and media"
+                data-i18n-aria-label-ko="파일 및 미디어"
+              ></div>
+            </section>
+            <div
+              id="content-entry-menu"
+              class="content-entry-menu"
+              role="menu"
+              aria-label="File actions"
+              data-i18n-aria-label-en="File actions"
+              data-i18n-aria-label-ko="파일 작업"
+              hidden
+            >
+              <button id="content-entry-attach" type="button" role="menuitem">
+                <span aria-hidden="true">＋</span>
+                <span data-i18n-en="Add to active CLI" data-i18n-ko="활성 CLI에 추가">Add to active CLI</span>
+              </button>
+              <button id="content-entry-open" type="button" role="menuitem">
+                <span aria-hidden="true">↗</span>
+                <span data-i18n-en="Open" data-i18n-ko="열기">Open</span>
+              </button>
+              <button id="content-entry-reveal" type="button" role="menuitem">
+                <span aria-hidden="true">▣</span>
+                <span data-i18n-en="Show in File Explorer" data-i18n-ko="파일 탐색기에서 보기">Show in File Explorer</span>
+              </button>
+              <span class="content-entry-menu-separator" role="separator"></span>
+              <button id="content-entry-copy-path" type="button" role="menuitem">
+                <span aria-hidden="true">⧉</span>
+                <span data-i18n-en="Copy full path" data-i18n-ko="전체 경로 복사">Copy full path</span>
+              </button>
+              <button id="content-entry-copy-name" type="button" role="menuitem">
+                <span aria-hidden="true">Aa</span>
+                <span data-i18n-en="Copy file name" data-i18n-ko="파일명 복사">Copy file name</span>
+              </button>
+              <span class="content-entry-menu-separator" role="separator"></span>
+              <button id="content-entry-delete" class="content-entry-menu-danger" type="button" role="menuitem">
+                <span aria-hidden="true">×</span>
+                <span data-i18n-en="Delete" data-i18n-ko="삭제">Delete</span>
+              </button>
+            </div>
+          </section>
+
         </section>
 
         <footer class="statusbar">
@@ -247,7 +393,6 @@
               class="provider-usage-item"
               data-provider="codex"
               type="button"
-              draggable="true"
               aria-keyshortcuts="Alt+ArrowLeft Alt+ArrowRight"
               aria-label="View Codex remaining limits"
               data-i18n-aria-label-en="View Codex remaining limits"
@@ -294,7 +439,6 @@
               class="provider-usage-item"
               data-provider="grok"
               type="button"
-              draggable="true"
               aria-keyshortcuts="Alt+ArrowLeft Alt+ArrowRight"
               aria-label="View Grok remaining limit"
               data-i18n-aria-label-en="View Grok remaining limit"
@@ -327,7 +471,6 @@
               class="provider-usage-item"
               data-provider="claudeCode"
               type="button"
-              draggable="true"
               aria-keyshortcuts="Alt+ArrowLeft Alt+ArrowRight"
               aria-label="View Claude Code usage availability"
               data-i18n-aria-label-en="View Claude Code usage availability"
@@ -363,7 +506,6 @@
               class="provider-usage-item"
               data-provider="openCode"
               type="button"
-              draggable="true"
               aria-keyshortcuts="Alt+ArrowLeft Alt+ArrowRight"
               aria-label="View OpenCode usage availability"
               data-i18n-aria-label-en="View OpenCode usage availability"
@@ -509,6 +651,72 @@
         </footer>
       </section>
 
+      <aside
+        id="file-sidebar"
+        class="file-sidebar"
+        aria-label="File explorer"
+        data-i18n-aria-label-en="File explorer"
+        data-i18n-aria-label-ko="파일 탐색기"
+      >
+        <section id="project-files" class="project-files" hidden>
+          <div class="project-files-heading">
+            <span
+              id="project-files-title"
+              class="project-files-title"
+              data-i18n-en="Files"
+              data-i18n-ko="파일"
+            >Files</span>
+            <button
+              id="refresh-project-files"
+              class="project-files-refresh"
+              type="button"
+              aria-label="Refresh project files"
+              title="Refresh project files"
+              data-i18n-aria-label-en="Refresh project files"
+              data-i18n-aria-label-ko="프로젝트 파일 새로고침"
+              data-i18n-title-en="Refresh project files"
+              data-i18n-title-ko="프로젝트 파일 새로고침"
+            >
+              <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+                <path d="M12.8 5.8A5.2 5.2 0 1 0 13 9M12.8 2.8v3h-3"></path>
+              </svg>
+            </button>
+            <button
+              id="toggle-project-files"
+              class="project-files-toggle"
+              type="button"
+              aria-controls="project-file-tree"
+              aria-expanded="true"
+              aria-label="Collapse project files"
+              title="Collapse project files"
+              data-i18n-aria-label-en="Collapse project files"
+              data-i18n-aria-label-ko="프로젝트 파일 접기"
+              data-i18n-title-en="Collapse project files"
+              data-i18n-title-ko="프로젝트 파일 접기"
+            >
+              <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+                <rect x="2.5" y="3" width="11" height="10" rx="1.25"></rect>
+                <path d="M10 3v10M5.75 5.5 8 8l-2.25 2.5"></path>
+              </svg>
+            </button>
+          </div>
+          <div
+            id="project-file-tree"
+            class="project-file-tree"
+            role="tree"
+            aria-label="Project files"
+            data-i18n-aria-label-en="Project files"
+            data-i18n-aria-label-ko="프로젝트 파일"
+          ></div>
+          <div
+            id="project-file-tree-status"
+            class="project-file-tree-status"
+            role="status"
+            aria-live="polite"
+          ></div>
+        </section>
+      </aside>
+
       <dialog id="project-dialog" class="project-dialog" aria-labelledby="project-dialog-title">
         <form id="project-form" method="dialog">
           <div class="dialog-heading">
@@ -516,6 +724,7 @@
               New project
             </strong>
             <span
+              id="project-dialog-description"
               data-i18n-en="Choose a project name and working folder."
               data-i18n-ko="프로젝트 이름과 작업할 폴더를 선택하세요."
             >Choose a project name and working folder.</span>
@@ -524,7 +733,7 @@
             <span data-i18n-en="Name" data-i18n-ko="이름">Name</span>
             <input id="project-name" name="project-name" maxlength="50" autocomplete="off" required />
           </label>
-          <div class="project-path-field">
+          <div id="project-path-field" class="project-path-field">
             <label for="project-path" data-i18n-en="Folder path" data-i18n-ko="폴더 경로">
               Folder path
             </label>
@@ -551,11 +760,141 @@
               Cancel
             </button>
             <button
+              id="submit-project"
               class="dialog-submit"
               type="submit"
               data-i18n-en="Create project"
               data-i18n-ko="프로젝트 만들기"
             >Create project</button>
+          </div>
+        </form>
+      </dialog>
+
+      <dialog
+        id="project-rename-dialog"
+        class="project-dialog project-rename-dialog"
+        aria-labelledby="project-rename-title"
+      >
+        <form id="project-rename-form" method="dialog">
+          <div class="dialog-heading">
+            <strong
+              id="project-rename-title"
+              data-i18n-en="Rename project"
+              data-i18n-ko="프로젝트 이름 변경"
+            >Rename project</strong>
+            <span
+              id="project-rename-description"
+              data-i18n-en="Enter a new name for this project. Its folder name will not change."
+              data-i18n-ko="프로젝트의 새 이름을 입력하세요. 실제 폴더 이름은 변경되지 않습니다."
+            >Enter a new name for this project. Its folder name will not change.</span>
+          </div>
+          <label>
+            <span data-i18n-en="Name" data-i18n-ko="이름">Name</span>
+            <input
+              id="project-rename-name"
+              name="project-rename-name"
+              maxlength="50"
+              autocomplete="off"
+              required
+            />
+          </label>
+          <p id="project-rename-error" class="project-form-error" role="alert"></p>
+          <div class="dialog-actions">
+            <button
+              id="cancel-project-rename"
+              type="button"
+              data-i18n-en="Cancel"
+              data-i18n-ko="취소"
+            >Cancel</button>
+            <button
+              id="confirm-project-rename"
+              class="dialog-submit"
+              type="submit"
+              data-i18n-en="Save"
+              data-i18n-ko="저장"
+            >Save</button>
+          </div>
+        </form>
+      </dialog>
+
+      <dialog
+        id="project-delete-dialog"
+        class="project-dialog project-delete-dialog"
+        aria-labelledby="project-delete-title"
+        aria-describedby="project-delete-message project-delete-safety"
+      >
+        <form method="dialog">
+          <div class="dialog-heading">
+            <strong
+              id="project-delete-title"
+              data-i18n-en="Delete project?"
+              data-i18n-ko="프로젝트를 삭제할까요?"
+            >Delete project?</strong>
+            <span
+              data-i18n-en="This removes the project from the IHATECODING workspace."
+              data-i18n-ko="IHATECODING 작업 공간에서 프로젝트를 제거합니다."
+            >This removes the project from the IHATECODING workspace.</span>
+          </div>
+          <p id="project-delete-message" class="project-delete-message"></p>
+          <p id="project-delete-safety" class="project-delete-safety">
+            <span
+              data-i18n-en="The project folder and files on your computer will not be deleted."
+              data-i18n-ko="컴퓨터의 프로젝트 폴더와 파일은 삭제되지 않습니다."
+            >The project folder and files on your computer will not be deleted.</span>
+          </p>
+          <div class="dialog-actions">
+            <button
+              id="cancel-project-delete"
+              type="button"
+              data-i18n-en="Cancel"
+              data-i18n-ko="취소"
+            >Cancel</button>
+            <button
+              id="confirm-project-delete"
+              class="dialog-danger"
+              type="button"
+              data-i18n-en="Delete project"
+              data-i18n-ko="프로젝트 삭제"
+            >Delete project</button>
+          </div>
+        </form>
+      </dialog>
+
+      <dialog
+        id="content-file-delete-dialog"
+        class="project-dialog content-file-delete-dialog"
+        aria-labelledby="content-file-delete-title"
+        aria-describedby="content-file-delete-description content-file-delete-name"
+      >
+        <form method="dialog">
+          <div class="dialog-heading">
+            <strong
+              id="content-file-delete-title"
+              data-i18n-en="Permanently delete this file?"
+              data-i18n-ko="이 파일을 영구 삭제할까요?"
+            >Permanently delete this file?</strong>
+            <span
+              id="content-file-delete-description"
+              data-i18n-en="This action cannot be undone. The file will be removed from your computer."
+              data-i18n-ko="이 작업은 되돌릴 수 없습니다. 컴퓨터에서 파일이 삭제됩니다."
+            >This action cannot be undone. The file will be removed from your computer.</span>
+          </div>
+          <p id="content-file-delete-name" class="content-file-delete-name"></p>
+          <p id="content-file-delete-error" class="project-form-error" role="alert"></p>
+          <div class="dialog-actions">
+            <button
+              id="cancel-content-file-delete"
+              type="button"
+              data-i18n-en="Cancel"
+              data-i18n-ko="취소"
+            >Cancel</button>
+            <button
+              id="confirm-content-file-delete"
+              class="dialog-danger"
+              type="button"
+              data-i18n-en="Delete permanently"
+              data-i18n-ko="영구 삭제"
+            >Delete permanently</button>
           </div>
         </form>
       </dialog>
@@ -901,9 +1240,9 @@
                       data-i18n-ko="Discord 휴대폰 알림"
                     >Discord notifications</strong>
                     <span
-                      data-i18n-en="Send CLI completion and error notifications to a Discord channel."
-                      data-i18n-ko="CLI 작업 완료와 오류를 Discord 채널로 알려줍니다."
-                    >Send CLI completion and error notifications to a Discord channel.</span>
+                      data-i18n-en="Send CLI completion, error, and safety-check notifications to a Discord channel."
+                      data-i18n-ko="CLI 작업 완료, 오류와 안전 검사 대기를 Discord 채널로 알려줍니다."
+                    >Send CLI completion, error, and safety-check notifications to a Discord channel.</span>
                   </div>
 
                   <label class="phone-notification-toggle settings-switch phone-notification-master">
@@ -970,9 +1309,9 @@
                       data-i18n-ko="3. 복사한 URL을 위 입력란에 붙여넣고 저장합니다."
                     >3. Paste the copied URL above, then save your settings.</span>
                     <small
-                      data-i18n-en="Only the project name, CLI name, and completion or error state are sent. Paths, PIDs, prompts, responses, and raw errors are never sent."
-                      data-i18n-ko="프로젝트명, CLI 이름, 완료/오류 상태만 전송합니다. 경로, PID, 프롬프트, 답변과 원문 오류는 보내지 않습니다."
-                    >Only the project name, CLI name, and completion or error state are sent. Paths, PIDs, prompts, responses, and raw errors are never sent.</small>
+                      data-i18n-en="Only the project name, CLI name, and completion, error, or safety-check state are sent. Paths, PIDs, prompts, responses, and raw errors are never sent."
+                      data-i18n-ko="프로젝트명, CLI 이름, 완료/오류/안전 검사 상태만 전송합니다. 경로, PID, 프롬프트, 답변과 원문 오류는 보내지 않습니다."
+                    >Only the project name, CLI name, and completion, error, or safety-check state are sent. Paths, PIDs, prompts, responses, and raw errors are never sent.</small>
                   </div>
 
                   <fieldset class="phone-notification-kinds">
@@ -990,6 +1329,13 @@
                         <span class="settings-switch-thumb"></span>
                       </span>
                       <span data-i18n-en="An error occurs" data-i18n-ko="작업 오류">An error occurs</span>
+                    </label>
+                    <label class="phone-notification-toggle settings-switch">
+                      <input id="phone-notification-safety-check" type="checkbox" role="switch" />
+                      <span class="settings-switch-track" aria-hidden="true">
+                        <span class="settings-switch-thumb"></span>
+                      </span>
+                      <span data-i18n-en="A safety check waits" data-i18n-ko="안전 검사 대기">A safety check waits</span>
                     </label>
                   </fieldset>
 

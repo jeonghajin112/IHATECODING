@@ -140,7 +140,38 @@ test("terminal clicks use guarded mode-aware cursor movement", async () => {
   assert.doesNotMatch(styles, /\.xterm-cursor-blink/);
 });
 
-test("single-line CLI input owns Ctrl+A and selected-range Backspace safely", async () => {
+test("Codex safety buffering raises one separate local and Discord attention state", async () => {
+  const [main, html, styles, backend] = await Promise.all([
+    source("src/main.ts"),
+    source("index.html"),
+    source("src/styles.css"),
+    source("src-tauri/src/phone_notify.rs"),
+  ]);
+  assert.match(main, /isCodexSafetyBufferingScreen/);
+  assert.match(
+    main,
+    /private visibleTerminalScreenText\(\)[\s\S]*buffer\.viewportY[\s\S]*translateToString\(true\)/,
+  );
+  assert.match(
+    main,
+    /terminal\.write\(data,[\s\S]*this\.observeCodexSafetyBufferingScreen\(\)/,
+  );
+  assert.match(
+    main,
+    /agentTurnState !== "working"[\s\S]*launchProfile !== "codex"[\s\S]*agentProvider !== "codex"/,
+  );
+  assert.match(main, /dataset\.safetyCheckPending = String\(pending\)/);
+  assert.match(main, /this\.acknowledgeSafetyCheck\(\)/);
+  assert.match(main, /sendBackground\(\s*"safetyCheck",\s*notificationId,/);
+  assert.match(main, /return `safety:v1:\$\{session\}:\$\{turn\}`/);
+  assert.doesNotMatch(main, /createPhoneNotificationEventId\("safety"\)/);
+  assert.match(html, /id="phone-notification-safety-check"/);
+  assert.match(styles, /data-safety-check-pending="true"[\s\S]*safety-check-glow-pulse/);
+  assert.match(backend, /PhoneNotificationKind::SafetyCheck/);
+  assert.match(backend, /"🛡️", "안전 검사 대기"/);
+});
+
+test("live CLI input owns Ctrl+A and selected-range Backspace safely", async () => {
   const main = await source("src/main.ts");
   const editingStart = main.indexOf(
     "private consumeEditableTerminalShortcut(event: KeyboardEvent)",
@@ -152,18 +183,29 @@ test("single-line CLI input owns Ctrl+A and selected-range Backspace safely", as
   assert.ok(editingStart >= 0 && editingEnd > editingStart);
   const editing = main.slice(editingStart, editingEnd);
 
-  assert.match(main, /type EditableTerminalAnchor = \{[\s\S]*?absoluteRow: number;[\s\S]*?linePrefix: string;/);
+  assert.match(
+    main,
+    /type EditableTerminalAnchor = \{[\s\S]*?bufferType: "normal" \| "alternate";[\s\S]*?absoluteRow: number;[\s\S]*?linePrefix: string;/,
+  );
   assert.match(
     main,
     /onWindowTerminalKeyDown[\s\S]*?if \(this\.capturedCursorMoveInput\) return;[\s\S]*?consumeEditableTerminalShortcut\(event\)/,
   );
   assert.match(
+    main,
+    /attachCustomKeyEventHandler[\s\S]*?consumeSelectionCopyShortcut\(event\)[\s\S]*?consumeManualTerminalInterruptShortcut\(event\)[\s\S]*?consumeEditableTerminalShortcut\(event\)/,
+  );
+  assert.doesNotMatch(
     editing,
-    /event\.isComposing[\s\S]*?event\.keyCode === 229[\s\S]*?this\.terminal\.textarea !== document\.activeElement/,
+    /this\.terminal\.textarea !== document\.activeElement|event\.composedPath\(\)\.includes\(this\.viewport\)/,
   );
   assert.match(
     main,
-    /buffer\.type !== "normal"[\s\S]*?!this\.isAtBottom\(\)[\s\S]*?mouseTrackingMode !== "none"[\s\S]*?!this\.terminal\.modes\.showCursor/,
+    /anchor\?\.bufferType === buffer\.type[\s\S]*?anchor\.absoluteRow = absoluteRow/,
+  );
+  assert.match(
+    main,
+    /anchor\.bufferType !== buffer\.type[\s\S]*?line\.translateToString\(false, 0, anchor\.column\) !== anchor\.linePrefix[\s\S]*?anchor\.absoluteRow = row/,
   );
   assert.match(editing, /this\.terminal\.getSelectionPosition\(\)/);
   assert.match(editing, /planEditableTerminalSelectAll\(editableLine\)/);
@@ -181,6 +223,18 @@ test("single-line CLI input owns Ctrl+A and selected-range Backspace safely", as
   assert.match(
     editing,
     /const encodedDeletion = this\.captureTerminalSelectionDeletion[\s\S]*?this\.queueInput\(\{ kind: "text", data: encodedDeletion \}\)/,
+  );
+  assert.match(
+    editing,
+    /if \(!this\.terminal\.hasSelection\(\)\) return false;[\s\S]*?selectedCursorRowTerminalLine\(selection\)[\s\S]*?if \(!editableLine\) return consume\("backspace"\);[\s\S]*?if \(!range\) return consume\("backspace"\)/,
+  );
+  assert.match(
+    main,
+    /private selectedCursorRowTerminalLine[\s\S]*?selection\.start\.y !== row[\s\S]*?selection\.end\.y !== row[\s\S]*?anchorColumn: selection\.start\.x/,
+  );
+  assert.doesNotMatch(
+    main,
+    /this\.terminal\.cols !== columnsBeforeFit[\s\S]{0,500}?this\.editableAnchor = null/,
   );
   assert.match(
     main,
@@ -589,8 +643,9 @@ test("live pane dragging preserves stable thresholds, frozen preview, and outsid
   assert.match(finish, /if \(!state\.started\) \{[\s\S]*?return;/);
   assert.match(
     finish,
-    /const changed =[\s\S]*?!cancelled[\s\S]*?state\.hasValidDrop[\s\S]*?!samePaneOrder[\s\S]*?const next = changed \? state\.previewOrder : state\.originalOrder/,
+    /const changed =[\s\S]*?!cancelled[\s\S]*?state\.hasValidDrop[\s\S]*?!samePaneOrder[\s\S]*?const visibleOrder = changed \? state\.previewOrder : state\.originalOrder[\s\S]*?const next = currentOrder\.map/,
   );
+  assert.match(finish, /onPaneOrderChangedCallback\(state\.projectId, orderedPaneIds\)/);
   assert.match(
     main,
     /private clearPaneDragLayout\(state: PaneDragState\)[\s\S]*?delete pane\.element\.dataset\.dragFrozen[\s\S]*?style\.transform = ""/,
@@ -908,10 +963,11 @@ test("provider usage opens a compact account-aware popover above the status bar"
     assert.match(
       html,
       new RegExp(
-        `id="${triggerId}"[\\s\\S]*?data-provider="${provider}"[\\s\\S]*?draggable="true"[\\s\\S]*?aria-keyshortcuts="Alt\\+ArrowLeft Alt\\+ArrowRight"`,
+        `id="${triggerId}"[\\s\\S]*?data-provider="${provider}"[\\s\\S]*?aria-keyshortcuts="Alt\\+ArrowLeft Alt\\+ArrowRight"`,
       ),
     );
   }
+  assert.doesNotMatch(html, /class="provider-usage-item"[^>]*draggable=/);
   for (const [inputId, provider] of [
     ["show-statusbar-codex", "codex"],
     ["show-statusbar-grok", "grok"],
@@ -969,7 +1025,11 @@ test("provider usage opens a compact account-aware popover above the status bar"
   );
   assert.match(
     usageController,
-    /onProviderDragStart\([\s\S]*onProviderDragOver\([\s\S]*onProviderDrop\([\s\S]*reorderFooterProvider/,
+    /onProviderPointerDown\([\s\S]*setPointerCapture\(event\.pointerId\)[\s\S]*onProviderPointerMove\([\s\S]*crossedPointerReorderThreshold\([\s\S]*horizontalReorderTarget\([\s\S]*onProviderPointerUp\([\s\S]*reorderFooterProvider/,
+  );
+  assert.match(
+    usageController,
+    /addEventListener\("pointermove"[\s\S]*addEventListener\("pointerup"[\s\S]*addEventListener\("pointercancel"[\s\S]*"lostpointercapture"[\s\S]*onProviderPointerCancel\([\s\S]*onProviderPointerCaptureLost\([\s\S]*releasePointerCapture\(pointer\.pointerId\)/,
   );
   assert.match(
     usageController,
@@ -1144,7 +1204,18 @@ test("provider usage opens a compact account-aware popover above the status bar"
     /\.provider-usage-item:focus-visible\s*\{[\s\S]*?outline:/,
   );
   assert.match(styles, /\.provider-usage-item\[hidden\]\s*\{[\s\S]*?display:\s*none/);
-  assert.match(styles, /\.provider-usage-item\[data-dragging="true"\]/);
+  assert.match(
+    usageController,
+    /trigger\.draggable = false[\s\S]*trigger\.dataset\.reorderable = String\(visible\.has\(provider\)\)/,
+  );
+  assert.match(
+    styles,
+    /\.provider-usage-item\s*\{[\s\S]*?cursor:\s*grab;[\s\S]*?touch-action:\s*none;/,
+  );
+  assert.match(
+    styles,
+    /\.provider-usage-item\[data-dragging="true"\][\s\S]*transform:\s*translateX\(var\(--reorder-offset-x, 0\)\)/,
+  );
   assert.match(
     styles,
     /\.provider-usage-item\[data-drop-position="before"\]\s*\{[\s\S]*?box-shadow:\s*inset 1px 0/,
@@ -1229,6 +1300,10 @@ test("native Explorer drops attach to the hit-tested terminal without submitting
   );
   assert.doesNotMatch(attach, /data:\s*["'](?:\\r|\\n)["']/);
   assert.match(
+    main,
+    /private async detectDroppedFileProvider\(\): Promise<DroppedFileProvider \| null>[\s\S]*?this\.launchProfile === "claude"[\s\S]*?this\.launchProfile === "opencode"[\s\S]*?this\.agentProvider \?\? launchProvider/,
+  );
+  assert.match(
     styles,
     /\.terminal-file-drop-overlay\s*\{[\s\S]*?pointer-events:\s*none[\s\S]*?border:\s*1px dashed #4a4a4a/,
   );
@@ -1260,7 +1335,7 @@ test("Discord phone notifications keep webhooks private and bind display names e
   assert.match(html, /data-i18n-en="2\. Under Integrations → Webhooks[\s\S]*data-i18n-ko="2\. 연동 → 웹후크에서 웹후크를 만들고 URL 복사/);
   assert.match(
     html,
-    /data-i18n-en="Only the project name, CLI name[\s\S]*data-i18n-ko="프로젝트명, CLI 이름, 완료\/오류 상태만 전송합니다[\s\S]*경로, PID, 프롬프트, 답변과 원문 오류는 보내지 않습니다/,
+    /data-i18n-en="Only the project name, CLI name[\s\S]*data-i18n-ko="프로젝트명, CLI 이름, 완료\/오류\/안전 검사 상태만 전송합니다[\s\S]*경로, PID, 프롬프트, 답변과 원문 오류는 보내지 않습니다/,
   );
   assert.doesNotMatch(html, /비공개 토픽|phone-notification-topic/);
   assert.match(styles, /\.settings-button\s*\{[\s\S]*grid-template-columns/);
@@ -1632,7 +1707,7 @@ test("opt-in idle agent sleep preserves the active project and resumes only dura
   );
 });
 
-test("application chrome stays monochrome except for completion and usage alerts", async () => {
+test("application chrome stays monochrome except for completion, safety, and usage alerts", async () => {
   const styles = await source("src/styles.css");
   const completionAccentColors = new Set([
     "c7a34e",
@@ -1640,6 +1715,8 @@ test("application chrome stays monochrome except for completion and usage alerts
     "8b743d",
     "f4d57a",
     "211c10",
+    "d79448",
+    "f0aa59",
     "d6b84b",
     "df873f",
     "e05a5a",

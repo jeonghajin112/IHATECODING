@@ -349,6 +349,87 @@ test("blank add, close, keyboard activation, reorder, and ARIA roving focus stay
   assert.equal(state.selectedProjectId, null);
 });
 
+test("pointer tab reorder inserts before a stable target and preserves opaque state", () => {
+  const source = workspace({
+    selectedProjectId: "project-b",
+    tabs: [
+      blankTab("tab-a", { futureTab: { position: "a" } }),
+      projectTab("tab-b", "project-a", { futureTab: { position: "b" } }),
+      projectTab("tab-c", "project-b", { futureTab: { position: "c" } }),
+      browserTab("tab-d", { futureTab: { position: "d" } }),
+    ],
+    activeTabId: "tab-c",
+    futureRoot: { preserve: "drag-reorder" },
+  });
+  const before = structuredClone(source);
+
+  const movedForward = core.moveWorkspaceTabBefore(source, "tab-a", "tab-c");
+  assert.deepEqual(source, before);
+  assert.deepEqual(movedForward.tabs.map((tab) => tab.id), ["tab-b", "tab-a", "tab-c", "tab-d"]);
+  assert.equal(movedForward.activeTabId, "tab-c");
+  assert.equal(movedForward.selectedProjectId, "project-b");
+  assert.deepEqual(movedForward.futureRoot, { preserve: "drag-reorder" });
+  assert.deepEqual(movedForward.tabs.find((tab) => tab.id === "tab-a").futureTab, {
+    position: "a",
+  });
+
+  const movedBackward = core.moveWorkspaceTabBefore(movedForward, "tab-d", "tab-b");
+  assert.deepEqual(movedBackward.tabs.map((tab) => tab.id), ["tab-d", "tab-b", "tab-a", "tab-c"]);
+  assert.equal(movedBackward.activeTabId, "tab-c");
+  assert.equal(movedBackward.selectedProjectId, "project-b");
+  assert.deepEqual(movedBackward.tabs.find((tab) => tab.id === "tab-d").futureTab, {
+    position: "d",
+  });
+});
+
+test("pointer tab reorder appends with null and keeps no-op moves stable", () => {
+  const source = workspace({
+    selectedProjectId: "project-a",
+    tabs: [
+      projectTab("tab-a", "project-a"),
+      blankTab("tab-b"),
+      outputTab("tab-c"),
+    ],
+    activeTabId: "tab-a",
+  });
+
+  const appended = core.moveWorkspaceTabBefore(source, "tab-a", null);
+  assert.deepEqual(appended.tabs.map((tab) => tab.id), ["tab-b", "tab-c", "tab-a"]);
+  assert.equal(appended.activeTabId, "tab-a");
+  assert.equal(appended.selectedProjectId, "project-a");
+
+  const sameTarget = core.moveWorkspaceTabBefore(source, "tab-b", "tab-b");
+  assert.deepEqual(sameTarget, source);
+  assert.notEqual(sameTarget, source);
+  assert.notEqual(sameTarget.tabs, source.tabs);
+
+  const alreadyBefore = core.moveWorkspaceTabBefore(source, "tab-a", "tab-b");
+  assert.deepEqual(alreadyBefore, source);
+
+  const alreadyLast = core.moveWorkspaceTabBefore(source, "tab-c", null);
+  assert.deepEqual(alreadyLast, source);
+});
+
+test("pointer tab reorder fails closed for missing source or target tabs", () => {
+  const source = workspace({
+    tabs: [blankTab("tab-a"), projectTab("tab-b", "project-a")],
+    activeTabId: "tab-b",
+    selectedProjectId: "project-a",
+  });
+  const before = structuredClone(source);
+
+  assert.throws(
+    () => core.moveWorkspaceTabBefore(source, "tab-missing", "tab-a"),
+    /workspace tab does not exist/u,
+  );
+  assert.deepEqual(source, before);
+  assert.throws(
+    () => core.moveWorkspaceTabBefore(source, "tab-a", "tab-missing"),
+    /target workspace tab does not exist/u,
+  );
+  assert.deepEqual(source, before);
+});
+
 test("each project independently persists at least sixty-four terminal panes", () => {
   let state = workspace({
     projects: [project("project-a", []), project("project-b", [])],
@@ -448,6 +529,109 @@ test("browser pane restore ignores malformed entries and persists sixty-four mix
     () => core.setProjectBrowserPaneUrl(state, "project-a", "browser-31", "javascript:1"),
     /not allowed/,
   );
+});
+
+test("terminal and browser panes reject identifiers used by another pane type", () => {
+  let state = workspace();
+  state = core.appendProjectBrowserPane(
+    state,
+    "project-a",
+    core.createWorkspaceBrowserPane("browser-one"),
+  );
+
+  assert.throws(
+    () => core.appendProjectPane(state, "project-a", pane("browser-one")),
+    /identifier is already in use/,
+  );
+  assert.throws(
+    () =>
+      core.appendProjectBrowserPane(
+        state,
+        "project-a",
+        core.createWorkspaceBrowserPane("pane-a"),
+      ),
+    /identifier is already in use/,
+  );
+});
+
+test("mixed pane order repairs stale data and persists only an exact current permutation", () => {
+  let state = workspace();
+  state = core.appendProjectBrowserPane(
+    state,
+    "project-a",
+    core.createWorkspaceBrowserPane("browser-one"),
+  );
+  state.projects[0].legacyExtensions.paneOrderV1 = [
+    "browser-one",
+    "stale-pane",
+    "pane-b",
+    "browser-one",
+    42,
+  ];
+  assert.deepEqual(core.projectPaneOrder(state.projects[0]), [
+    "browser-one",
+    "pane-b",
+    "pane-a",
+    "pane-c",
+  ]);
+
+  const requested = ["browser-one", "pane-c", "pane-a", "pane-b"];
+  const before = structuredClone(state);
+  const ordered = core.setProjectPaneOrder(
+    state,
+    "project-a",
+    requested,
+    "2026-07-20T01:00:00Z",
+  );
+  assert.deepEqual(state, before);
+  assert.deepEqual(ordered.projects[0].legacyExtensions.paneOrderV1, requested);
+  assert.deepEqual(core.projectPaneOrder(ordered.projects[0]), requested);
+  assert.equal(ordered.projects[0].lastModifiedAtUtc, "2026-07-20T01:00:00Z");
+
+  for (const invalid of [
+    ["browser-one", "pane-c", "pane-a"],
+    ["browser-one", "pane-c", "pane-a", "pane-a"],
+    ["browser-one", "pane-c", "pane-a", "unknown"],
+  ]) {
+    assert.throws(
+      () => core.setProjectPaneOrder(ordered, "project-a", invalid),
+      /every current pane exactly once/,
+    );
+  }
+
+  let changed = core.appendProjectPane(ordered, "project-a", pane("pane-new"));
+  assert.deepEqual(core.projectPaneOrder(changed.projects[0]), [...requested, "pane-new"]);
+  assert.deepEqual(changed.projects[0].legacyExtensions.paneOrderV1, [
+    ...requested,
+    "pane-new",
+  ]);
+
+  changed = core.removeProjectBrowserPane(changed, "project-a", "browser-one");
+  assert.deepEqual(core.projectPaneOrder(changed.projects[0]), [
+    "pane-c",
+    "pane-a",
+    "pane-b",
+    "pane-new",
+  ]);
+  assert.deepEqual(changed.projects[0].legacyExtensions.paneOrderV1, [
+    "pane-c",
+    "pane-a",
+    "pane-b",
+    "pane-new",
+  ]);
+
+  changed = core.appendProjectBrowserPane(
+    changed,
+    "project-a",
+    core.createWorkspaceBrowserPane("browser-two"),
+  );
+  changed = core.removeProjectPane(changed, "project-a", "pane-new");
+  assert.deepEqual(changed.projects[0].legacyExtensions.paneOrderV1, [
+    "pane-c",
+    "pane-a",
+    "pane-b",
+    "browser-two",
+  ]);
 });
 
 test("local browser restore probes only loopback URLs with a bounded retry policy", () => {
@@ -597,6 +781,67 @@ test("project and terminal helpers create, append, rename, remove, and name dete
     () => core.renameProjectPane(state, "project-new", "pane-worker-2", "   "),
     /cannot be empty/,
   );
+});
+
+test("project rename and removal update every reference without touching unrelated state", () => {
+  const source = workspace({
+    selectedProjectId: "project-a",
+    tabs: [
+      browserTab("tab-alpha-browser", { futureTab: { keep: "browser" } }),
+      projectTab("tab-alpha", "project-a", { futureTab: { keep: "project" } }),
+      projectTab("tab-beta", "project-b", { futureTab: { keep: "beta" } }),
+      blankTab("tab-after"),
+    ],
+    activeTabId: "tab-alpha",
+  });
+  const before = structuredClone(source);
+
+  const renamed = core.renameWorkspaceProject(
+    source,
+    "project-a",
+    "  Renamed Alpha  ",
+    "2026-07-20T12:00:00Z",
+  );
+  assert.deepEqual(source, before);
+  assert.equal(renamed.projects[0].name, "Renamed Alpha");
+  assert.equal(renamed.projects[0].lastModifiedAtUtc, "2026-07-20T12:00:00Z");
+  assert.equal(renamed.tabs.find((tab) => tab.id === "tab-alpha").title, "Renamed Alpha");
+  assert.equal(renamed.tabs.find((tab) => tab.id === "tab-alpha-browser").title, "Browser");
+  assert.deepEqual(
+    renamed.tabs.find((tab) => tab.id === "tab-alpha").futureTab,
+    { keep: "project" },
+  );
+  assert.throws(
+    () => core.renameWorkspaceProject(source, "project-a", "   "),
+    /project name/i,
+  );
+  assert.throws(
+    () => core.renameWorkspaceProject(source, "project-a", "x".repeat(51)),
+    /50 characters or fewer/,
+  );
+
+  const removed = core.removeWorkspaceProject(renamed, "project-a", "tab-replacement");
+  assert.deepEqual(source, before);
+  assert.deepEqual(removed.projects.map((project) => project.id), ["project-b"]);
+  assert.equal(removed.tabs.some((tab) => tab.projectId === "project-a"), false);
+  assert.deepEqual(removed.tabs.map((tab) => tab.id), ["tab-beta", "tab-after"]);
+  assert.equal(removed.activeTabId, "tab-beta");
+  assert.equal(removed.selectedProjectId, "project-b");
+  assert.deepEqual(removed.futureRoot, before.futureRoot);
+
+  const onlyProject = workspace({
+    selectedProjectId: "project-a",
+    projects: [project("project-a")],
+    tabs: [projectTab("tab-alpha", "project-a"), outputTab("tab-output")],
+    activeTabId: "tab-alpha",
+  });
+  const empty = core.removeWorkspaceProject(onlyProject, "project-a", "tab-replacement");
+  assert.deepEqual(empty.projects, []);
+  assert.equal(empty.tabs.length, 1);
+  assert.equal(empty.tabs[0].id, "tab-replacement");
+  assert.equal(empty.tabs[0].kind, "empty");
+  assert.equal(empty.activeTabId, "tab-replacement");
+  assert.equal(empty.selectedProjectId, null);
 });
 
 test("projects sort newest-first with terminal fallback and stable ties", () => {

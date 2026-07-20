@@ -38,6 +38,8 @@ const MAX_BROWSER_PANE_TITLE_BYTES: usize = 4 * 80;
 const MAX_EXTENSION_DEPTH: usize = 32;
 const MAX_EXTENSION_STRING_BYTES: usize = 64 * 1024;
 const PROJECT_BROWSER_PANES_EXTENSION: &str = "browserPanesV1";
+const RETIRED_PROJECT_IMAGE_PANES_EXTENSION: &str = "imagePanesV1";
+const PROJECT_PANE_ORDER_EXTENSION: &str = "paneOrderV1";
 const BACKUP_COUNT: usize = 3;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -1200,12 +1202,16 @@ fn merge_preserved_extensions(incoming: &mut WorkspaceStateV1, current: &Workspa
             continue;
         };
         // Project extensions are backend-owned by default so an older/lossy
-        // frontend cannot overwrite opaque values. browserPanesV1 is the one
-        // narrowly allowlisted UI-owned payload: it must accept edits and an
-        // empty array so rename/navigation/close survive the next save.
+        // frontend cannot overwrite opaque values. Browser panes and pane
+        // order are narrowly allowlisted UI-owned payloads so edits survive
+        // the next save.
         let incoming_browser_panes = project
             .legacy_extensions
             .get(PROJECT_BROWSER_PANES_EXTENSION)
+            .cloned();
+        let incoming_pane_order = project
+            .legacy_extensions
+            .get(PROJECT_PANE_ORDER_EXTENSION)
             .cloned();
         project
             .legacy_extensions
@@ -1214,6 +1220,11 @@ fn merge_preserved_extensions(incoming: &mut WorkspaceStateV1, current: &Workspa
             project
                 .legacy_extensions
                 .insert(PROJECT_BROWSER_PANES_EXTENSION.to_owned(), browser_panes);
+        }
+        if let Some(pane_order) = incoming_pane_order {
+            project
+                .legacy_extensions
+                .insert(PROJECT_PANE_ORDER_EXTENSION.to_owned(), pane_order);
         }
         for terminal in &mut project.terminals {
             if let Some(current_terminal) = current_project
@@ -1243,7 +1254,38 @@ fn merge_preserved_extensions(incoming: &mut WorkspaceStateV1, current: &Workspa
     }
 }
 
+fn retire_image_viewer_state(state: &mut WorkspaceStateV1) {
+    for project in &mut state.projects {
+        let retired_pane_ids = match project
+            .legacy_extensions
+            .remove(RETIRED_PROJECT_IMAGE_PANES_EXTENSION)
+        {
+            Some(Value::Array(panes)) => panes
+                .iter()
+                .filter_map(|pane| pane.get("id").and_then(Value::as_str))
+                .map(str::to_owned)
+                .collect::<HashSet<_>>(),
+            _ => HashSet::new(),
+        };
+
+        if retired_pane_ids.is_empty() {
+            continue;
+        }
+        if let Some(Value::Array(order)) = project
+            .legacy_extensions
+            .get_mut(PROJECT_PANE_ORDER_EXTENSION)
+        {
+            order.retain(|entry| {
+                entry
+                    .as_str()
+                    .is_none_or(|pane_id| !retired_pane_ids.contains(pane_id))
+            });
+        }
+    }
+}
+
 fn normalize_and_validate_state(state: &mut WorkspaceStateV1) -> StorageResult<()> {
+    retire_image_viewer_state(state);
     for project in &mut state.projects {
         for (key, ratios) in &mut project.pane_width_ratios {
             if active_layout_columns(key).is_some() {
@@ -1332,7 +1374,7 @@ fn validate_state(state: &WorkspaceStateV1) -> StorageResult<()> {
             &project.legacy_extensions,
             &format!("{prefix}/legacyExtensions"),
         )?;
-        let mut terminal_ids = HashSet::new();
+        let mut pane_ids = HashSet::new();
         for (terminal_index, terminal) in project.terminals.iter().enumerate() {
             let terminal_prefix = format!("{prefix}/terminals/{terminal_index}");
             validate_text(
@@ -1341,7 +1383,7 @@ fn validate_state(state: &WorkspaceStateV1) -> StorageResult<()> {
                 false,
                 &format!("{terminal_prefix}/id"),
             )?;
-            if !terminal_ids.insert(terminal.id.as_str()) {
+            if !pane_ids.insert(terminal.id.clone()) {
                 return Err(StorageError::invalid(
                     "Terminal identifiers must be unique within a project.",
                     format!("{terminal_prefix}/id"),
@@ -1380,8 +1422,13 @@ fn validate_state(state: &WorkspaceStateV1) -> StorageResult<()> {
         }
         validate_project_browser_panes(
             &project.legacy_extensions,
-            &terminal_ids,
+            &mut pane_ids,
             &format!("{prefix}/legacyExtensions/{PROJECT_BROWSER_PANES_EXTENSION}"),
+        )?;
+        validate_project_pane_order(
+            &project.legacy_extensions,
+            &pane_ids,
+            &format!("{prefix}/legacyExtensions/{PROJECT_PANE_ORDER_EXTENSION}"),
         )?;
         for (key, ratios) in &project.pane_width_ratios {
             if key.len() > MAX_ID_BYTES || ratios.is_empty() || ratios.len() > 5 {
@@ -1635,7 +1682,7 @@ fn validate_optional_uuid(value: Option<&str>, pointer: &str) -> StorageResult<(
 
 fn validate_project_browser_panes(
     extensions: &BTreeMap<String, Value>,
-    terminal_ids: &HashSet<&str>,
+    pane_ids: &mut HashSet<String>,
     pointer: &str,
 ) -> StorageResult<()> {
     let Some(value) = extensions.get(PROJECT_BROWSER_PANES_EXTENSION) else {
@@ -1647,7 +1694,6 @@ fn validate_project_browser_panes(
             pointer,
         ));
     };
-    let mut browser_ids = HashSet::new();
     for (index, pane) in panes.iter().enumerate() {
         let pane_pointer = format!("{pointer}/{index}");
         let Value::Object(pane) = pane else {
@@ -1658,7 +1704,7 @@ fn validate_project_browser_panes(
         };
         let id = required_browser_pane_string(pane, "id", &pane_pointer)?;
         validate_text(id, MAX_ID_BYTES, false, &format!("{pane_pointer}/id"))?;
-        if terminal_ids.contains(id) || !browser_ids.insert(id) {
+        if !pane_ids.insert(id.to_owned()) {
             return Err(StorageError::invalid(
                 "Browser pane identifiers must be unique within a project.",
                 format!("{pane_pointer}/id"),
@@ -1681,6 +1727,53 @@ fn validate_project_browser_panes(
             ));
         }
         validate_browser_url(url, &format!("{pane_pointer}/url"))?;
+    }
+    Ok(())
+}
+
+fn validate_project_pane_order(
+    extensions: &BTreeMap<String, Value>,
+    pane_ids: &HashSet<String>,
+    pointer: &str,
+) -> StorageResult<()> {
+    let Some(value) = extensions.get(PROJECT_PANE_ORDER_EXTENSION) else {
+        return Ok(());
+    };
+    let Value::Array(order) = value else {
+        return Err(StorageError::invalid(
+            "The pane order extension must be an array.",
+            pointer,
+        ));
+    };
+
+    let mut ordered_ids = HashSet::with_capacity(order.len());
+    for (index, value) in order.iter().enumerate() {
+        let item_pointer = format!("{pointer}/{index}");
+        let Value::String(id) = value else {
+            return Err(StorageError::invalid(
+                "A pane order entry must be a string identifier.",
+                item_pointer,
+            ));
+        };
+        if !pane_ids.contains(id) {
+            return Err(StorageError::invalid(
+                "A pane order entry references an unknown pane.",
+                item_pointer,
+            ));
+        }
+        if !ordered_ids.insert(id.as_str()) {
+            return Err(StorageError::invalid(
+                "A pane order entry is duplicated.",
+                item_pointer,
+            ));
+        }
+    }
+
+    if ordered_ids.len() != pane_ids.len() {
+        return Err(StorageError::invalid(
+            "The pane order must contain every project pane exactly once.",
+            pointer,
+        ));
     }
     Ok(())
 }
@@ -1897,13 +1990,14 @@ fn parse_document(bytes: &[u8]) -> StorageResult<WorkspaceDocumentV1> {
         )
         .at("/schemaVersion"));
     }
-    let document: WorkspaceDocumentV1 = serde_json::from_value(unique.0).map_err(|_| {
+    let mut document: WorkspaceDocumentV1 = serde_json::from_value(unique.0).map_err(|_| {
         StorageError::new(
             StorageErrorCode::InvalidState,
             "The workspace does not match the v1 schema.",
             false,
         )
     })?;
+    retire_image_viewer_state(&mut document.state);
     validate_document(&document)?;
     Ok(document)
 }
@@ -2432,6 +2526,19 @@ mod tests {
         }
     }
 
+    fn sample_state_with_auxiliary_panes() -> WorkspaceStateV1 {
+        let mut state = sample_state();
+        state.projects[0].legacy_extensions.insert(
+            PROJECT_BROWSER_PANES_EXTENSION.to_owned(),
+            serde_json::json!([{
+                "id": "browser-one",
+                "title": "Preview",
+                "url": "https://example.com/"
+            }]),
+        );
+        state
+    }
+
     fn save(store: &WorkspaceStore, expected_revision: u64, state: WorkspaceStateV1) -> u64 {
         store
             .save(SaveWorkspaceRequest {
@@ -2677,6 +2784,252 @@ mod tests {
         assert_eq!(
             state.projects[0].legacy_extensions[PROJECT_BROWSER_PANES_EXTENSION],
             Value::Array(Vec::new())
+        );
+    }
+
+    #[test]
+    fn retired_image_panes_are_removed_without_reordering_surviving_panes() {
+        let mut state = sample_state_with_auxiliary_panes();
+        state.projects[0]
+            .legacy_extensions
+            .insert("backendOwned".to_owned(), Value::from(42));
+        state.projects[0].legacy_extensions.insert(
+            RETIRED_PROJECT_IMAGE_PANES_EXTENSION.to_owned(),
+            serde_json::json!([
+                { "id": "image-one", "legacy": true },
+                { "id": "image-two", "legacy": true }
+            ]),
+        );
+        state.projects[0].legacy_extensions.insert(
+            PROJECT_PANE_ORDER_EXTENSION.to_owned(),
+            serde_json::json!(["image-one", "browser-one", "image-two", "terminal-1"]),
+        );
+
+        normalize_and_validate_state(&mut state).unwrap();
+        let project = &state.projects[0];
+        assert!(
+            !project
+                .legacy_extensions
+                .contains_key(RETIRED_PROJECT_IMAGE_PANES_EXTENSION)
+        );
+        assert_eq!(
+            project.legacy_extensions[PROJECT_PANE_ORDER_EXTENSION],
+            serde_json::json!(["browser-one", "terminal-1"])
+        );
+        assert_eq!(project.legacy_extensions["backendOwned"], Value::from(42));
+
+        let once_retired = state.clone();
+        normalize_and_validate_state(&mut state).unwrap();
+        assert_eq!(state, once_retired);
+    }
+
+    #[test]
+    fn retired_image_only_order_becomes_empty() {
+        let mut state = sample_state();
+        state.projects[0].terminals.clear();
+        state.projects[0].legacy_extensions.insert(
+            RETIRED_PROJECT_IMAGE_PANES_EXTENSION.to_owned(),
+            serde_json::json!([{ "id": "image-only" }]),
+        );
+        state.projects[0].legacy_extensions.insert(
+            PROJECT_PANE_ORDER_EXTENSION.to_owned(),
+            serde_json::json!(["image-only"]),
+        );
+
+        normalize_and_validate_state(&mut state).unwrap();
+        assert_eq!(
+            state.projects[0].legacy_extensions[PROJECT_PANE_ORDER_EXTENSION],
+            serde_json::json!([])
+        );
+    }
+
+    #[test]
+    fn loading_and_resaving_legacy_image_state_cannot_resurrect_it() {
+        let test = TestDirectory::new();
+        let store = test.open();
+        let mut state = sample_state_with_auxiliary_panes();
+        state.projects[0].legacy_extensions.insert(
+            RETIRED_PROJECT_IMAGE_PANES_EXTENSION.to_owned(),
+            serde_json::json!([{ "id": "image-one" }]),
+        );
+        state.projects[0].legacy_extensions.insert(
+            PROJECT_PANE_ORDER_EXTENSION.to_owned(),
+            serde_json::json!(["terminal-1", "image-one", "browser-one"]),
+        );
+        let legacy_document = WorkspaceDocumentV1 {
+            schema_version: WORKSPACE_SCHEMA_VERSION,
+            revision: 1,
+            written_at_utc: current_utc_timestamp().unwrap(),
+            state,
+            import_provenance: None,
+        };
+        fs::write(
+            store.primary_path(),
+            serialize_document(&legacy_document).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = store.load().unwrap().snapshot.unwrap();
+        assert!(
+            !loaded.state.projects[0]
+                .legacy_extensions
+                .contains_key(RETIRED_PROJECT_IMAGE_PANES_EXTENSION)
+        );
+        assert_eq!(
+            loaded.state.projects[0].legacy_extensions[PROJECT_PANE_ORDER_EXTENSION],
+            serde_json::json!(["terminal-1", "browser-one"])
+        );
+
+        save(&store, loaded.revision, loaded.state);
+        let reloaded = store.load().unwrap().snapshot.unwrap().state;
+        assert!(
+            !reloaded.projects[0]
+                .legacy_extensions
+                .contains_key(RETIRED_PROJECT_IMAGE_PANES_EXTENSION)
+        );
+        assert_eq!(
+            reloaded.projects[0].legacy_extensions[PROJECT_PANE_ORDER_EXTENSION],
+            serde_json::json!(["terminal-1", "browser-one"])
+        );
+    }
+
+    #[test]
+    fn retirement_does_not_hide_invalid_surviving_pane_order_entries() {
+        let mut state = sample_state_with_auxiliary_panes();
+        state.projects[0].legacy_extensions.insert(
+            RETIRED_PROJECT_IMAGE_PANES_EXTENSION.to_owned(),
+            serde_json::json!([{ "id": "image-one" }]),
+        );
+        state.projects[0].legacy_extensions.insert(
+            PROJECT_PANE_ORDER_EXTENSION.to_owned(),
+            serde_json::json!(["image-one", "unknown", "terminal-1", "browser-one"]),
+        );
+
+        let error = normalize_and_validate_state(&mut state).unwrap_err();
+        assert_eq!(error.code, StorageErrorCode::InvalidState);
+        assert_eq!(
+            error.json_pointer.as_deref(),
+            Some("/projects/0/legacyExtensions/paneOrderV1/0")
+        );
+    }
+
+    #[test]
+    fn pane_order_extension_is_ui_owned_while_opaque_extensions_remain_preserved() {
+        let test = TestDirectory::new();
+        let store = test.open();
+        let sentinel = 9_007_199_254_740_993_u64;
+        let mut base = sample_state();
+        base.projects[0]
+            .legacy_extensions
+            .insert("backendOwned".to_owned(), Value::from(sentinel));
+        base.projects[0].legacy_extensions.insert(
+            PROJECT_PANE_ORDER_EXTENSION.to_owned(),
+            serde_json::json!(["terminal-1"]),
+        );
+        save(&store, 0, base);
+
+        let mut added = sample_state_with_auxiliary_panes();
+        added.projects[0]
+            .legacy_extensions
+            .insert("backendOwned".to_owned(), Value::from(1));
+        added.projects[0].legacy_extensions.insert(
+            PROJECT_PANE_ORDER_EXTENSION.to_owned(),
+            serde_json::json!(["terminal-1", "browser-one"]),
+        );
+        save(&store, 1, added);
+
+        let mut reordered = sample_state_with_auxiliary_panes();
+        reordered.projects[0]
+            .legacy_extensions
+            .insert("backendOwned".to_owned(), Value::from(2));
+        reordered.projects[0].legacy_extensions.insert(
+            PROJECT_PANE_ORDER_EXTENSION.to_owned(),
+            serde_json::json!(["browser-one", "terminal-1"]),
+        );
+        save(&store, 2, reordered);
+
+        let state = store.load().unwrap().snapshot.unwrap().state;
+        assert_eq!(
+            state.projects[0].legacy_extensions["backendOwned"].as_u64(),
+            Some(sentinel)
+        );
+        assert_eq!(
+            state.projects[0].legacy_extensions[PROJECT_PANE_ORDER_EXTENSION],
+            serde_json::json!(["browser-one", "terminal-1"])
+        );
+
+        let mut closed = sample_state();
+        closed.projects[0]
+            .legacy_extensions
+            .insert("backendOwned".to_owned(), Value::from(3));
+        closed.projects[0].legacy_extensions.insert(
+            PROJECT_BROWSER_PANES_EXTENSION.to_owned(),
+            Value::Array(Vec::new()),
+        );
+        closed.projects[0].legacy_extensions.insert(
+            PROJECT_PANE_ORDER_EXTENSION.to_owned(),
+            serde_json::json!(["terminal-1"]),
+        );
+        save(&store, 3, closed);
+
+        let state = store.load().unwrap().snapshot.unwrap().state;
+        assert_eq!(
+            state.projects[0].legacy_extensions["backendOwned"].as_u64(),
+            Some(sentinel)
+        );
+        assert_eq!(
+            state.projects[0].legacy_extensions[PROJECT_PANE_ORDER_EXTENSION],
+            serde_json::json!(["terminal-1"])
+        );
+    }
+
+    #[test]
+    fn pane_order_extension_requires_every_known_pane_exactly_once() {
+        let mut valid = sample_state_with_auxiliary_panes();
+        valid.projects[0].legacy_extensions.insert(
+            PROJECT_PANE_ORDER_EXTENSION.to_owned(),
+            serde_json::json!(["terminal-1", "browser-one"]),
+        );
+        normalize_and_validate_state(&mut valid).unwrap();
+
+        let invalid_orders = [
+            (
+                serde_json::json!(["terminal-1", "browser-one", "unknown"]),
+                "/projects/0/legacyExtensions/paneOrderV1/2",
+            ),
+            (
+                serde_json::json!(["terminal-1", "browser-one", "browser-one"]),
+                "/projects/0/legacyExtensions/paneOrderV1/2",
+            ),
+            (
+                serde_json::json!(["terminal-1"]),
+                "/projects/0/legacyExtensions/paneOrderV1",
+            ),
+            (
+                serde_json::json!(["terminal-1", "browser-one", 7]),
+                "/projects/0/legacyExtensions/paneOrderV1/2",
+            ),
+        ];
+        for (order, pointer) in invalid_orders {
+            let mut invalid = sample_state_with_auxiliary_panes();
+            invalid.projects[0]
+                .legacy_extensions
+                .insert(PROJECT_PANE_ORDER_EXTENSION.to_owned(), order);
+            let error = normalize_and_validate_state(&mut invalid).unwrap_err();
+            assert_eq!(error.code, StorageErrorCode::InvalidState);
+            assert_eq!(error.json_pointer.as_deref(), Some(pointer));
+        }
+
+        let mut non_array = sample_state_with_auxiliary_panes();
+        non_array.projects[0].legacy_extensions.insert(
+            PROJECT_PANE_ORDER_EXTENSION.to_owned(),
+            Value::Object(Map::new()),
+        );
+        let error = normalize_and_validate_state(&mut non_array).unwrap_err();
+        assert_eq!(error.code, StorageErrorCode::InvalidState);
+        assert_eq!(
+            error.json_pointer.as_deref(),
+            Some("/projects/0/legacyExtensions/paneOrderV1")
         );
     }
 

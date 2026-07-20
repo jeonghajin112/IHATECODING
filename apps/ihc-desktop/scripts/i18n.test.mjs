@@ -119,4 +119,18 @@ test("backend error text follows the selected application language", async () =>
     korean.localizeBackendMessage("선택한 계정을 찾지 못했습니다."),
     "선택한 계정을 찾지 못했습니다.",
   );
+  assert.equal(
+    korean.localizeBackendMessage(
+      "A file or folder with that project name already exists in Documents.",
+    ),
+    "문서 폴더에 같은 프로젝트 이름의 파일이나 폴더가 이미 있습니다.",
+  );
+  assert.equal(
+    korean.localizeBackendMessage("The media preview could not be authorized."),
+    "미디어 미리보기 접근을 허용하지 못했습니다.",
+  );
+  assert.equal(
+    korean.localizeBackendMessage("The selected file could not be deleted."),
+    "선택한 파일을 삭제하지 못했습니다.",
+  );
 });

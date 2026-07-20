@@ -21,29 +21,32 @@ import {
   appendProjectBrowserPane,
   appendProjectPane,
   appendWorkspaceProject,
-  applyProjectPaneInsertion,
   blockWorkspaceProviderResumeForAccountSwitch,
   closeWorkspaceTab,
   createWorkspaceBrowserPane,
   createWorkspaceProject,
   createWorkspaceTerminal,
   findWorkspaceProjectByFolder,
+  moveWorkspaceTabBefore,
   moveWorkspaceTabByKeyboard,
   migrateLegacyAutomaticProjectTabsToManual,
   nextWorkspacePaneName,
   openProjectWorkspaceTab,
+  removeWorkspaceProject,
   removeProjectBrowserPane,
   removeProjectPane,
   renameProjectBrowserPane,
   renameProjectPane,
+  renameWorkspaceProject,
   setProjectBrowserPaneUrl,
+  setProjectPaneOrder,
   setTerminalAgentConversation,
   sortWorkspaceProjectsByRecentModification,
   suggestWorkspaceProjectName,
   terminalAgentBindingChanged,
   uniqueWorkspaceProjectName,
   validateWorkspaceProjectDraft,
-  type PaneInsertionTarget,
+  validateWorkspaceProjectName,
   type RestoreCapacityDecision,
   type WorkspaceBrowserPane,
   type WorkspaceAgentProvider,
@@ -55,8 +58,25 @@ import {
   type SafeResumePlan,
 } from "./phase5-core";
 import { localizeBackendMessage, tr } from "./i18n";
+import {
+  crossedPointerReorderThreshold,
+  horizontalReorderTarget,
+} from "./pointer-reorder";
+import {
+  ProjectFileTreeView,
+  type ProjectFileTreeViewElements,
+} from "./project-file-tree-view";
 
 type StatusTone = "normal" | "error";
+
+type TabPointerReorder = {
+  pointerId: number;
+  tabId: string;
+  element: HTMLElement;
+  startX: number;
+  startY: number;
+  started: boolean;
+};
 
 type StorageStatus = {
   writable: boolean;
@@ -101,17 +121,37 @@ export type Phase4RuntimePort = {
 
 export type Phase4ControllerElements = {
   projectList: HTMLElement;
+  projectListToggle: HTMLButtonElement;
+  projectSidebarContent: HTMLElement;
+  projectFileTree: ProjectFileTreeViewElements;
   tabList: HTMLElement;
   addTerminalButton: HTMLButtonElement;
   addTabButton: HTMLButtonElement;
   createProjectButton: HTMLButtonElement;
+  projectCreateMenu: HTMLElement;
+  useExistingProjectFolderButton: HTMLButtonElement;
+  startProjectFromScratchButton: HTMLButtonElement;
   projectDialog: HTMLDialogElement;
+  projectDialogTitle: HTMLElement;
+  projectDialogDescription: HTMLElement;
   projectForm: HTMLFormElement;
   projectName: HTMLInputElement;
+  projectPathField: HTMLElement;
   projectPath: HTMLInputElement;
   selectProjectFolderButton: HTMLButtonElement;
   projectFormError: HTMLElement;
   cancelProjectButton: HTMLButtonElement;
+  submitProjectButton: HTMLButtonElement;
+  projectRenameDialog: HTMLDialogElement;
+  projectRenameForm: HTMLFormElement;
+  projectRenameName: HTMLInputElement;
+  projectRenameError: HTMLElement;
+  cancelProjectRenameButton: HTMLButtonElement;
+  confirmProjectRenameButton: HTMLButtonElement;
+  projectDeleteDialog: HTMLDialogElement;
+  projectDeleteMessage: HTMLElement;
+  cancelProjectDeleteButton: HTMLButtonElement;
+  confirmProjectDeleteButton: HTMLButtonElement;
   upgradeButton: HTMLButtonElement;
   upgradeDialog: HTMLDialogElement;
   upgradeProjectCount: HTMLElement;
@@ -121,6 +161,56 @@ export type Phase4ControllerElements = {
   closeUpgradeButton: HTMLButtonElement;
   upgradeError: HTMLElement;
 };
+
+function createProjectActionIcon(kind: "edit" | "delete"): SVGSVGElement {
+  const namespace = "http://www.w3.org/2000/svg";
+  const icon = document.createElementNS(namespace, "svg");
+  icon.setAttribute("viewBox", "0 0 16 16");
+  icon.setAttribute("aria-hidden", "true");
+  icon.setAttribute("focusable", "false");
+  const paths = kind === "edit"
+    ? [
+        "M3 12.5l.7-3.1 6.9-6.9a1 1 0 0 1 1.4 0l1.1 1.1a1 1 0 0 1 0 1.4l-6.9 6.9z",
+        "M9.8 3.3l2.9 2.9",
+      ]
+    : [
+        "M3.5 4.5h9",
+        "M6 2.5h4l.5 2H5.5z",
+        "M5 4.5v8h6v-8",
+        "M7 6.5v4M9 6.5v4",
+      ];
+  for (const data of paths) {
+    const path = document.createElementNS(namespace, "path");
+    path.setAttribute("d", data);
+    icon.append(path);
+  }
+  return icon;
+}
+
+function createProjectMenuToggle(label: string, menuId: string): HTMLButtonElement {
+  const button = document.createElement("button");
+  button.className = "project-item-menu-toggle";
+  button.type = "button";
+  button.title = label;
+  button.setAttribute("aria-label", label);
+  button.setAttribute("aria-haspopup", "menu");
+  button.setAttribute("aria-controls", menuId);
+  button.setAttribute("aria-expanded", "false");
+  button.textContent = "…";
+  return button;
+}
+
+function createProjectMenuItem(kind: "edit" | "delete", label: string): HTMLButtonElement {
+  const button = document.createElement("button");
+  button.className = `project-item-menu-entry project-item-${kind}`;
+  button.type = "button";
+  button.setAttribute("role", "menuitem");
+  button.append(createProjectActionIcon(kind));
+  const text = document.createElement("span");
+  text.textContent = label;
+  button.append(text);
+  return button;
+}
 
 export class Phase4WorkspaceController {
   private session: WorkspaceSession | null = null;
@@ -137,11 +227,24 @@ export class Phase4WorkspaceController {
   private externalReplacementBarrier: Promise<void> | null = null;
   private resolveExternalReplacement: (() => void) | null = null;
   private projectFolderPickerPending = false;
+  private projectCreationPending = false;
   private projectFolderDefaultPath: string | null = null;
+  private projectDialogMode: "existing" | "scratch" = "scratch";
+  private scratchProjectDirectory: { projectName: string; folderPath: string } | null = null;
+  private pendingProjectRenameId: string | null = null;
+  private pendingProjectRenameTrigger: HTMLButtonElement | null = null;
+  private projectRenamePending = false;
+  private pendingProjectDeleteId: string | null = null;
+  private pendingProjectDeleteTrigger: HTMLButtonElement | null = null;
   private providerAccountRestartRollback: WorkspaceState | null = null;
   private readonly projectActivity = new ProjectActivityTracker();
   private readonly listeners = new AbortController();
-  private readonly projectListToggle: HTMLButtonElement | null;
+  private readonly projectListToggle: HTMLButtonElement;
+  private readonly projectFileTree: ProjectFileTreeView;
+  private tabPointerReorder: TabPointerReorder | null = null;
+  private tabDropTargetId: string | null = null;
+  private tabDropPosition: "before" | "after" | null = null;
+  private suppressTabClickUntil = 0;
 
   constructor(
     private readonly runtime: Phase4RuntimePort,
@@ -149,28 +252,132 @@ export class Phase4WorkspaceController {
     private readonly idFactory: () => string = createOpaqueId,
   ) {
     const signal = this.listeners.signal;
-    this.projectListToggle = elements.projectList.parentElement?.querySelector<HTMLButtonElement>(
-      "#toggle-project-list",
-    ) ?? null;
-    this.projectListToggle?.addEventListener(
+    this.projectListToggle = elements.projectListToggle;
+    this.projectFileTree = new ProjectFileTreeView(elements.projectFileTree);
+    this.projectListToggle.addEventListener(
       "click",
       () => {
-        const expanded = this.projectListToggle?.getAttribute("aria-expanded") === "true";
+        const expanded = this.projectListToggle.getAttribute("aria-expanded") === "true";
         this.setProjectListExpanded(!expanded);
       },
       { signal },
     );
     elements.addTabButton.addEventListener("click", () => void this.addBlankTab(), { signal });
+    elements.tabList.addEventListener("pointermove", (event) => this.onTabPointerMove(event), {
+      signal,
+    });
+    elements.tabList.addEventListener("pointerup", (event) => void this.onTabPointerUp(event), {
+      signal,
+    });
+    elements.tabList.addEventListener("pointercancel", (event) => this.onTabPointerCancel(event), {
+      signal,
+    });
+    elements.tabList.addEventListener(
+      "lostpointercapture",
+      (event) => this.onTabPointerCaptureLost(event),
+      { signal },
+    );
     elements.createProjectButton.addEventListener(
       "click",
+      (event) => {
+        event.stopPropagation();
+        if (this.canMutate()) this.setProjectCreateMenuOpen(elements.projectCreateMenu.hidden);
+      },
+      { signal },
+    );
+    elements.useExistingProjectFolderButton.addEventListener(
+      "click",
       () => {
-        if (this.canMutate()) this.openProjectDialog();
+        this.setProjectCreateMenuOpen(false);
+        void this.openExistingFolderProject();
+      },
+      { signal },
+    );
+    elements.startProjectFromScratchButton.addEventListener(
+      "click",
+      () => {
+        this.setProjectCreateMenuOpen(false);
+        if (this.canMutate()) this.openProjectDialog(null, "scratch");
+      },
+      { signal },
+    );
+    document.addEventListener(
+      "pointerdown",
+      (event) => {
+        const target = event.target instanceof Element ? event.target : null;
+        if (!target?.closest(".project-create-menu-root")) this.setProjectCreateMenuOpen(false);
+        if (!target?.closest(".project-item-menu-root")) this.closeProjectItemMenus();
+      },
+      { capture: true, signal },
+    );
+    document.addEventListener(
+      "keydown",
+      (event) => {
+        if (event.key !== "Escape") return;
+        if (!elements.projectCreateMenu.hidden) {
+          event.preventDefault();
+          this.setProjectCreateMenuOpen(false, true);
+          return;
+        }
+        const openProjectMenu = elements.projectList.querySelector<HTMLElement>(
+          '.project-item-menu:not([hidden])',
+        );
+        if (openProjectMenu) {
+          event.preventDefault();
+          this.closeProjectItemMenus(true);
+        }
       },
       { signal },
     );
     elements.cancelProjectButton.addEventListener(
       "click",
-      () => elements.projectDialog.close(),
+      () => {
+        if (!this.projectCreationPending) elements.projectDialog.close();
+      },
+      { signal },
+    );
+    elements.projectDialog.addEventListener(
+      "cancel",
+      (event) => {
+        if (this.projectCreationPending) event.preventDefault();
+      },
+      { signal },
+    );
+    elements.cancelProjectRenameButton.addEventListener(
+      "click",
+      () => {
+        if (!this.projectRenamePending) elements.projectRenameDialog.close();
+      },
+      { signal },
+    );
+    elements.projectRenameDialog.addEventListener(
+      "cancel",
+      (event) => {
+        if (this.projectRenamePending) event.preventDefault();
+      },
+      { signal },
+    );
+    elements.projectRenameForm.addEventListener(
+      "submit",
+      (event) => {
+        event.preventDefault();
+        void this.submitProjectRename();
+      },
+      { signal },
+    );
+    elements.cancelProjectDeleteButton.addEventListener(
+      "click",
+      () => elements.projectDeleteDialog.close(),
+      { signal },
+    );
+    elements.confirmProjectDeleteButton.addEventListener(
+      "click",
+      () => {
+        const projectId = this.pendingProjectDeleteId;
+        if (!projectId) return;
+        elements.projectDeleteDialog.close();
+        void this.deleteProject(projectId);
+      },
       { signal },
     );
     elements.selectProjectFolderButton.addEventListener(
@@ -209,7 +416,38 @@ export class Phase4WorkspaceController {
     );
     elements.projectDialog.addEventListener(
       "close",
-      () => this.runtime.setModalOverlayOpen("project", false),
+      () => {
+        this.scratchProjectDirectory = null;
+        this.runtime.setModalOverlayOpen("project", false);
+        this.setProjectCreateMenuOpen(false);
+      },
+      { signal },
+    );
+    elements.projectRenameDialog.addEventListener(
+      "close",
+      () => {
+        const trigger = this.pendingProjectRenameTrigger;
+        this.pendingProjectRenameId = null;
+        this.pendingProjectRenameTrigger = null;
+        this.elements.projectRenameError.textContent = "";
+        this.runtime.setModalOverlayOpen("project-rename", false);
+        requestAnimationFrame(() => {
+          if (!this.shuttingDown && trigger?.isConnected) trigger.focus();
+        });
+      },
+      { signal },
+    );
+    elements.projectDeleteDialog.addEventListener(
+      "close",
+      () => {
+        const trigger = this.pendingProjectDeleteTrigger;
+        this.pendingProjectDeleteId = null;
+        this.pendingProjectDeleteTrigger = null;
+        this.runtime.setModalOverlayOpen("project-delete", false);
+        requestAnimationFrame(() => {
+          if (!this.shuttingDown && trigger?.isConnected) trigger.focus();
+        });
+      },
       { signal },
     );
     elements.upgradeDialog.addEventListener(
@@ -223,12 +461,40 @@ export class Phase4WorkspaceController {
       { signal },
     );
     this.setProjectListExpanded(true);
+    this.setProjectCreateMenuOpen(false);
     this.refreshControls();
+  }
+
+  private setProjectCreateMenuOpen(open: boolean, restoreFocus = false): void {
+    const allowed = open && this.mutationsEnabled();
+    this.elements.projectCreateMenu.hidden = !allowed;
+    this.elements.createProjectButton.setAttribute("aria-expanded", String(allowed));
+    if (allowed) {
+      this.closeProjectItemMenus();
+      requestAnimationFrame(() => this.elements.useExistingProjectFolderButton.focus());
+    } else if (restoreFocus && this.elements.createProjectButton.isConnected) {
+      this.elements.createProjectButton.focus();
+    }
+  }
+
+  private closeProjectItemMenus(restoreFocus = false): void {
+    for (const menu of this.elements.projectList.querySelectorAll<HTMLElement>(
+      ".project-item-menu",
+    )) {
+      if (menu.hidden) continue;
+      menu.hidden = true;
+      const root = menu.closest<HTMLElement>(".project-item-menu-root");
+      const toggle = root?.querySelector<HTMLButtonElement>(".project-item-menu-toggle") ?? null;
+      toggle?.setAttribute("aria-expanded", "false");
+      const item = root?.closest<HTMLElement>(".project-item");
+      if (item) delete item.dataset.menuOpen;
+      if (restoreFocus && toggle?.isConnected) toggle.focus();
+    }
   }
 
   private setProjectListExpanded(expanded: boolean): void {
     this.elements.projectList.hidden = !expanded;
-    if (!this.projectListToggle) return;
+    this.elements.projectSidebarContent.hidden = !expanded;
     this.projectListToggle.setAttribute("aria-expanded", String(expanded));
     const label = expanded
       ? tr("Collapse project list", "프로젝트 목록 접기")
@@ -343,9 +609,15 @@ export class Phase4WorkspaceController {
 
   dispose(): void {
     this.projectActivity.clear();
+    this.finishTabPointerReorder(false);
+    this.projectFileTree.dispose();
     if (this.elements.projectDialog.open) this.elements.projectDialog.close();
+    if (this.elements.projectRenameDialog.open) this.elements.projectRenameDialog.close();
+    if (this.elements.projectDeleteDialog.open) this.elements.projectDeleteDialog.close();
     if (this.elements.upgradeDialog.open) this.elements.upgradeDialog.close();
     this.runtime.setModalOverlayOpen("project", false);
+    this.runtime.setModalOverlayOpen("project-rename", false);
+    this.runtime.setModalOverlayOpen("project-delete", false);
     this.runtime.setModalOverlayOpen("upgrade", false);
     this.listeners.abort();
   }
@@ -590,18 +862,14 @@ export class Phase4WorkspaceController {
     }
   }
 
-  onPaneReordered(
-    projectId: string,
-    draggedPaneId: string,
-    target: Pick<PaneInsertionTarget, "beforePaneId">,
-  ): void {
+  onPaneOrderChanged(projectId: string, orderedPaneIds: string[]): void {
     const state = this.currentState();
     if (!state || !this.canMutate(false)) return;
     try {
-      const next = applyProjectPaneInsertion(state, projectId, draggedPaneId, target);
+      const next = setProjectPaneOrder(state, projectId, orderedPaneIds);
       void this.persist(
         next,
-        tr("Could not save the PowerShell layout", "PowerShell 배치를 저장하지 못했습니다"),
+        tr("Could not save the panel layout", "패널 배치를 저장하지 못했습니다"),
       ).then((saved) => {
         const project = this.currentState()?.projects.find((item) => item.id === projectId);
         if (project) this.runtime.syncProject(project);
@@ -732,6 +1000,7 @@ export class Phase4WorkspaceController {
     this.renderSidebar();
     const state = this.currentState();
     if (!state) {
+      this.projectFileTree.hide();
       this.runtime.showEmptyView();
       return;
     }
@@ -739,12 +1008,19 @@ export class Phase4WorkspaceController {
     const tab = state.tabs.find((item) => item.id === state.activeTabId) ?? null;
     if (tab?.kind === "project" && tab.projectId) {
       const project = state.projects.find((item) => item.id === tab.projectId);
+      if (project) {
+        this.projectFileTree.showProject(project);
+      } else {
+        this.projectFileTree.hide();
+      }
       if (project && this.canStartRuntime()) {
         this.runtime.syncProject(project);
         if (this.runtime.showProject(project)) {
           return;
         }
       }
+    } else {
+      this.projectFileTree.hide();
     }
     this.runtime.showEmptyView();
     if (tab && tab.kind !== "empty" && tab.kind !== "project") {
@@ -772,6 +1048,9 @@ export class Phase4WorkspaceController {
       element.setAttribute("role", "tab");
       element.setAttribute("aria-selected", String(tab.id === state.activeTabId));
       element.setAttribute("aria-disabled", String(!enabled));
+      element.setAttribute("aria-grabbed", "false");
+      element.draggable = false;
+      element.dataset.reorderable = String(enabled);
       element.tabIndex = tab.id === state.activeTabId ? 0 : -1;
 
       const working = Boolean(
@@ -828,12 +1107,20 @@ export class Phase4WorkspaceController {
       close.title = closeLabel;
       close.setAttribute("aria-label", closeLabel);
       close.disabled = !enabled;
+      close.draggable = false;
+      close.addEventListener("pointerdown", (event) => {
+        event.stopPropagation();
+      });
       close.addEventListener("click", (event) => {
         event.stopPropagation();
         void this.closeTab(tab.id, tab.projectId);
       });
-      const activate = () => void this.activateTab(tab.id);
+      const activate = () => {
+        if (performance.now() < this.suppressTabClickUntil) return;
+        void this.activateTab(tab.id);
+      };
       element.addEventListener("click", activate);
+      element.addEventListener("pointerdown", (event) => this.onTabPointerDown(event, tab.id));
       element.addEventListener("keydown", (event) => this.onTabKeyDown(event, tab.id));
       element.append(kind, title, status, close);
       this.elements.tabList.append(element);
@@ -861,16 +1148,24 @@ export class Phase4WorkspaceController {
     if (!state) return;
     const enabled = this.mutationsEnabled();
     for (const project of sortWorkspaceProjectsByRecentModification(state.projects)) {
-      const button = document.createElement("button");
-      button.className = "project-item";
-      button.type = "button";
-      button.disabled = !enabled;
-      button.dataset.active = String(project.id === state.selectedProjectId);
+      const item = document.createElement("div");
+      item.className = "project-item";
+      item.dataset.enabled = String(enabled);
+      item.dataset.active = String(project.id === state.selectedProjectId);
+
+      const openButton = document.createElement("button");
+      openButton.className = "project-item-open";
+      openButton.type = "button";
+      openButton.disabled = !enabled;
+      openButton.title = tr(`Open ${project.name}`, `${project.name} 열기`);
+      openButton.setAttribute("aria-label", openButton.title);
       const name = document.createElement("strong");
+      name.className = "project-item-name";
       name.textContent = project.name;
+      openButton.append(name);
+
       const unread = projectUnreadCount(state, project.id);
-      button.dataset.hasCompletion = String(unread > 0);
-      button.append(name);
+      item.dataset.hasCompletion = String(unread > 0);
       if (unread > 0) {
         const badge = document.createElement("span");
         badge.className = "completion-badge project-completion-badge";
@@ -881,11 +1176,227 @@ export class Phase4WorkspaceController {
         );
         badge.title = unreadLabel;
         badge.setAttribute("aria-label", unreadLabel);
-        button.append(badge);
+        item.append(badge);
       }
-      button.addEventListener("click", () => void this.openProject(project.id));
-      this.elements.projectList.append(button);
+
+      const menuRoot = document.createElement("div");
+      menuRoot.className = "project-item-menu-root";
+      const menuId = `project-item-menu-${project.id}`;
+      const menuLabel = tr(`More actions for ${project.name}`, `${project.name} 추가 작업`);
+      const menuToggle = createProjectMenuToggle(menuLabel, menuId);
+      menuToggle.disabled = !enabled;
+      const menu = document.createElement("div");
+      menu.id = menuId;
+      menu.className = "project-item-menu";
+      menu.setAttribute("role", "menu");
+      menu.hidden = true;
+      const editButton = createProjectMenuItem(
+        "edit",
+        tr("Rename", "이름 변경"),
+      );
+      const deleteButton = createProjectMenuItem(
+        "delete",
+        tr("Delete", "삭제"),
+      );
+      editButton.disabled = !enabled;
+      deleteButton.disabled = !enabled;
+      menu.append(editButton, deleteButton);
+      menuRoot.append(menuToggle, menu);
+
+      menuToggle.addEventListener("click", (event) => {
+        event.stopPropagation();
+        if (!enabled) return;
+        const opening = menu.hidden;
+        this.closeProjectItemMenus();
+        this.setProjectCreateMenuOpen(false);
+        if (!opening) return;
+        const listBounds = this.elements.projectList.getBoundingClientRect();
+        const itemBounds = item.getBoundingClientRect();
+        item.dataset.menuDirection = listBounds.bottom - itemBounds.bottom < 70 ? "up" : "down";
+        item.dataset.menuOpen = "true";
+        menu.hidden = false;
+        menuToggle.setAttribute("aria-expanded", "true");
+        requestAnimationFrame(() => editButton.focus());
+      });
+      editButton.addEventListener("click", (event) => {
+        event.stopPropagation();
+        if (!enabled) return;
+        this.closeProjectItemMenus();
+        this.openProjectRenameDialog(project.id, menuToggle);
+      });
+      deleteButton.addEventListener("click", (event) => {
+        event.stopPropagation();
+        if (!enabled) return;
+        this.closeProjectItemMenus();
+        this.openProjectDeleteDialog(project.id, menuToggle);
+      });
+      openButton.addEventListener("click", () => void this.openProject(project.id));
+      item.append(openButton, menuRoot);
+      this.elements.projectList.append(item);
     }
+  }
+
+  private onTabPointerDown(event: PointerEvent, tabId: string): void {
+    const target = event.target instanceof Element ? event.target : null;
+    if (
+      !this.canMutate(false) ||
+      event.button !== 0 ||
+      !event.isPrimary ||
+      target?.closest(".workspace-tab-close")
+    ) {
+      return;
+    }
+    const element = target?.closest<HTMLElement>(".workspace-tab");
+    if (!element || element.dataset.tabId !== tabId) {
+      return;
+    }
+    this.finishTabPointerReorder(false);
+    this.tabPointerReorder = {
+      pointerId: event.pointerId,
+      tabId,
+      element,
+      startX: event.clientX,
+      startY: event.clientY,
+      started: false,
+    };
+    try {
+      element.setPointerCapture(event.pointerId);
+    } catch {
+      this.tabPointerReorder = null;
+    }
+  }
+
+  private onTabPointerMove(event: PointerEvent): void {
+    const pointer = this.tabPointerReorder;
+    if (!pointer || pointer.pointerId !== event.pointerId) return;
+    if (
+      !pointer.started &&
+      !crossedPointerReorderThreshold(
+        pointer.startX,
+        pointer.startY,
+        event.clientX,
+        event.clientY,
+      )
+    ) {
+      return;
+    }
+    if (!pointer.started) {
+      pointer.started = true;
+      this.suppressTabClickUntil = Number.POSITIVE_INFINITY;
+      pointer.element.setAttribute("aria-grabbed", "true");
+      pointer.element.dataset.dragging = "true";
+    }
+    event.preventDefault();
+    pointer.element.style.setProperty(
+      "--reorder-offset-x",
+      `${event.clientX - pointer.startX}px`,
+    );
+    this.clearTabDropIndicators();
+    const elements = [...this.elements.tabList.querySelectorAll<HTMLElement>(".workspace-tab")];
+    const target = horizontalReorderTarget(
+      elements.flatMap((element) => {
+        const id = element.dataset.tabId;
+        if (!id) return [];
+        const bounds = element.getBoundingClientRect();
+        return [{ id, left: bounds.left, right: bounds.right }];
+      }),
+      pointer.tabId,
+      event.clientX,
+    );
+    if (!target) {
+      this.tabDropTargetId = null;
+      this.tabDropPosition = null;
+      return;
+    }
+    this.tabDropTargetId = target.targetId;
+    this.tabDropPosition = target.position;
+    elements.find((element) => element.dataset.tabId === target.targetId)!.dataset.dropPosition =
+      target.position;
+  }
+
+  private async onTabPointerUp(event: PointerEvent): Promise<void> {
+    const pointer = this.tabPointerReorder;
+    if (!pointer || pointer.pointerId !== event.pointerId) return;
+    if (!pointer.started) {
+      this.finishTabPointerReorder(false);
+      return;
+    }
+    event.preventDefault();
+    const draggedTabId = pointer.tabId;
+    const state = this.currentState();
+    const targetId = this.tabDropTargetId;
+    const position = this.tabDropPosition;
+    this.finishTabPointerReorder(true);
+    if (!state || !this.canMutate()) return;
+
+    const remaining = state.tabs.filter((tab) => tab.id !== draggedTabId);
+    let beforeTabId: string | null = null;
+    if (targetId && position) {
+      const targetIndex = remaining.findIndex((tab) => tab.id === targetId);
+      if (targetIndex < 0) return;
+      beforeTabId = position === "before"
+        ? targetId
+        : (remaining[targetIndex + 1]?.id ?? null);
+    } else {
+      return;
+    }
+
+    try {
+      const next = moveWorkspaceTabBefore(state, draggedTabId, beforeTabId);
+      if (next.tabs.every((tab, index) => tab.id === state.tabs[index]?.id)) return;
+      if (
+        await this.persist(
+          next,
+          tr("Could not save the tab order", "탭 순서를 저장하지 못했습니다"),
+        )
+      ) {
+        this.renderAndActivate();
+        requestAnimationFrame(() => {
+          this.elements.tabList
+            .querySelector<HTMLElement>(`.workspace-tab[data-tab-id="${CSS.escape(draggedTabId)}"]`)
+            ?.focus();
+        });
+      }
+    } catch (error) {
+      this.runtime.setFooterStatus(errorMessage(error), "error");
+    }
+  }
+
+  private onTabPointerCancel(event: PointerEvent): void {
+    if (this.tabPointerReorder?.pointerId !== event.pointerId) return;
+    this.finishTabPointerReorder(this.tabPointerReorder.started);
+  }
+
+  private onTabPointerCaptureLost(event: PointerEvent): void {
+    if (this.tabPointerReorder?.pointerId !== event.pointerId) return;
+    this.finishTabPointerReorder(this.tabPointerReorder.started);
+  }
+
+  private clearTabDropIndicators(): void {
+    for (const tab of this.elements.tabList.querySelectorAll<HTMLElement>(".workspace-tab")) {
+      delete tab.dataset.dropPosition;
+    }
+  }
+
+  private finishTabPointerReorder(suppressClick = this.tabPointerReorder?.started ?? false): void {
+    const pointer = this.tabPointerReorder;
+    this.tabPointerReorder = null;
+    if (pointer) {
+      delete pointer.element.dataset.dragging;
+      pointer.element.style.removeProperty("--reorder-offset-x");
+      pointer.element.setAttribute("aria-grabbed", "false");
+      try {
+        if (pointer.element.hasPointerCapture(pointer.pointerId)) {
+          pointer.element.releasePointerCapture(pointer.pointerId);
+        }
+      } catch {
+        // The element may have been replaced while storage state refreshed.
+      }
+    }
+    this.clearTabDropIndicators();
+    this.tabDropTargetId = null;
+    this.tabDropPosition = null;
+    if (suppressClick) this.suppressTabClickUntil = performance.now() + 240;
   }
 
   private onTabKeyDown(event: KeyboardEvent, tabId: string): void {
@@ -973,6 +1484,160 @@ export class Phase4WorkspaceController {
     this.renderAndActivate();
   }
 
+  refreshLocalizedUi(): void {
+    if (this.shuttingDown) return;
+    const projectListExpanded = this.projectListToggle.getAttribute("aria-expanded") !== "false";
+    this.renderTabs();
+    this.renderSidebar();
+    this.projectFileTree.refreshLocalizedUi();
+    this.setProjectListExpanded(projectListExpanded);
+    this.refreshControls();
+  }
+
+  private openProjectRenameDialog(projectId: string, trigger: HTMLButtonElement): void {
+    const state = this.currentState();
+    if (!state || !this.canMutate()) return;
+    const project = state.projects.find((item) => item.id === projectId);
+    if (!project || this.elements.projectRenameDialog.open) return;
+    this.pendingProjectRenameId = projectId;
+    this.pendingProjectRenameTrigger = trigger;
+    this.elements.projectRenameName.value = project.name;
+    this.elements.projectRenameError.textContent = "";
+    this.elements.confirmProjectRenameButton.disabled = false;
+    this.runtime.setModalOverlayOpen("project-rename", true);
+    try {
+      this.elements.projectRenameDialog.showModal();
+    } catch (error) {
+      this.pendingProjectRenameId = null;
+      this.pendingProjectRenameTrigger = null;
+      this.runtime.setModalOverlayOpen("project-rename", false);
+      throw error;
+    }
+    requestAnimationFrame(() => {
+      this.elements.projectRenameName.focus();
+      this.elements.projectRenameName.select();
+    });
+  }
+
+  private async submitProjectRename(): Promise<void> {
+    const projectId = this.pendingProjectRenameId;
+    const state = this.currentState();
+    if (!projectId || !state || !this.canMutate()) return;
+    this.elements.projectRenameError.textContent = "";
+    this.projectRenamePending = true;
+    this.elements.cancelProjectRenameButton.disabled = true;
+    this.elements.confirmProjectRenameButton.disabled = true;
+    try {
+      const name = validateWorkspaceProjectName(this.elements.projectRenameName.value);
+      const currentName = state.projects.find((project) => project.id === projectId)?.name;
+      if (name === currentName) {
+        this.elements.projectRenameDialog.close();
+      } else if (await this.renameProject(projectId, name)) {
+        this.elements.projectRenameDialog.close();
+      } else {
+        this.elements.projectRenameError.textContent = tr(
+          "The project name could not be saved. Try again.",
+          "프로젝트 이름을 저장하지 못했습니다. 다시 시도하세요.",
+        );
+      }
+    } catch (error) {
+      this.elements.projectRenameError.textContent = errorMessage(error);
+    } finally {
+      this.projectRenamePending = false;
+      this.elements.cancelProjectRenameButton.disabled = false;
+      if (this.elements.projectRenameDialog.open) {
+        this.elements.confirmProjectRenameButton.disabled = false;
+      }
+    }
+  }
+
+  private async renameProject(projectId: string, name: string): Promise<boolean> {
+    const state = this.currentState();
+    if (!state || !this.canMutate()) return false;
+    const next = renameWorkspaceProject(state, projectId, name);
+    if (
+      !(await this.persist(
+        next,
+        tr("Could not save the project name", "프로젝트 이름을 저장하지 못했습니다"),
+      ))
+    ) {
+      return false;
+    }
+    const committedProject = this.currentState()?.projects.find(
+      (project) => project.id === projectId,
+    );
+    if (committedProject) this.runtime.syncProject(committedProject);
+    this.renderAndActivate();
+    return true;
+  }
+
+  private async deleteProject(projectId: string): Promise<void> {
+    const state = this.currentState();
+    if (!state || !this.canMutate()) return;
+    const project = state.projects.find((item) => item.id === projectId);
+    if (!project) return;
+
+    try {
+      const next = removeWorkspaceProject(state, projectId, this.idFactory());
+      if (!this.canActivateWorkspaceState(next, projectId)) return;
+      if (
+        !(await this.persist(
+          next,
+          tr("Could not remove the project", "프로젝트를 삭제하지 못했습니다"),
+        ))
+      ) {
+        return;
+      }
+      let cleanupError: string | null = null;
+      try {
+        await this.trackRuntimeTransition(() => this.runtime.unloadProject(projectId));
+      } catch (error) {
+        cleanupError = tr(
+          `The project was removed, but its running panes could not be closed cleanly: ${errorMessage(error)}`,
+          `프로젝트는 삭제했지만 실행 중인 창을 정상적으로 닫지 못했습니다: ${errorMessage(error)}`,
+        );
+      }
+      this.projectActivity.clearProject(projectId);
+      this.renderAndActivate();
+      if (cleanupError) {
+        this.runtime.setFooterStatus(cleanupError, "error");
+      } else {
+        this.runtime.setFooterStatus(
+          tr(
+            `Removed ${project.name} from IHATECODING. Its folder and files were left unchanged.`,
+            `${project.name} 프로젝트를 IHATECODING에서 삭제했습니다. 폴더와 파일은 그대로 유지됩니다.`,
+          ),
+        );
+      }
+    } catch (error) {
+      this.runtime.setFooterStatus(errorMessage(error), "error");
+    }
+  }
+
+  private openProjectDeleteDialog(projectId: string, trigger: HTMLButtonElement): void {
+    const state = this.currentState();
+    if (!state || !this.canMutate()) return;
+    const project = state.projects.find((item) => item.id === projectId);
+    if (!project) return;
+    if (this.elements.projectDeleteDialog.open) return;
+    this.pendingProjectDeleteId = projectId;
+    this.pendingProjectDeleteTrigger = trigger;
+    this.elements.projectDeleteMessage.textContent = tr(
+      `Remove "${project.name}" and close its open tabs and running panes?`,
+      `"${project.name}" 프로젝트와 열려 있는 탭, 실행 중인 창을 닫을까요?`,
+    );
+    this.runtime.setModalOverlayOpen("project-delete", true);
+    try {
+      this.elements.projectDeleteDialog.showModal();
+    } catch (error) {
+      this.pendingProjectDeleteId = null;
+      this.pendingProjectDeleteTrigger = null;
+      this.runtime.setModalOverlayOpen("project-delete", false);
+      throw error;
+    }
+    requestAnimationFrame(() => this.elements.cancelProjectDeleteButton.focus());
+  }
+
   private async openProject(projectId: string): Promise<void> {
     const state = this.currentState();
     if (!state || !this.canMutate()) return;
@@ -987,12 +1652,58 @@ export class Phase4WorkspaceController {
     }
   }
 
-  private openProjectDialog(): void {
+  private async openExistingFolderProject(): Promise<void> {
     const state = this.currentState();
+    if (!state || !this.canMutate()) return;
+    const defaultPath =
+      state.projects.find((project) => project.id === state.selectedProjectId)?.folderPath ?? null;
+    const selected = await this.pickProjectFolder(defaultPath, false);
+    if (!selected || !this.canMutate(false)) return;
+    const current = this.currentState();
+    if (!current) return;
+    const existing = findWorkspaceProjectByFolder(current.projects, selected);
+    if (existing) {
+      await this.openProject(existing.id);
+      return;
+    }
+    this.openProjectDialog(selected, "existing");
+  }
+
+  private openProjectDialog(
+    initialFolderPath: string | null = null,
+    mode: "existing" | "scratch" = "scratch",
+  ): void {
+    const state = this.currentState();
+    this.projectDialogMode = mode;
+    this.scratchProjectDirectory = null;
     this.projectFolderDefaultPath =
       state?.projects.find((project) => project.id === state.selectedProjectId)?.folderPath ?? null;
     this.elements.projectForm.reset();
     this.elements.projectFormError.textContent = "";
+    const scratch = mode === "scratch";
+    this.elements.projectPathField.hidden = scratch;
+    this.elements.projectPath.required = !scratch;
+    this.elements.selectProjectFolderButton.disabled = scratch;
+    this.elements.projectDialogTitle.textContent = mode === "existing"
+      ? tr("Use existing folder", "기존 폴더 사용")
+      : tr("Start from scratch", "처음부터 시작");
+    this.elements.projectDialogDescription.textContent = mode === "existing"
+      ? tr(
+          "Review the project name for the selected folder.",
+          "선택한 폴더의 프로젝트 이름을 확인하세요.",
+        )
+      : tr(
+          "Enter a name. A matching folder will be created in Documents.",
+          "이름을 입력하면 문서 폴더 안에 같은 이름의 프로젝트 폴더를 만듭니다.",
+        );
+    this.elements.submitProjectButton.textContent = mode === "existing"
+      ? tr("Add project", "프로젝트 추가")
+      : tr("Create project", "프로젝트 만들기");
+    this.elements.submitProjectButton.disabled = false;
+    if (initialFolderPath) {
+      this.elements.projectPath.value = initialFolderPath;
+      this.elements.projectName.value = suggestWorkspaceProjectName(initialFolderPath);
+    }
     this.runtime.setModalOverlayOpen("project", true);
     try {
       this.elements.projectDialog.showModal();
@@ -1000,70 +1711,191 @@ export class Phase4WorkspaceController {
       this.runtime.setModalOverlayOpen("project", false);
       throw error;
     }
-    requestAnimationFrame(() => this.elements.projectName.focus());
+    requestAnimationFrame(() => {
+      this.elements.projectName.focus();
+      if (initialFolderPath) this.elements.projectName.select();
+    });
   }
 
   private async selectProjectFolder(): Promise<void> {
     if (this.projectFolderPickerPending || !this.canMutate()) return;
+    const currentPath = this.elements.projectPath.value.trim();
+    const selected = await this.pickProjectFolder(
+      currentPath || this.projectFolderDefaultPath,
+      true,
+    );
+    if (!selected) return;
+    this.elements.projectPath.value = selected;
+    if (!this.elements.projectName.value.trim()) {
+      this.elements.projectName.value = suggestWorkspaceProjectName(selected);
+    }
+    this.elements.projectFormError.textContent = "";
+  }
+
+  private async pickProjectFolder(
+    defaultPath: string | null,
+    reportToProjectForm: boolean,
+  ): Promise<string | null> {
+    if (this.projectFolderPickerPending || !this.canMutate()) return null;
     this.projectFolderPickerPending = true;
     this.elements.selectProjectFolderButton.disabled = true;
+    this.elements.createProjectButton.disabled = true;
+    this.elements.useExistingProjectFolderButton.disabled = true;
+    this.elements.startProjectFromScratchButton.disabled = true;
     try {
-      const currentPath = this.elements.projectPath.value.trim();
       const selected = await open({
         directory: true,
         multiple: false,
         title: tr("Select project folder", "프로젝트 폴더 선택"),
-        defaultPath: currentPath || this.projectFolderDefaultPath || undefined,
+        defaultPath: defaultPath || undefined,
       });
-      if (typeof selected !== "string") return;
-      this.elements.projectPath.value = selected;
-      if (!this.elements.projectName.value.trim()) {
-        this.elements.projectName.value = suggestWorkspaceProjectName(selected);
-      }
-      this.elements.projectFormError.textContent = "";
+      return typeof selected === "string" ? selected : null;
     } catch (error) {
-      this.elements.projectFormError.textContent = tr(
+      const message = tr(
         `Could not open the folder picker. ${errorMessage(error)}`,
         `폴더 선택기를 열지 못했습니다. ${errorMessage(error)}`,
       );
+      if (reportToProjectForm) this.elements.projectFormError.textContent = message;
+      else this.runtime.setFooterStatus(message, "error");
+      return null;
     } finally {
       this.projectFolderPickerPending = false;
-      this.elements.selectProjectFolderButton.disabled = !this.mutationsEnabled();
+      const enabled = this.mutationsEnabled();
+      this.elements.selectProjectFolderButton.disabled =
+        !enabled || this.projectDialogMode === "scratch";
+      this.elements.createProjectButton.disabled = !enabled;
+      this.elements.useExistingProjectFolderButton.disabled = !enabled;
+      this.elements.startProjectFromScratchButton.disabled = !enabled;
     }
   }
 
   private async createProject(): Promise<void> {
     const state = this.currentState();
-    if (!state || !this.canMutate()) return;
+    if (!state || !this.canMutate() || this.elements.submitProjectButton.disabled) return;
     this.elements.projectFormError.textContent = "";
-    let draft;
+    this.projectCreationPending = true;
+    this.elements.cancelProjectButton.disabled = true;
+    this.elements.submitProjectButton.disabled = true;
     try {
-      draft = validateWorkspaceProjectDraft(
-        this.elements.projectName.value,
-        this.elements.projectPath.value,
+      const requestedName = validateWorkspaceProjectName(this.elements.projectName.value);
+      if (this.projectDialogMode === "scratch") {
+        const saved = await this.enqueueOperation(async () => {
+          const current = this.currentState();
+          if (!current) {
+            throw new Error(
+              tr("Could not load the workspace state.", "작업 공간 상태를 불러오지 못했습니다."),
+            );
+          }
+          const projectName = uniqueWorkspaceProjectName(current.projects, requestedName);
+          let cachedDirectory = this.scratchProjectDirectory;
+          if (cachedDirectory && cachedDirectory.projectName !== projectName) {
+            if (!(await this.rollbackScratchProjectDirectory())) {
+              throw new Error(
+                tr(
+                  `The previously created "${cachedDirectory.projectName}" folder is not empty. It was left unchanged.`,
+                  `앞서 만든 "${cachedDirectory.projectName}" 폴더가 비어 있지 않아 그대로 유지했습니다.`,
+                ),
+              );
+            }
+            cachedDirectory = null;
+          }
+          const folderPath = cachedDirectory?.folderPath ??
+            await invoke<string>("create_documents_project_directory", { projectName });
+          this.scratchProjectDirectory = { projectName, folderPath };
+          const draft = validateWorkspaceProjectDraft(projectName, folderPath);
+          this.elements.projectPath.value = draft.folderPath;
+          const project = createWorkspaceProject(
+            this.idFactory(),
+            draft.name,
+            draft.folderPath,
+            new Date().toISOString(),
+          );
+          const withProject = appendWorkspaceProject(current, project);
+          const next = openProjectWorkspaceTab(withProject, project.id, this.idFactory());
+          return this.persistNow(
+            next,
+            tr("Could not save the project", "프로젝트를 저장하지 못했습니다"),
+          );
+        });
+        if (saved) {
+          this.elements.projectDialog.close();
+          this.renderAndActivate();
+        } else {
+          const rolledBack = await this.rollbackScratchProjectDirectory();
+          this.elements.projectFormError.textContent = rolledBack
+            ? tr(
+                "The project could not be saved. The empty folder was removed; try again.",
+                "프로젝트를 저장하지 못해 빈 폴더를 되돌렸습니다. 다시 시도하세요.",
+              )
+            : tr(
+                "The folder was created, but the project could not be saved. Try again.",
+                "폴더는 만들었지만 프로젝트를 저장하지 못했습니다. 다시 시도하세요.",
+              );
+        }
+        return;
+      }
+
+      const projectName = uniqueWorkspaceProjectName(state.projects, requestedName);
+      const draft = validateWorkspaceProjectDraft(projectName, this.elements.projectPath.value);
+      this.elements.projectPath.value = draft.folderPath;
+      const existing = findWorkspaceProjectByFolder(state.projects, draft.folderPath);
+      if (existing) {
+        this.elements.projectDialog.close();
+        await this.openProject(existing.id);
+        return;
+      }
+      const project = createWorkspaceProject(
+        this.idFactory(),
+        draft.name,
+        draft.folderPath,
+        new Date().toISOString(),
       );
+      const withProject = appendWorkspaceProject(state, project);
+      const next = openProjectWorkspaceTab(withProject, project.id, this.idFactory());
+      const saved = await this.persist(
+        next,
+        tr("Could not save the project", "프로젝트를 저장하지 못했습니다"),
+      );
+      if (saved) {
+        this.elements.projectDialog.close();
+        this.renderAndActivate();
+      }
     } catch (error) {
-      this.elements.projectFormError.textContent = errorMessage(error);
-      return;
+      const message = errorMessage(error);
+      const rolledBack = await this.rollbackScratchProjectDirectory();
+      this.elements.projectFormError.textContent = rolledBack
+        ? message
+        : tr(
+            `${message} The created folder is not empty, so it was left unchanged.`,
+            `${message} 생성된 폴더가 비어 있지 않아 그대로 유지했습니다.`,
+          );
+    } finally {
+      this.projectCreationPending = false;
+      this.elements.cancelProjectButton.disabled = false;
+      if (this.elements.projectDialog.open) this.elements.submitProjectButton.disabled = false;
     }
-    const existing = findWorkspaceProjectByFolder(state.projects, draft.folderPath);
-    if (existing) {
-      this.elements.projectDialog.close();
-      await this.openProject(existing.id);
-      return;
+  }
+
+  private async rollbackScratchProjectDirectory(): Promise<boolean> {
+    const created = this.scratchProjectDirectory;
+    if (!created) return true;
+    try {
+      await invoke<void>("remove_empty_documents_project_directory", {
+        projectName: created.projectName,
+      });
+      this.scratchProjectDirectory = null;
+      return true;
+    } catch {
+      return false;
     }
-    const project = createWorkspaceProject(
-      this.idFactory(),
-      uniqueWorkspaceProjectName(state.projects, draft.name),
-      draft.folderPath,
-      new Date().toISOString(),
-    );
-    const withProject = appendWorkspaceProject(state, project);
-    const next = openProjectWorkspaceTab(withProject, project.id, this.idFactory());
-    if (await this.persist(next, tr("Could not save the project", "프로젝트를 저장하지 못했습니다"))) {
-      this.elements.projectDialog.close();
-      this.renderAndActivate();
-    }
+  }
+
+  activeProjectFolderPath(): string | null {
+    const state = this.currentState();
+    if (!state) return null;
+    const tab = state.tabs.find((item) => item.id === state.activeTabId);
+    if (tab?.kind !== "project" || !tab.projectId) return null;
+    return state.projects.find((project) => project.id === tab.projectId)?.folderPath ?? null;
   }
 
   async addTerminal(
@@ -1393,7 +2225,15 @@ export class Phase4WorkspaceController {
     const enabled = this.mutationsEnabled();
     this.elements.addTabButton.disabled = !enabled;
     this.elements.createProjectButton.disabled = !enabled;
-    this.elements.selectProjectFolderButton.disabled = !enabled || this.projectFolderPickerPending;
+    this.elements.useExistingProjectFolderButton.disabled = !enabled;
+    this.elements.startProjectFromScratchButton.disabled = !enabled;
+    this.elements.selectProjectFolderButton.disabled =
+      !enabled || this.projectFolderPickerPending || this.projectDialogMode === "scratch";
+    if (!enabled) {
+      this.setProjectCreateMenuOpen(false);
+      this.closeProjectItemMenus();
+      this.finishTabPointerReorder();
+    }
     this.runtime.setCatalogWritable(enabled);
     this.elements.commitUpgradeButton.disabled =
       this.mutationPending ||

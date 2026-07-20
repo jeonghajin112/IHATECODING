@@ -2,6 +2,7 @@ import { normalizeWorkspaceState } from "./phase3b-core";
 import { formatAppNumber, tr } from "./i18n";
 
 export type AgentProvider = "codex" | "grok";
+export type DroppedFileProvider = AgentProvider | "claude" | "opencode";
 
 export type RectangleBounds = {
   left: number;
@@ -184,6 +185,33 @@ export function scanTerminalLaunchControl(tail: string, data: string) {
     detected: TERMINAL_LAUNCH_CONTROL_PATTERN.test(combined),
     tail: combined.slice(-TERMINAL_LAUNCH_ESCAPE_TAIL_LENGTH),
   };
+}
+
+/**
+ * Codex renders safety buffering as a modal inside its alternate-screen TUI.
+ * Call this with xterm's current visible-screen text, not raw PTY bytes: raw
+ * output contains cursor rewrites and old scrollback can retain a dismissed
+ * modal long after it is no longer actionable.
+ */
+export function isCodexSafetyBufferingScreen(screenText: string) {
+  const text = screenText.replace(/\s+/g, " ").trim().toLowerCase();
+  if (!text) return false;
+
+  const retry = text.includes("retry with a faster model");
+  const keepWaiting =
+    text.includes("keep waiting") || text.includes("dismiss and keep waiting");
+  const currentPrompt = text.includes(
+    "our systems are thinking a bit more about this request before responding.",
+  );
+  const legacyHeader = text.includes("additional safety checks");
+  const legacyPrompt = text.includes(
+    "this request requires additional safety checks, which can take extra time.",
+  );
+
+  return (
+    (currentPrompt && (retry || keepWaiting)) ||
+    (legacyHeader && legacyPrompt && (retry || keepWaiting))
+  );
 }
 
 export type TerminalDirectPaintState = {
@@ -822,17 +850,24 @@ export function isLikelyImageFilePath(path: string): boolean {
 
 /**
  * Codex turns a pasted image path into a real image attachment. Other agent
- * files use their @-file reference syntax; a plain shell receives only an
- * inert quoted path. Windows file names cannot contain a double quote.
+ * files use their @-file reference syntax; a plain PowerShell receives a
+ * single-quoted literal so `$()`, variables, and backticks never interpolate.
  */
 export function formatDroppedFileReference(
-  provider: AgentProvider | null | undefined,
+  provider: DroppedFileProvider | null | undefined,
   path: string,
 ): string {
   const quotedPath = `"${path}"`;
   if (provider === "codex" && isLikelyImageFilePath(path)) return quotedPath;
-  if (provider === "codex" || provider === "grok") return `@${quotedPath}`;
-  return quotedPath;
+  if (
+    provider === "codex" ||
+    provider === "grok" ||
+    provider === "claude" ||
+    provider === "opencode"
+  ) {
+    return `@${quotedPath}`;
+  }
+  return `'${path.replace(/'/g, "''")}'`;
 }
 
 export type TerminalShortcutEvent = Readonly<{

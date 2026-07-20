@@ -15,6 +15,7 @@ export const DEFAULT_MIN_PANE_WIDTH_PX = 160;
 export const DEFAULT_INSERTION_HYSTERESIS_PX = 14;
 export const DEFAULT_SNAP_DISTANCE_PX = 8;
 export const PROJECT_BROWSER_PANES_EXTENSION = "browserPanesV1";
+export const PROJECT_PANE_ORDER_EXTENSION = "paneOrderV1";
 export const TERMINAL_LAUNCH_PROFILE_EXTENSION = "launchProfileV1";
 export const LOCAL_BROWSER_RETRY_WINDOW_MS = 5 * 60 * 1_000;
 
@@ -383,6 +384,35 @@ export function moveWorkspaceTabByKeyboard(
   return next;
 }
 
+/**
+ * Move a tab directly before another tab, or append it when the target is null.
+ * This mirrors pointer drag/drop semantics without changing tab identity,
+ * activation, project selection, or any opaque persisted fields.
+ */
+export function moveWorkspaceTabBefore(
+  state: WorkspaceState,
+  tabId: string,
+  beforeTabId: string | null,
+): WorkspaceState {
+  const next = editableClone(state);
+  const sourceIndex = next.tabs.findIndex((tab) => tab.id === tabId);
+  if (sourceIndex < 0) throw new Error("The requested workspace tab does not exist.");
+
+  if (beforeTabId === tabId) return next;
+  if (beforeTabId !== null && !next.tabs.some((tab) => tab.id === beforeTabId)) {
+    throw new Error("The requested target workspace tab does not exist.");
+  }
+
+  const [tab] = next.tabs.splice(sourceIndex, 1);
+  if (beforeTabId === null) {
+    next.tabs.push(tab);
+  } else {
+    const targetIndex = next.tabs.findIndex((item) => item.id === beforeTabId);
+    next.tabs.splice(targetIndex, 0, tab);
+  }
+  return next;
+}
+
 export function describeWorkspaceTabsForAccessibility(
   state: WorkspaceState,
 ): WorkspaceTabAccessibility[] {
@@ -404,10 +434,14 @@ export function appendProjectPane(
 ): WorkspaceState {
   const next = editableClone(state);
   const project = requireProject(next, projectId);
-  if (project.terminals.some((item) => item.id === pane.id)) {
+  if (
+    project.terminals.some((item) => item.id === pane.id) ||
+    projectBrowserPanes(project).some((item) => item.id === pane.id)
+  ) {
     throw new Error("The pane identifier is already in use.");
   }
   project.terminals.push(pane);
+  repairPersistedPaneOrder(project);
   project.lastModifiedAtUtc = modifiedAtUtc;
   return normalizeWorkspaceState(next);
 }
@@ -423,7 +457,7 @@ export function projectBrowserPanes(
   const source = project.legacyExtensions[PROJECT_BROWSER_PANES_EXTENSION];
   if (!Array.isArray(source)) return [];
   const panes: WorkspaceBrowserPane[] = [];
-  const ids = new Set<string>();
+  const ids = new Set(project.terminals.map((terminal) => terminal.id));
   for (const entry of source) {
     if (!isRecord(entry)) continue;
     try {
@@ -473,6 +507,7 @@ export function appendProjectBrowserPane(
   }
   browsers.push({ ...structuredClone(pane), ...normalized });
   project.legacyExtensions[PROJECT_BROWSER_PANES_EXTENSION] = browsers;
+  repairPersistedPaneOrder(project);
   project.lastModifiedAtUtc = modifiedAtUtc;
   return normalizeWorkspaceState(next);
 }
@@ -490,6 +525,7 @@ export function removeProjectBrowserPane(
   if (index < 0) throw new Error("The requested browser pane does not exist.");
   browsers.splice(index, 1);
   project.legacyExtensions[PROJECT_BROWSER_PANES_EXTENSION] = browsers;
+  repairPersistedPaneOrder(project);
   project.lastModifiedAtUtc = modifiedAtUtc;
   return normalizeWorkspaceState(next);
 }
@@ -518,6 +554,57 @@ export function setProjectBrowserPaneUrl(
   }, modifiedAtUtc);
 }
 
+/**
+ * Resolve the UI-owned mixed pane sequence without letting stale extension
+ * data hide a real pane. Persisted valid IDs retain their relative order;
+ * panes added since the last save are appended in canonical storage order.
+ */
+export function projectPaneOrder(project: WorkspaceProject): string[] {
+  const canonical = canonicalProjectPaneIds(project);
+  const available = new Set(canonical);
+  const ordered: string[] = [];
+  const seen = new Set<string>();
+  const source = project.legacyExtensions[PROJECT_PANE_ORDER_EXTENSION];
+  if (Array.isArray(source)) {
+    for (const entry of source) {
+      if (typeof entry !== "string" || !available.has(entry) || seen.has(entry)) continue;
+      seen.add(entry);
+      ordered.push(entry);
+    }
+  }
+  for (const paneId of canonical) {
+    if (seen.has(paneId)) continue;
+    seen.add(paneId);
+    ordered.push(paneId);
+  }
+  return ordered;
+}
+
+export function setProjectPaneOrder(
+  state: WorkspaceState,
+  projectId: string,
+  orderedPaneIds: readonly string[],
+  modifiedAtUtc = new Date().toISOString(),
+): WorkspaceState {
+  const next = editableClone(state);
+  const project = requireProject(next, projectId);
+  const canonical = canonicalProjectPaneIds(project);
+  const available = new Set(canonical);
+  const seen = new Set<string>();
+  if (!Array.isArray(orderedPaneIds) || orderedPaneIds.length !== canonical.length) {
+    throw new Error("A pane order must contain every current pane exactly once.");
+  }
+  for (const paneId of orderedPaneIds) {
+    if (typeof paneId !== "string" || !available.has(paneId) || seen.has(paneId)) {
+      throw new Error("A pane order must contain every current pane exactly once.");
+    }
+    seen.add(paneId);
+  }
+  project.legacyExtensions[PROJECT_PANE_ORDER_EXTENSION] = [...orderedPaneIds];
+  project.lastModifiedAtUtc = modifiedAtUtc;
+  return normalizeWorkspaceState(next);
+}
+
 /** Append a canonical project without creating hidden runtime state. */
 export function appendWorkspaceProject(
   state: WorkspaceState,
@@ -534,6 +621,74 @@ export function appendWorkspaceProject(
     throw new Error("The project folder is already registered.");
   }
   next.projects.push(project);
+  return normalizeWorkspaceState(next);
+}
+
+/** Rename one project and every project tab that presents its canonical name. */
+export function renameWorkspaceProject(
+  state: WorkspaceState,
+  projectId: string,
+  name: string,
+  modifiedAtUtc = new Date().toISOString(),
+): WorkspaceState {
+  const next = editableClone(state);
+  const project = requireProject(next, projectId);
+  const normalized = validateWorkspaceProjectDraft(name, project.folderPath).name;
+  project.name = normalized;
+  project.lastModifiedAtUtc = modifiedAtUtc;
+  for (const tab of next.tabs) {
+    if (tab.kind === "project" && tab.projectId === projectId) tab.title = normalized;
+  }
+  return normalizeWorkspaceState(next);
+}
+
+/**
+ * Remove a project from the workspace catalog without touching its folder.
+ * Every tab referencing the project is removed atomically. If that leaves no
+ * tab, create one explicit blank replacement so the workspace remains valid.
+ */
+export function removeWorkspaceProject(
+  state: WorkspaceState,
+  projectId: string,
+  replacementTabId: string,
+): WorkspaceState {
+  const next = editableClone(state);
+  const projectIndex = next.projects.findIndex((project) => project.id === projectId);
+  if (projectIndex < 0) throw new Error("The requested workspace project does not exist.");
+
+  const activeIndex = next.tabs.findIndex((tab) => tab.id === next.activeTabId);
+  const activeRemoved = next.tabs.some(
+    (tab) => tab.id === next.activeTabId && tab.projectId === projectId,
+  );
+  const fallbackActiveTabId =
+    activeIndex >= 0
+      ? (next.tabs.slice(activeIndex + 1).find((tab) => tab.projectId !== projectId)?.id ??
+        next.tabs
+          .slice(0, activeIndex)
+          .reverse()
+          .find((tab) => tab.projectId !== projectId)?.id)
+      : next.tabs.find((tab) => tab.projectId !== projectId)?.id;
+  next.projects.splice(projectIndex, 1);
+  next.tabs = next.tabs.filter((tab) => tab.projectId !== projectId);
+
+  if (next.tabs.length === 0) {
+    assertNewTabId(next, replacementTabId);
+    next.tabs.push({
+      id: replacementTabId,
+      kind: "empty",
+      title: tr("New tab", "새 탭"),
+      projectId: null,
+      browser: null,
+      output: null,
+      extensions: {},
+    });
+    next.activeTabId = replacementTabId;
+  } else if (activeRemoved || !next.tabs.some((tab) => tab.id === next.activeTabId)) {
+    next.activeTabId = fallbackActiveTabId ?? next.tabs[0].id;
+  }
+
+  const active = next.tabs.find((tab) => tab.id === next.activeTabId) ?? null;
+  next.selectedProjectId = active?.kind === "project" ? active.projectId : null;
   return normalizeWorkspaceState(next);
 }
 
@@ -560,6 +715,7 @@ export function removeProjectPane(
   const index = project.terminals.findIndex((pane) => pane.id === paneId);
   if (index < 0) throw new Error("The requested pane does not exist.");
   project.terminals.splice(index, 1);
+  repairPersistedPaneOrder(project);
   project.lastModifiedAtUtc = modifiedAtUtc;
   return normalizeWorkspaceState(next);
 }
@@ -708,14 +864,8 @@ export function validateWorkspaceProjectDraft(
   name: string,
   folderPath: string,
 ): WorkspaceProjectDraft {
-  const normalizedName = name.trim();
+  const normalizedName = validateWorkspaceProjectName(name);
   const normalizedFolder = normalizeWindowsFolder(folderPath);
-  if (!normalizedName) throw new Error(tr("Enter a project name.", "프로젝트 이름을 입력하세요."));
-  if (normalizedName.length > 50) {
-    throw new Error(
-      tr("Project names must be 50 characters or fewer.", "프로젝트 이름은 50자 이하여야 합니다."),
-    );
-  }
   if (!isAbsoluteWindowsPath(normalizedFolder)) {
     throw new Error(
       tr(
@@ -725,6 +875,17 @@ export function validateWorkspaceProjectDraft(
     );
   }
   return { name: normalizedName, folderPath: normalizedFolder };
+}
+
+export function validateWorkspaceProjectName(name: string): string {
+  const normalizedName = name.trim();
+  if (!normalizedName) throw new Error(tr("Enter a project name.", "프로젝트 이름을 입력하세요."));
+  if (normalizedName.length > 50) {
+    throw new Error(
+      tr("Project names must be 50 characters or fewer.", "프로젝트 이름은 50자 이하여야 합니다."),
+    );
+  }
+  return normalizedName;
 }
 
 /** Match the legacy dialog: suggest the selected folder's final path segment. */
@@ -1113,6 +1274,19 @@ function updateProjectBrowserPane(
   project.legacyExtensions[PROJECT_BROWSER_PANES_EXTENSION] = browsers;
   project.lastModifiedAtUtc = modifiedAtUtc;
   return normalizeWorkspaceState(next);
+}
+
+function canonicalProjectPaneIds(project: WorkspaceProject): string[] {
+  return [
+    ...project.terminals.map((terminal) => terminal.id),
+    ...projectBrowserPanes(project).map((pane) => pane.id),
+  ];
+}
+
+/** Keep an already-persisted mixed order valid across pane lifecycle changes. */
+function repairPersistedPaneOrder(project: WorkspaceProject): void {
+  if (!Array.isArray(project.legacyExtensions[PROJECT_PANE_ORDER_EXTENSION])) return;
+  project.legacyExtensions[PROJECT_PANE_ORDER_EXTENSION] = projectPaneOrder(project);
 }
 
 function normalizeBrowserPaneTitle(value: string): string {

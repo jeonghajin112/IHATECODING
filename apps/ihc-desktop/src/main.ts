@@ -35,9 +35,9 @@ import {
   isLoopbackBrowserUrl,
   localBrowserRetryDelayMs,
   projectBrowserPanes,
+  projectPaneOrder,
   workspaceTerminalLaunchProfile,
   type PaneGeometry,
-  type PaneInsertionTarget,
   type WorkspaceBrowserPane,
   type WorkspaceTerminalLaunchProfile,
 } from "./phase4-core";
@@ -51,6 +51,7 @@ import {
   isTerminalCopyShortcut,
   isTerminalCtrlInsertShortcut,
   isTerminalModifierOnlyInput,
+  isCodexSafetyBufferingScreen,
   millisecondsUntilNextProviderUsageReset,
   normalizeProviderAccountListResponse,
   normalizeProviderUsageResponse,
@@ -69,6 +70,7 @@ import {
   TerminalLaunchPaintWatchdog,
   TerminalSelectionCopyGuard,
   type AgentProvider,
+  type DroppedFileProvider,
   type ProviderAccountListResponse,
   type ProviderLimitUsage,
   type ProviderUsageResponse,
@@ -99,7 +101,6 @@ import {
   FOOTER_PROVIDER_IDS,
   getFooterProviderSettings,
   isFooterProviderVisible,
-  isFooterProviderId,
   reorderFooterProvider,
   setFooterProviderVisible,
   subscribeFooterProviderSettings,
@@ -111,6 +112,11 @@ import {
   getUseEmbeddedBrowserTools,
   setUseEmbeddedBrowserTools,
 } from "./agent-browser-settings";
+import {
+  crossedPointerReorderThreshold,
+  horizontalReorderTarget,
+} from "./pointer-reorder";
+import { MediaDrawer } from "./media-drawer";
 
 initializeAppLanguage();
 
@@ -128,6 +134,7 @@ type PaneState =
   | "error";
 
 type StatusTone = "normal" | "error";
+
 type AgentTurnState = "unknown" | "working" | "idle";
 
 type OutputBatch = Extract<TerminalEvent, { event: "output" }>["data"];
@@ -154,6 +161,7 @@ type CursorClickSnapshot = {
 };
 
 type EditableTerminalAnchor = {
+  bufferType: "normal" | "alternate";
   absoluteRow: number;
   column: number;
   linePrefix: string;
@@ -195,6 +203,7 @@ type PhoneNotificationSettings = {
   webhookConfigured: boolean;
   notifyOnSuccess: boolean;
   notifyOnError: boolean;
+  notifyOnSafetyCheck: boolean;
 };
 
 type PhoneNotificationLabels = {
@@ -208,9 +217,10 @@ type PhoneNotificationSettingsUpdate = {
   clearWebhook: boolean;
   notifyOnSuccess: boolean;
   notifyOnError: boolean;
+  notifyOnSafetyCheck: boolean;
 };
 
-type PhoneNotificationKind = "success" | "error" | "test";
+type PhoneNotificationKind = "success" | "error" | "safetyCheck" | "test";
 
 type PhoneNotificationResult = {
   sent: boolean;
@@ -301,6 +311,7 @@ const OUTPUT_RENDER_MAX_BYTES = 64 * 1024;
 const FOREGROUND_OUTPUT_BURST_IDLE_MS = 48;
 const FOREGROUND_FORCED_REFRESH_INTERVAL_MS = 120;
 const COMPLETION_OUTPUT_QUIET_MS = 1_000;
+const SAFETY_BUFFERING_DISMISS_STABILITY_MS = 750;
 const EXIT_GAP_TIMEOUT_MS = 2_000;
 const UNBOUND_OUTPUT_MAX_BATCHES = 64;
 const UNBOUND_OUTPUT_MAX_BYTES = 1_048_576;
@@ -360,6 +371,7 @@ class TerminalPane {
   private readonly titleElement: HTMLElement;
   private readonly titleEditor: HTMLInputElement;
   private readonly stateLabel: HTMLElement;
+  private readonly safetyCheckLabel: HTMLElement;
   private readonly contextLabel: HTMLElement;
   private readonly copyButton: HTMLButtonElement;
   private readonly maximizeButton: HTMLButtonElement;
@@ -451,6 +463,10 @@ class TerminalPane {
   private pendingAgentCompletionRoutes: PendingAgentCompletionRoute[] = [];
   private lastRenderedOutputAt = performance.now();
   private readonly observedCompletionKeys = new Set<string>();
+  private safetyBufferingScreenVisible = false;
+  private safetyCheckPending = false;
+  private safetyBufferingDismissTimer = 0;
+  private lastSafetyCheckNotificationId: string | null = null;
 
   private readonly onWindowMouseUp = (event: MouseEvent) => {
     if (event.button !== 0 || !this.selectionGestureActive) return;
@@ -564,6 +580,7 @@ class TerminalPane {
     this.element.dataset.state = this.paneState;
     this.element.dataset.active = "false";
     this.element.dataset.completionPending = String(this.completionPending);
+    this.element.dataset.safetyCheckPending = "false";
     this.element.setAttribute("aria-label", this.title);
 
     const header = document.createElement("header");
@@ -587,6 +604,10 @@ class TerminalPane {
     this.stateLabel = document.createElement("span");
     this.stateLabel.className = "terminal-state-label";
     this.stateLabel.textContent = this.statusMessage;
+    this.safetyCheckLabel = document.createElement("span");
+    this.safetyCheckLabel.className = "terminal-safety-check";
+    this.safetyCheckLabel.textContent = tr("Safety check · waiting", "안전 검사 중 · 응답 대기");
+    this.safetyCheckLabel.hidden = true;
     this.contextLabel = document.createElement("span");
     this.contextLabel.className = "terminal-context";
     this.contextLabel.hidden = true;
@@ -594,6 +615,7 @@ class TerminalPane {
       this.titleElement,
       this.titleEditor,
       this.stateLabel,
+      this.safetyCheckLabel,
       this.contextLabel,
     );
 
@@ -806,6 +828,7 @@ class TerminalPane {
     this.element.addEventListener("pointerdown", () => {
       this.workspace.activatePane(this.id, false);
       this.workspace.acknowledgePaneCompletion(this.id);
+      this.acknowledgeSafetyCheck();
     });
     header.addEventListener("pointerdown", (event) => {
       this.workspace.beginPaneDrag(event, this.id, header);
@@ -872,6 +895,10 @@ class TerminalPane {
       this.agentLastTurnStartIdentity = null;
       this.agentInputBaselineTurnStartIdentity = null;
       this.agentInputObservedAtUnixMs = null;
+      window.clearTimeout(this.safetyBufferingDismissTimer);
+      this.safetyBufferingDismissTimer = 0;
+      this.safetyBufferingScreenVisible = false;
+      this.setSafetyCheckPending(false);
     }
     this.agentProvider = provider;
     this.agentConversationId = normalizedConversationId;
@@ -881,6 +908,7 @@ class TerminalPane {
     this.agentDiscoveryTimer = 0;
     window.clearTimeout(this.resumeHealthTimer);
     this.resumeHealthTimer = 0;
+    queueMicrotask(() => this.observeCodexSafetyBufferingScreen());
   }
 
   setAgentTurnWorking(
@@ -908,6 +936,14 @@ class TerminalPane {
     }
     this.agentTurnState = working ? "working" : "idle";
     this.agentIdleSinceUnixMs = working ? null : Date.now();
+    if (working) {
+      queueMicrotask(() => this.observeCodexSafetyBufferingScreen());
+    } else {
+      window.clearTimeout(this.safetyBufferingDismissTimer);
+      this.safetyBufferingDismissTimer = 0;
+      this.safetyBufferingScreenVisible = false;
+      this.setSafetyCheckPending(false);
+    }
   }
 
   inactiveAgentSleepCandidate(
@@ -1011,6 +1047,10 @@ class TerminalPane {
 
   private async start() {
     const epoch = ++this.lifecycleEpoch;
+    window.clearTimeout(this.safetyBufferingDismissTimer);
+    this.safetyBufferingDismissTimer = 0;
+    this.safetyBufferingScreenVisible = false;
+    this.setSafetyCheckPending(false);
     this.editableAnchor = null;
     this.editableShortcutReleasePending = null;
     this.setState("queued", tr("Waiting to start", "시작 대기 중"));
@@ -1184,6 +1224,29 @@ class TerminalPane {
     }
   }
 
+  private setSafetyCheckPending(pending: boolean) {
+    this.safetyCheckPending = pending;
+    this.element.dataset.safetyCheckPending = String(pending);
+    this.safetyCheckLabel.hidden = !pending;
+    if (pending) {
+      this.safetyCheckLabel.textContent = tr(
+        "Safety check · waiting",
+        "안전 검사 중 · 응답 대기",
+      );
+      this.safetyCheckLabel.title = tr(
+        "Codex is performing additional safety checks.",
+        "Codex가 추가 안전 검사를 진행하고 있습니다.",
+      );
+    } else {
+      this.safetyCheckLabel.removeAttribute("title");
+    }
+  }
+
+  private acknowledgeSafetyCheck() {
+    if (!this.safetyCheckPending) return;
+    this.setSafetyCheckPending(false);
+  }
+
   beginCompletionAcknowledgement() {
     if (!this.completionPending || this.completionAckPending) return false;
     this.completionAckPending = true;
@@ -1318,6 +1381,8 @@ class TerminalPane {
     window.clearTimeout(this.completionBarrierTimer);
     window.clearTimeout(this.agentDiscoveryTimer);
     window.clearTimeout(this.resumeHealthTimer);
+    window.clearTimeout(this.safetyBufferingDismissTimer);
+    this.safetyBufferingDismissTimer = 0;
     this.resizeObserver.disconnect();
     window.removeEventListener("mouseup", this.onWindowMouseUp, true);
     window.removeEventListener("keydown", this.onWindowTerminalKeyDown, true);
@@ -1371,6 +1436,10 @@ class TerminalPane {
       if (this.consumeSelectionCopyShortcut(event)) return false;
       if (this.consumeManualTerminalInterruptShortcut(event)) return false;
       if (event.isComposing || event.keyCode === 229) return true;
+      // The window capture listener normally owns editable selections. Keep a
+      // terminal-local fallback as WebView2 can retarget the hidden textarea
+      // after a pointer selection and skip that ownership path.
+      if (this.consumeEditableTerminalShortcut(event)) return false;
       this.noteEditableKeyboardEvent(event);
 
       const key = String(event.key || "").toLowerCase();
@@ -1881,21 +1950,32 @@ class TerminalPane {
     if (
       this.disposed ||
       this.paneState !== "running" ||
-      buffer.type !== "normal" ||
-      !this.isAtBottom() ||
-      this.terminal.modes.mouseTrackingMode !== "none" ||
+      (buffer.type === "normal" && !this.isAtBottom()) ||
       !this.terminal.modes.showCursor
     ) {
       return;
     }
     const absoluteRow = buffer.baseY + buffer.cursorY;
-    if (this.editableAnchor?.absoluteRow === absoluteRow) return;
     const line = buffer.getLine(absoluteRow);
     if (!line || line.isWrapped) {
       this.editableAnchor = null;
       return;
     }
+
+    const anchor = this.editableAnchor;
+    if (
+      anchor?.bufferType === buffer.type &&
+      buffer.cursorX >= anchor.column &&
+      line.translateToString(false, 0, anchor.column) === anchor.linePrefix
+    ) {
+      // Full-screen CLIs repaint their composer on a different absolute row as
+      // output grows. Preserve the original input start instead of resetting it
+      // to the current cursor (which used to make Ctrl+A select nothing).
+      anchor.absoluteRow = absoluteRow;
+      return;
+    }
     this.editableAnchor = {
+      bufferType: buffer.type,
       absoluteRow,
       column: buffer.cursorX,
       linePrefix: line.translateToString(false, 0, buffer.cursorX),
@@ -1909,9 +1989,8 @@ class TerminalPane {
       !anchor ||
       this.disposed ||
       this.paneState !== "running" ||
-      buffer.type !== "normal" ||
-      !this.isAtBottom() ||
-      this.terminal.modes.mouseTrackingMode !== "none" ||
+      anchor.bufferType !== buffer.type ||
+      (buffer.type === "normal" && !this.isAtBottom()) ||
       !this.terminal.modes.showCursor
     ) {
       return null;
@@ -1920,7 +1999,6 @@ class TerminalPane {
     const row = buffer.baseY + buffer.cursorY;
     const line = buffer.getLine(row);
     if (
-      row !== anchor.absoluteRow ||
       buffer.cursorX < anchor.column ||
       !line ||
       line.isWrapped ||
@@ -1929,6 +2007,7 @@ class TerminalPane {
       this.editableAnchor = null;
       return null;
     }
+    if (row !== anchor.absoluteRow) anchor.absoluteRow = row;
 
     let lineEndColumn = buffer.cursorX;
     for (let column = anchor.column; column < this.terminal.cols; column += 1) {
@@ -1947,12 +2026,45 @@ class TerminalPane {
     };
   }
 
+  private selectedCursorRowTerminalLine(
+    selection: ReturnType<Terminal["getSelectionPosition"]>,
+  ): EditableTerminalLineSnapshot | null {
+    const buffer = this.terminal.buffer.active;
+    const row = buffer.baseY + buffer.cursorY;
+    if (
+      !selection ||
+      this.disposed ||
+      this.paneState !== "running" ||
+      (buffer.type === "normal" && !this.isAtBottom()) ||
+      !this.terminal.modes.showCursor ||
+      selection.start.y !== row ||
+      selection.end.y !== row ||
+      selection.start.x < 0 ||
+      selection.start.x >= selection.end.x ||
+      selection.end.x > this.terminal.cols
+    ) {
+      return null;
+    }
+    const line = buffer.getLine(row);
+    if (!line) return null;
+
+    // A deliberate xterm selection on the live cursor row is sufficient to
+    // edit even when a full-screen TUI repainted away the prompt fingerprint.
+    // The selected start becomes the lower editing bound, so output on other
+    // rows and cross-row selections still cannot produce PTY input.
+    return {
+      row,
+      anchorColumn: selection.start.x,
+      cursorColumn: buffer.cursorX,
+      lineEndColumn: Math.max(buffer.cursorX, selection.end.x),
+      line,
+    };
+  }
+
   private consumeEditableTerminalShortcut(event: KeyboardEvent) {
     if (
       event.isComposing ||
-      event.keyCode === 229 ||
-      this.terminal.textarea !== document.activeElement ||
-      !event.composedPath().includes(this.viewport)
+      event.keyCode === 229
     ) {
       return false;
     }
@@ -1987,17 +2099,9 @@ class TerminalPane {
       return consume("backspace");
     }
 
-    const editableLine = this.currentEditableTerminalLine();
-    if (!editableLine) return false;
-
     if (selectAll) {
-      const existingSelection = this.terminal.getSelectionPosition();
-      if (
-        this.terminal.hasSelection() &&
-        !planEditableTerminalSelectionDelete(editableLine, existingSelection)
-      ) {
-        return false;
-      }
+      const editableLine = this.currentEditableTerminalLine();
+      if (!editableLine) return false;
       const range = planEditableTerminalSelectAll(editableLine);
       if (!range) return false;
       consume("a");
@@ -2011,17 +2115,26 @@ class TerminalPane {
       return true;
     }
 
+    // A visible xterm selection must never fall through as a normal Backspace:
+    // doing so erases one unrelated character at the live cursor. Invalid or
+    // output selections stay selected and send no PTY input.
+    if (!this.terminal.hasSelection()) return false;
+    const selection = this.terminal.getSelectionPosition();
+    const editableLine =
+      this.currentEditableTerminalLine() ??
+      this.selectedCursorRowTerminalLine(selection);
+    if (!editableLine) return consume("backspace");
     const range = planEditableTerminalSelectionDelete(
       editableLine,
-      this.terminal.getSelectionPosition(),
+      selection,
     );
-    if (!range) return false;
+    if (!range) return consume("backspace");
     if (
       !this.isTerminalCellBoundary(editableLine.line, range.startColumn) ||
       !this.isTerminalCellBoundary(editableLine.line, range.endColumn) ||
       !this.isTerminalCellBoundary(editableLine.line, editableLine.cursorColumn)
     ) {
-      return false;
+      return consume("backspace");
     }
     const movement = this.countTerminalCellKeystrokes(
       editableLine.line,
@@ -2039,7 +2152,7 @@ class TerminalPane {
       deletion === 0 ||
       movement + deletion > CURSOR_CLICK_MAX_KEYSTROKES
     ) {
-      return false;
+      return consume("backspace");
     }
 
     consume("backspace");
@@ -2452,6 +2565,85 @@ class TerminalPane {
     }
   }
 
+  private visibleTerminalScreenText() {
+    const buffer = this.terminal.buffer.active;
+    const start = Math.max(0, buffer.viewportY);
+    const end = Math.min(buffer.length, start + this.terminal.rows);
+    let text = "";
+    for (let row = start; row < end; row += 1) {
+      const line = buffer.getLine(row);
+      if (!line) continue;
+      if (text && !line.isWrapped) text += "\n";
+      text += line.translateToString(true);
+    }
+    return text;
+  }
+
+  private safetyCheckNotificationEventId() {
+    const session = (this.sessionId ?? `epoch-${this.lifecycleEpoch}`)
+      .replace(/[^A-Za-z0-9_.:-]+/g, "_")
+      .slice(0, 80);
+    const turn = (this.agentLastTurnStartIdentity ?? `started:${this.runtimeStartedAtUnixMs}`)
+      .replace(/[^A-Za-z0-9_.:-]+/g, "_")
+      .slice(0, 96);
+    return `safety:v1:${session}:${turn}`;
+  }
+
+  private observeCodexSafetyBufferingScreen() {
+    if (
+      this.disposed ||
+      this.terminalFailed ||
+      this.agentTurnState !== "working" ||
+      (this.launchProfile !== "codex" && this.agentProvider !== "codex")
+    ) {
+      return;
+    }
+    const visible = isCodexSafetyBufferingScreen(this.visibleTerminalScreenText());
+    if (visible) {
+      window.clearTimeout(this.safetyBufferingDismissTimer);
+      this.safetyBufferingDismissTimer = 0;
+      if (this.safetyBufferingScreenVisible) return;
+      this.safetyBufferingScreenVisible = true;
+      const notificationId = this.safetyCheckNotificationEventId();
+      if (this.lastSafetyCheckNotificationId === notificationId) return;
+      this.lastSafetyCheckNotificationId = notificationId;
+      this.setSafetyCheckPending(true);
+      void invoke("play_completion_sound").catch(() => undefined);
+      const labels = this.workspace.phoneNotificationLabels(
+        this.projectId,
+        this.terminalId,
+      );
+      if (labels) {
+        this.workspace.setFooterStatus(
+          tr(
+            `${labels.projectName} · ${labels.terminalName}: waiting for a Codex safety check`,
+            `${labels.projectName} · ${labels.terminalName}: Codex 안전 검사 대기 중`,
+          ),
+        );
+        void phoneNotifications.sendBackground(
+          "safetyCheck",
+          notificationId,
+          labels,
+        );
+      } else {
+        console.warn("Discord safety notification skipped: terminal label mapping unavailable");
+      }
+      return;
+    }
+    if (!this.safetyBufferingScreenVisible || this.safetyBufferingDismissTimer !== 0) return;
+    this.safetyBufferingDismissTimer = window.setTimeout(() => {
+      this.safetyBufferingDismissTimer = 0;
+      if (
+        this.disposed ||
+        isCodexSafetyBufferingScreen(this.visibleTerminalScreenText())
+      ) {
+        return;
+      }
+      this.safetyBufferingScreenVisible = false;
+      this.setSafetyCheckPending(false);
+    }, SAFETY_BUFFERING_DISMISS_STABILITY_MS);
+  }
+
   private scheduleRenderDrain() {
     if (this.renderDrainScheduled || this.disposed || this.terminalFailed) return;
     this.renderDrainScheduled = true;
@@ -2584,6 +2776,7 @@ class TerminalPane {
           this.terminal.scrollToBottom();
         }
         this.lastRenderedOutputAt = performance.now();
+        this.observeCodexSafetyBufferingScreen();
         if (this.pendingCompletionKey) this.armCompletionBarrier();
         resolve();
       });
@@ -2759,9 +2952,10 @@ class TerminalPane {
         this.terminal.cols !== columnsBeforeFit ||
         this.terminal.rows !== rowsBeforeFit
       ) {
-        // xterm may reflow wrapped buffer rows during a fit. A prompt anchor
-        // captured before that reflow can no longer prove which row is editable.
-        this.editableAnchor = null;
+        // Keep the prompt fingerprint across a fit. The next edit validates it
+        // against the live cursor row and safely discards it if reflow changed
+        // the editable prefix; eagerly clearing it broke Ctrl+A after layout
+        // switches even when the prompt itself did not move.
         this.cursorClickSnapshot = null;
       }
     } catch {
@@ -3292,9 +3486,16 @@ class TerminalPane {
     return detected;
   }
 
-  private async detectDroppedFileProvider(): Promise<AgentProvider | null> {
+  private async detectDroppedFileProvider(): Promise<DroppedFileProvider | null> {
     const sessionId = this.sessionId;
-    if (!sessionId) return null;
+    const launchProvider: DroppedFileProvider | null =
+      this.launchProfile === "codex" ||
+      this.launchProfile === "grok" ||
+      this.launchProfile === "claude" ||
+      this.launchProfile === "opencode"
+        ? this.launchProfile
+        : null;
+    if (!sessionId) return launchProvider;
     const timedOut = Symbol("agent detection timed out");
     const detected = await Promise.race([
       invoke<AgentProvider | null>("detect_terminal_agent", { sessionId }).catch(
@@ -3302,12 +3503,12 @@ class TerminalPane {
       ),
       delay(750).then(() => timedOut),
     ]);
-    if (detected === timedOut) return this.agentProvider;
+    if (detected === timedOut) return this.agentProvider ?? launchProvider;
     if (detected === "codex" || detected === "grok") {
       this.agentProvider = detected;
       return detected;
     }
-    return null;
+    return this.agentProvider ?? launchProvider;
   }
 
   private scheduleExitBarrier() {
@@ -3990,11 +4191,15 @@ class BrowserPane {
   }
 
   async waitUntilNativeHiddenForSettings(): Promise<void> {
+    await this.waitUntilNativeHidden();
+  }
+
+  async waitUntilNativeHidden(): Promise<void> {
     await this.boundsQueue.catch(() => undefined);
     const webview = this.webview;
     if (this.disposed || !this.interactionSuspended || !webview) return;
     await webview.hide().catch((error) => {
-      console.warn("Could not hide the browser pane behind Settings", error);
+      console.warn("Could not hide the browser pane behind an application overlay", error);
     });
   }
 
@@ -4764,6 +4969,7 @@ class TerminalWorkspace {
   private nativeFileDropRegistrationEpoch = 0;
   private nativeFileDropTargetPaneId: string | null = null;
   private nativeFileDropCount = 0;
+  private nativeFileDropPaths: string[] = [];
   private readonly nativeFileDropUnlisteners: Array<() => void> = [];
   private readonly browserUrlUnlisteners: Array<() => void> = [];
   private browserUrlRegistrationEpoch = 0;
@@ -4870,10 +5076,9 @@ class TerminalWorkspace {
       projectId: string,
       url: string,
     ) => Promise<string | null>,
-    private readonly onPaneReorderedCallback: (
+    private readonly onPaneOrderChangedCallback: (
       projectId: string,
-      paneId: string,
-      target: Pick<PaneInsertionTarget, "beforePaneId">,
+      orderedPaneIds: string[],
     ) => void,
     private readonly onPaneRatiosChangedCallback: (
       projectId: string,
@@ -5000,10 +5205,11 @@ class TerminalWorkspace {
     if (typeof terminalId !== "string" || terminalId.length === 0) {
       throw new Error("The browser command terminal is missing.");
     }
-    const normalizedMethod =
+    const browserMethod =
       typeof method === "string" && method.startsWith("browser_")
         ? method.slice("browser_".length)
         : method;
+    const normalizedMethod = browserMethod;
     if (
       normalizedMethod !== "list" &&
       normalizedMethod !== "open" &&
@@ -5261,7 +5467,8 @@ class TerminalWorkspace {
     }
 
     if (payload.type === "enter") {
-      this.nativeFileDropCount = selectDroppedFilePaths(payload.paths).paths.length;
+      this.nativeFileDropPaths = selectDroppedFilePaths(payload.paths).paths;
+      this.nativeFileDropCount = this.nativeFileDropPaths.length;
       this.updateNativeFileDropTarget(payload.position);
       return;
     }
@@ -5271,9 +5478,9 @@ class TerminalWorkspace {
     }
 
     const selection = selectDroppedFilePaths(payload.paths);
-    const pane = this.terminalPaneAtNativeDropPosition(payload.position);
+    const target = this.layoutPaneAtNativeDropPosition(payload.position);
     this.clearNativeFileDropTarget();
-    if (!pane) {
+    if (!target || target instanceof BrowserPane) {
       this.setFooterStatus(
         tr(
           "Drop the files over the PowerShell pane where you want to attach them.",
@@ -5291,6 +5498,7 @@ class TerminalWorkspace {
       return;
     }
 
+    const pane = target;
     this.activatePane(pane.id, false);
     void pane.attachDroppedFiles(selection.paths).then((attached) => {
       if (this.disposed) return;
@@ -5323,25 +5531,25 @@ class TerminalWorkspace {
   private updateNativeFileDropTarget(
     position: Extract<DragDropEvent, { type: "over" }>["position"],
   ) {
-    const pane = this.terminalPaneAtNativeDropPosition(position);
+    const pane = this.layoutPaneAtNativeDropPosition(position);
     if (pane?.id === this.nativeFileDropTargetPaneId) {
-      pane?.setFileDropTarget(true, this.nativeFileDropCount);
+      if (pane instanceof TerminalPane) pane.setFileDropTarget(true, this.nativeFileDropCount);
       return;
     }
     this.clearNativeFileDropTarget(false);
-    if (!pane) return;
+    if (!pane || pane instanceof BrowserPane) return;
     this.nativeFileDropTargetPaneId = pane.id;
     pane.setFileDropTarget(true, this.nativeFileDropCount);
   }
 
-  private terminalPaneAtNativeDropPosition(
+  private layoutPaneAtNativeDropPosition(
     position: Extract<DragDropEvent, { type: "over" }>["position"],
-  ): TerminalPane | null {
+  ): LayoutPane | null {
     const logical = position.toLogical(this.nativeFileDropScaleFactor);
     const element = document.elementFromPoint(logical.x, logical.y);
     const paneElement = element?.closest<HTMLElement>(".terminal-pane");
     const paneId = paneElement?.dataset.paneId;
-    const pane = paneId ? this.panes.get(paneId) : undefined;
+    const pane = paneId ? this.layoutPane(paneId) : undefined;
     if (!pane || pane.element.hidden || pane.projectId !== this.activeProjectId) return null;
     return pane;
   }
@@ -5351,7 +5559,10 @@ class TerminalWorkspace {
       this.panes.get(this.nativeFileDropTargetPaneId)?.setFileDropTarget(false);
     }
     this.nativeFileDropTargetPaneId = null;
-    if (resetFileCount) this.nativeFileDropCount = 0;
+    if (resetFileCount) {
+      this.nativeFileDropCount = 0;
+      this.nativeFileDropPaths = [];
+    }
   }
 
   addPane(
@@ -5534,6 +5745,13 @@ class TerminalWorkspace {
       ),
     );
     const savedBrowsers = projectBrowserPanes(project);
+    const persistentToRuntimeId = new Map<string, string>();
+    for (const terminal of project.terminals) {
+      persistentToRuntimeId.set(terminal.id, paneRuntimeId(project.id, terminal.id));
+    }
+    for (const browser of savedBrowsers) {
+      persistentToRuntimeId.set(browser.id, browserPaneRuntimeId(project.id, browser.id));
+    }
     const orderedTerminals = project.terminals.map((terminal) =>
       paneRuntimeId(project.id, terminal.id),
     );
@@ -5542,16 +5760,9 @@ class TerminalWorkspace {
     );
     const terminalIds = new Set(orderedTerminals);
     const browserIds = new Set(orderedBrowsers);
-    const previous = this.projectOrders.get(project.id) ?? [];
-    let terminalIndex = 0;
-    const ordered = previous
-      .map((paneId) => {
-        if (terminalIds.has(paneId)) return orderedTerminals[terminalIndex++] ?? null;
-        return browserIds.has(paneId) ? paneId : null;
-      })
+    const ordered = projectPaneOrder(project)
+      .map((persistentId) => persistentToRuntimeId.get(persistentId) ?? null)
       .filter((paneId): paneId is string => paneId !== null);
-    ordered.push(...orderedTerminals.slice(terminalIndex));
-    ordered.push(...orderedBrowsers.filter((paneId) => !ordered.includes(paneId)));
     this.projectOrders.set(project.id, ordered);
     this.projectRatios.set(
       project.id,
@@ -5971,6 +6182,100 @@ class TerminalWorkspace {
       pane.setTitle(previousTitle);
     }
     this.renderActiveStatus();
+  }
+
+  focusActivePane(): void {
+    if (this.disposed || this.workspaceView !== "terminals" || !this.activePaneId) return;
+    this.layoutPane(this.activePaneId)?.focus();
+  }
+
+  setContentBrowserFileDropTarget(paneId: string | null, fileCount = 1): boolean {
+    if (this.disposed || this.workspaceView !== "terminals") return false;
+    if (paneId === this.nativeFileDropTargetPaneId) {
+      const existing = paneId ? this.panes.get(paneId) : null;
+      if (existing) existing.setFileDropTarget(true, fileCount);
+      return Boolean(existing);
+    }
+    this.clearNativeFileDropTarget(false);
+    this.nativeFileDropCount = Math.max(1, fileCount);
+    if (!paneId) return false;
+    const pane = this.panes.get(paneId);
+    if (!pane || pane.element.hidden || pane.projectId !== this.activeProjectId) return false;
+    this.nativeFileDropTargetPaneId = pane.id;
+    pane.setFileDropTarget(true, this.nativeFileDropCount);
+    return true;
+  }
+
+  clearContentBrowserFileDropTarget() {
+    this.clearNativeFileDropTarget();
+  }
+
+  async attachFilesToActivePane(candidates: readonly string[]): Promise<number> {
+    if (this.disposed || this.workspaceView !== "terminals") return 0;
+    const pane = this.activePaneId ? this.layoutPane(this.activePaneId) : null;
+    if (!(pane instanceof TerminalPane) || pane.projectId !== this.activeProjectId) {
+      this.setFooterStatus(
+        tr(
+          "Select the terminal where you want to add these files.",
+          "파일을 추가할 터미널을 먼저 선택하세요.",
+        ),
+        "error",
+      );
+      return 0;
+    }
+    return this.attachFilesToPane(pane.id, candidates);
+  }
+
+  async attachFilesToPane(
+    paneId: string,
+    candidates: readonly string[],
+  ): Promise<number> {
+    if (this.disposed || this.workspaceView !== "terminals") return 0;
+    const pane = this.panes.get(paneId);
+    if (!pane || pane.element.hidden || pane.projectId !== this.activeProjectId) {
+      this.setFooterStatus(
+        tr(
+          "Drop the file over a terminal in the current project.",
+          "현재 프로젝트의 터미널 위에 파일을 놓아주세요.",
+        ),
+        "error",
+      );
+      return 0;
+    }
+    const selection = selectDroppedFilePaths(candidates);
+    if (selection.paths.length === 0) {
+      this.setFooterStatus(
+        tr("No attachable file paths were found.", "첨부할 수 있는 파일 경로가 없습니다."),
+        "error",
+      );
+      return 0;
+    }
+
+    this.activatePane(pane.id, true);
+    const attached = await pane.attachDroppedFiles(selection.paths);
+    if (attached === 0) {
+      this.setFooterStatus(
+        tr(
+          "Files can only be added to a running terminal.",
+          "실행 중인 터미널에만 파일을 추가할 수 있습니다.",
+        ),
+        "error",
+      );
+      return 0;
+    }
+    const skipped = selection.skipped > 0
+      ? tr(
+          ` · ${formatAppNumber(selection.skipped)} skipped`,
+          ` · ${formatAppNumber(selection.skipped)}개 제외`,
+        )
+      : "";
+    this.setFooterStatus(
+      tr(
+        `Added ${formatAppNumber(attached)} ${attached === 1 ? "file" : "files"} to the ${pane.title} prompt${skipped}.`,
+        `${pane.title} 프롬프트에 ${formatAppNumber(attached)}개 파일을 추가했습니다${skipped}.`,
+      ),
+    );
+    return attached;
   }
 
   updateBrowserPaneUrl(paneId: string, url: string): Promise<boolean> {
@@ -6492,20 +6797,34 @@ class TerminalWorkspace {
       !cancelled &&
       state.hasValidDrop &&
       !samePaneOrder(state.originalOrder, state.previewOrder);
-    const next = changed ? state.previewOrder : state.originalOrder;
-    this.projectOrders.set(state.projectId, [...next]);
+    const visibleOrder = changed ? state.previewOrder : state.originalOrder;
+    const visibleIds = new Set(state.originalOrder);
+    let visibleIndex = 0;
+    const currentOrder = this.projectOrders.get(state.projectId) ?? state.originalOrder;
+    const next = currentOrder.map((paneId) =>
+      visibleIds.has(paneId) ? (visibleOrder[visibleIndex++] ?? paneId) : paneId,
+    );
+    this.projectOrders.set(state.projectId, next);
     this.updateLayout();
     this.setBrowserSuspensionReason("layout-interaction", false);
-    if (changed && pane instanceof TerminalPane) {
-      const movedIndex = next.indexOf(pane.id);
-      const nextTerminal = next
-        .slice(movedIndex + 1)
-        .map((candidateId) => this.panes.get(candidateId))
-        .find((candidate) => candidate !== undefined);
-      this.onPaneReorderedCallback(state.projectId, pane.terminalId, {
-        beforePaneId: nextTerminal?.terminalId ?? null,
-      });
+    if (changed) {
+      const orderedPaneIds = next
+        .map((runtimeId) => this.persistentPaneId(state.projectId, runtimeId))
+        .filter((persistentId): persistentId is string => persistentId !== null);
+      this.onPaneOrderChangedCallback(state.projectId, orderedPaneIds);
     }
+  }
+
+  private persistentPaneId(projectId: string, runtimeId: string): string | null {
+    const pane = this.layoutPane(runtimeId);
+    if (pane instanceof TerminalPane) return pane.terminalId;
+    if (pane instanceof BrowserPane) return pane.persistentId;
+    for (const terminal of this.projectTerminalStates.get(projectId)?.values() ?? []) {
+      if (paneRuntimeId(projectId, terminal.id) === runtimeId) {
+        return terminal.id;
+      }
+    }
+    return null;
   }
 
   private freezePaneDragLayout(state: PaneDragState) {
@@ -6895,8 +7214,13 @@ class TerminalWorkspace {
     this.refreshBrowserSuspensions();
   }
 
-  setModalOverlayOpen(reason: string, open: boolean) {
+  async setModalOverlayOpen(reason: string, open: boolean): Promise<void> {
     this.setBrowserSuspensionReason(`modal:${reason}`, open);
+    if (open) {
+      await Promise.all(
+        [...this.browserPanes.values()].map((pane) => pane.waitUntilNativeHidden()),
+      );
+    }
   }
 
   async prepareSettingsModal(): Promise<void> {
@@ -7243,6 +7567,15 @@ function footerProviderName(provider: FooterProviderId) {
   }
 }
 
+type ProviderPointerReorder = {
+  pointerId: number;
+  provider: FooterProviderId;
+  element: HTMLButtonElement;
+  startX: number;
+  startY: number;
+  started: boolean;
+};
+
 class ProviderUsageController {
   private timer = 0;
   private resetTimer = 0;
@@ -7260,10 +7593,10 @@ class ProviderUsageController {
   private readonly listeners = new AbortController();
   private readonly detailResizeObserver: ResizeObserver;
   private readonly unsubscribeFooterSettings: () => void;
-  private draggedProvider: FooterProviderId | null = null;
+  private providerPointerReorder: ProviderPointerReorder | null = null;
   private dropTargetProvider: FooterProviderId | null = null;
   private dropPosition: "before" | "after" | null = null;
-  private suppressNextTriggerClick = false;
+  private suppressTriggerClickUntil = 0;
 
   constructor(
     private readonly usageRoot: HTMLElement,
@@ -7283,10 +7616,10 @@ class ProviderUsageController {
     for (const provider of FOOTER_PROVIDER_IDS) {
       const trigger = this.triggers[provider];
       trigger.addEventListener("click", () => {
-        if (this.suppressNextTriggerClick) return;
+        if (performance.now() < this.suppressTriggerClickUntil) return;
         this.toggleDetail(provider, trigger);
       }, { signal });
-      trigger.addEventListener("dragstart", (event) => this.onProviderDragStart(provider, event), {
+      trigger.addEventListener("pointerdown", (event) => this.onProviderPointerDown(provider, event), {
         signal,
       });
       trigger.addEventListener("keydown", (event) => this.onProviderKeyDown(provider, event), {
@@ -7296,11 +7629,20 @@ class ProviderUsageController {
         setFooterProviderVisible(provider, this.visibilityInputs[provider].checked);
       }, { signal });
     }
-    this.usageRoot.addEventListener("dragover", (event) => this.onProviderDragOver(event), {
+    this.usageRoot.addEventListener("pointermove", (event) => this.onProviderPointerMove(event), {
       signal,
     });
-    this.usageRoot.addEventListener("drop", (event) => this.onProviderDrop(event), { signal });
-    this.usageRoot.addEventListener("dragend", () => this.finishProviderDrag(), { signal });
+    this.usageRoot.addEventListener("pointerup", (event) => this.onProviderPointerUp(event), {
+      signal,
+    });
+    this.usageRoot.addEventListener("pointercancel", (event) => this.onProviderPointerCancel(event), {
+      signal,
+    });
+    this.usageRoot.addEventListener(
+      "lostpointercapture",
+      (event) => this.onProviderPointerCaptureLost(event),
+      { signal },
+    );
     this.unsubscribeFooterSettings = subscribeFooterProviderSettings((settings) =>
       this.applyFooterSettings(settings, true),
     );
@@ -7341,6 +7683,7 @@ class ProviderUsageController {
 
   dispose() {
     this.disposed = true;
+    this.finishProviderPointerReorder(false);
     window.clearInterval(this.timer);
     window.clearTimeout(this.resetTimer);
     this.accountRequestSequence += 1;
@@ -7470,7 +7813,8 @@ class ProviderUsageController {
     for (const provider of settings.order) {
       const trigger = this.triggers[provider];
       trigger.hidden = !visible.has(provider);
-      trigger.draggable = visible.has(provider);
+      trigger.draggable = false;
+      trigger.dataset.reorderable = String(visible.has(provider));
       delete trigger.dataset.firstVisible;
       this.visibilityInputs[provider].checked = visible.has(provider);
       this.usageRoot.append(trigger);
@@ -7480,66 +7824,107 @@ class ProviderUsageController {
     this.clearProviderDropIndicators();
   }
 
-  private onProviderDragStart(provider: FooterProviderId, event: DragEvent) {
-    if (this.accountBusy || !isFooterProviderVisible(getFooterProviderSettings(), provider)) {
-      event.preventDefault();
+  private onProviderPointerDown(provider: FooterProviderId, event: PointerEvent) {
+    if (
+      this.accountBusy ||
+      event.button !== 0 ||
+      !event.isPrimary ||
+      !isFooterProviderVisible(getFooterProviderSettings(), provider)
+    ) {
       return;
     }
-    this.requestCloseDetail(false);
-    this.draggedProvider = provider;
-    this.suppressNextTriggerClick = true;
-    if (event.dataTransfer) {
-      event.dataTransfer.effectAllowed = "move";
-      event.dataTransfer.setData("text/plain", provider);
+    const target = event.target instanceof Element
+      ? event.target.closest<HTMLButtonElement>(".provider-usage-item")
+      : null;
+    if (target !== this.triggers[provider]) return;
+    this.finishProviderPointerReorder(false);
+    this.providerPointerReorder = {
+      pointerId: event.pointerId,
+      provider,
+      element: target,
+      startX: event.clientX,
+      startY: event.clientY,
+      started: false,
+    };
+    try {
+      target.setPointerCapture(event.pointerId);
+    } catch {
+      this.providerPointerReorder = null;
     }
-    requestAnimationFrame(() => {
-      if (this.draggedProvider === provider) this.triggers[provider].dataset.dragging = "true";
-    });
   }
 
-  private onProviderDragOver(event: DragEvent) {
-    const dragged = this.draggedProvider;
-    if (!dragged) return;
+  private onProviderPointerMove(event: PointerEvent) {
+    const pointer = this.providerPointerReorder;
+    if (!pointer || pointer.pointerId !== event.pointerId) return;
+    if (
+      !pointer.started &&
+      !crossedPointerReorderThreshold(
+        pointer.startX,
+        pointer.startY,
+        event.clientX,
+        event.clientY,
+      )
+    ) {
+      return;
+    }
+    if (!pointer.started) {
+      pointer.started = true;
+      this.requestCloseDetail(false);
+      this.suppressTriggerClickUntil = Number.POSITIVE_INFINITY;
+      pointer.element.dataset.dragging = "true";
+    }
     event.preventDefault();
-    if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
-    const element = event.target instanceof Element
-      ? event.target.closest<HTMLElement>(".provider-usage-item")
-      : null;
-    const target = element?.dataset.provider;
+    pointer.element.style.setProperty(
+      "--reorder-offset-x",
+      `${event.clientX - pointer.startX}px`,
+    );
     this.clearProviderDropIndicators();
-    if (target === dragged) {
-      this.dropTargetProvider = dragged;
+    const settings = getFooterProviderSettings();
+    const target = horizontalReorderTarget(
+      visibleFooterProviders(settings).map((visibleProvider) => {
+        const element = this.triggers[visibleProvider];
+        const bounds = element.getBoundingClientRect();
+        return { id: visibleProvider, left: bounds.left, right: bounds.right };
+      }),
+      pointer.provider,
+      event.clientX,
+    );
+    if (!target) {
+      this.dropTargetProvider = null;
       this.dropPosition = null;
       return;
     }
-    if (!element || !isFooterProviderId(target) || element.hidden) {
-      this.dropTargetProvider = null;
-      this.dropPosition = "after";
-      return;
-    }
-    const rect = element.getBoundingClientRect();
-    const position = event.clientX < rect.left + rect.width / 2 ? "before" : "after";
-    this.dropTargetProvider = target;
-    this.dropPosition = position;
-    element.dataset.dropPosition = position;
+    this.dropTargetProvider = target.targetId;
+    this.dropPosition = target.position;
+    this.triggers[target.targetId].dataset.dropPosition = target.position;
   }
 
-  private onProviderDrop(event: DragEvent) {
-    const dragged = this.draggedProvider;
-    if (!dragged) return;
+  private onProviderPointerUp(event: PointerEvent) {
+    const pointer = this.providerPointerReorder;
+    if (!pointer || pointer.pointerId !== event.pointerId) return;
+    if (!pointer.started) {
+      this.finishProviderPointerReorder(false);
+      return;
+    }
     event.preventDefault();
+    const dragged = pointer.provider;
     const target = this.dropTargetProvider;
     const position = this.dropPosition;
-    if (target === dragged && position === null) {
-      // Dropping back onto the source keeps the current order.
-    } else if (target && position) {
+    this.finishProviderPointerReorder(true);
+    if (target && position) {
       this.reorderProviderRelative(dragged, target, position);
-    } else {
-      this.requestCloseDetail(false);
-      reorderFooterProvider(dragged, null);
+      this.announceProviderOrder(dragged);
     }
-    this.announceProviderOrder(dragged);
-    this.finishProviderDrag();
+  }
+
+  private onProviderPointerCancel(event: PointerEvent) {
+    if (this.providerPointerReorder?.pointerId !== event.pointerId) return;
+    this.finishProviderPointerReorder(this.providerPointerReorder.started);
+  }
+
+  private onProviderPointerCaptureLost(event: PointerEvent) {
+    if (this.providerPointerReorder?.pointerId !== event.pointerId) return;
+    this.finishProviderPointerReorder(this.providerPointerReorder.started);
   }
 
   private onProviderKeyDown(provider: FooterProviderId, event: KeyboardEvent) {
@@ -7589,15 +7974,26 @@ class ProviderUsageController {
     }
   }
 
-  private finishProviderDrag() {
-    if (this.draggedProvider) delete this.triggers[this.draggedProvider].dataset.dragging;
-    this.draggedProvider = null;
+  private finishProviderPointerReorder(
+    suppressClick = this.providerPointerReorder?.started ?? false,
+  ) {
+    const pointer = this.providerPointerReorder;
+    this.providerPointerReorder = null;
+    if (pointer) {
+      delete pointer.element.dataset.dragging;
+      pointer.element.style.removeProperty("--reorder-offset-x");
+      try {
+        if (pointer.element.hasPointerCapture(pointer.pointerId)) {
+          pointer.element.releasePointerCapture(pointer.pointerId);
+        }
+      } catch {
+        // A settings refresh may replace capture ownership while reordering.
+      }
+    }
     this.dropTargetProvider = null;
     this.dropPosition = null;
     this.clearProviderDropIndicators();
-    window.setTimeout(() => {
-      this.suppressNextTriggerClick = false;
-    }, 0);
+    if (suppressClick) this.suppressTriggerClickUntil = performance.now() + 240;
   }
 
   private renderLimit(
@@ -8378,6 +8774,7 @@ class PhoneNotificationController {
     private readonly webhookState: HTMLElement,
     private readonly successInput: HTMLInputElement,
     private readonly errorInput: HTMLInputElement,
+    private readonly safetyCheckInput: HTMLInputElement,
     private readonly removeButton: HTMLButtonElement,
     private readonly testButton: HTMLButtonElement,
     private readonly closeButton: HTMLButtonElement,
@@ -8469,7 +8866,8 @@ class PhoneNotificationController {
       !settings?.enabled ||
       !settings.webhookConfigured ||
       (kind === "success" && !settings.notifyOnSuccess) ||
-      (kind === "error" && !settings.notifyOnError)
+      (kind === "error" && !settings.notifyOnError) ||
+      (kind === "safetyCheck" && !settings.notifyOnSafetyCheck)
     ) {
       return;
     }
@@ -8553,6 +8951,7 @@ class PhoneNotificationController {
       this.enabledInput.checked = settings.enabled;
       this.successInput.checked = settings.notifyOnSuccess;
       this.errorInput.checked = settings.notifyOnError;
+      this.safetyCheckInput.checked = settings.notifyOnSafetyCheck;
     }
     this.webhookInput.value = "";
     this.renderWebhookState();
@@ -8645,6 +9044,7 @@ class PhoneNotificationController {
       clearWebhook: false,
       notifyOnSuccess: this.successInput.checked,
       notifyOnError: this.errorInput.checked,
+      notifyOnSafetyCheck: this.safetyCheckInput.checked,
     };
   }
 
@@ -8744,6 +9144,7 @@ class PhoneNotificationController {
             clearWebhook: true,
             notifyOnSuccess: this.successInput.checked,
             notifyOnError: this.errorInput.checked,
+            notifyOnSafetyCheck: this.safetyCheckInput.checked,
           } satisfies PhoneNotificationSettingsUpdate,
         }),
       );
@@ -9399,7 +9800,8 @@ function normalizePhoneNotificationSettings(value: unknown): PhoneNotificationSe
     typeof value.enabled !== "boolean" ||
     typeof value.webhookConfigured !== "boolean" ||
     typeof value.notifyOnSuccess !== "boolean" ||
-    typeof value.notifyOnError !== "boolean"
+    typeof value.notifyOnError !== "boolean" ||
+    typeof value.notifyOnSafetyCheck !== "boolean"
   ) {
     throw new Error(
       tr(
@@ -9413,6 +9815,7 @@ function normalizePhoneNotificationSettings(value: unknown): PhoneNotificationSe
     webhookConfigured: value.webhookConfigured,
     notifyOnSuccess: value.notifyOnSuccess,
     notifyOnError: value.notifyOnError,
+    notifyOnSafetyCheck: value.notifyOnSafetyCheck,
   };
 }
 
@@ -9684,17 +10087,64 @@ const addClaudeCodeButton = requireButton("add-claude-code-pane");
 const addOpenCodeButton = requireButton("add-opencode-pane");
 const addBrowserButton = requireButton("add-browser-pane");
 const statusElement = requireElement("status");
+const projectSidebar = requireElement("project-sidebar");
+const toggleProjectSidebarButton = requireButton("toggle-project-sidebar");
+const projectListToggle = requireButton("toggle-project-list");
+const projectSidebarContent = requireElement("project-sidebar-content");
 const projectList = requireElement("project-list");
+const projectFiles = requireElement("project-files");
+const projectFilesToggle = requireButton("toggle-project-files");
+const refreshProjectFilesButton = requireButton("refresh-project-files");
+const projectFilesTitle = requireElement("project-files-title");
+const projectFileTree = requireElement("project-file-tree");
+const projectFileTreeStatus = requireElement("project-file-tree-status");
+const workspaceStage = requireElement("workspace-stage");
+const mediaDrawerLayer = requireElement("media-drawer-layer");
+const mediaDrawerPanel = requireElement("media-drawer");
+const mediaDrawerTitle = requireElement("media-drawer-title");
+const mediaDrawerPathForm = requireForm("media-drawer-path-form");
+const mediaDrawerPathInput = requireInput("media-drawer-path");
+const mediaDrawerGrid = requireElement("media-drawer-grid");
+const mediaDrawerCollapseButton = requireButton("media-drawer-collapse");
+const contentEntryMenu = requireElement("content-entry-menu");
+const contentEntryAttachButton = requireButton("content-entry-attach");
+const contentEntryOpenButton = requireButton("content-entry-open");
+const contentEntryRevealButton = requireButton("content-entry-reveal");
+const contentEntryCopyPathButton = requireButton("content-entry-copy-path");
+const contentEntryCopyNameButton = requireButton("content-entry-copy-name");
+const contentEntryDeleteButton = requireButton("content-entry-delete");
+const contentFileDeleteDialog = requireDialog("content-file-delete-dialog");
+const contentFileDeleteName = requireElement("content-file-delete-name");
+const contentFileDeleteError = requireElement("content-file-delete-error");
+const cancelContentFileDeleteButton = requireButton("cancel-content-file-delete");
+const confirmContentFileDeleteButton = requireButton("confirm-content-file-delete");
 const tabList = requireElement("workspace-tab-list");
 const addTabButton = requireButton("add-workspace-tab");
 const createProjectButton = requireButton("create-project");
+const projectCreateMenu = requireElement("project-create-menu");
+const useExistingProjectFolderButton = requireButton("use-existing-project-folder");
+const startProjectFromScratchButton = requireButton("start-project-from-scratch");
 const projectDialog = requireDialog("project-dialog");
+const projectDialogTitle = requireElement("project-dialog-title");
+const projectDialogDescription = requireElement("project-dialog-description");
 const projectForm = requireForm("project-form");
 const projectName = requireInput("project-name");
+const projectPathField = requireElement("project-path-field");
 const projectPath = requireInput("project-path");
 const selectProjectFolderButton = requireButton("select-project-folder");
 const projectFormError = requireElement("project-form-error");
 const cancelProjectButton = requireButton("cancel-project");
+const submitProjectButton = requireButton("submit-project");
+const projectRenameDialog = requireDialog("project-rename-dialog");
+const projectRenameForm = requireForm("project-rename-form");
+const projectRenameName = requireInput("project-rename-name");
+const projectRenameError = requireElement("project-rename-error");
+const cancelProjectRenameButton = requireButton("cancel-project-rename");
+const confirmProjectRenameButton = requireButton("confirm-project-rename");
+const projectDeleteDialog = requireDialog("project-delete-dialog");
+const projectDeleteMessage = requireElement("project-delete-message");
+const cancelProjectDeleteButton = requireButton("cancel-project-delete");
+const confirmProjectDeleteButton = requireButton("confirm-project-delete");
 const upgradeButton = requireButton("open-phase3-upgrade");
 const upgradeDialog = requireDialog("phase3-upgrade-dialog");
 const upgradeProjectCount = requireElement("phase3-upgrade-project-count");
@@ -9745,6 +10195,7 @@ const phoneNotificationWebhook = requireInput("phone-notification-webhook");
 const phoneNotificationWebhookState = requireElement("phone-notification-webhook-state");
 const phoneNotificationSuccess = requireInput("phone-notification-success");
 const phoneNotificationError = requireInput("phone-notification-error");
+const phoneNotificationSafetyCheck = requireInput("phone-notification-safety-check");
 const removePhoneNotificationWebhookButton = requireButton(
   "remove-phone-notification-webhook",
 );
@@ -9752,7 +10203,38 @@ const testPhoneNotificationsButton = requireButton("test-phone-notifications");
 const closeSettingsButton = requireButton("close-settings");
 const phoneNotificationStatus = requireElement("phone-notification-status");
 
+const PROJECT_SIDEBAR_COLLAPSED_KEY = "ihatecoding.project-sidebar-collapsed.v1";
+let projectSidebarCollapsed = false;
+try {
+  projectSidebarCollapsed = localStorage.getItem(PROJECT_SIDEBAR_COLLAPSED_KEY) === "true";
+} catch {
+  projectSidebarCollapsed = false;
+}
+
+function renderProjectSidebarState(): void {
+  app.dataset.sidebarCollapsed = String(projectSidebarCollapsed);
+  projectSidebar.dataset.collapsed = String(projectSidebarCollapsed);
+  toggleProjectSidebarButton.setAttribute("aria-expanded", String(!projectSidebarCollapsed));
+  const label = projectSidebarCollapsed
+    ? tr("Expand sidebar", "사이드바 펼치기")
+    : tr("Collapse sidebar", "사이드바 접기");
+  toggleProjectSidebarButton.setAttribute("aria-label", label);
+  toggleProjectSidebarButton.title = label;
+}
+
+toggleProjectSidebarButton.addEventListener("click", () => {
+  projectSidebarCollapsed = !projectSidebarCollapsed;
+  try {
+    localStorage.setItem(PROJECT_SIDEBAR_COLLAPSED_KEY, String(projectSidebarCollapsed));
+  } catch {
+    // The UI remains usable even when WebView storage is unavailable.
+  }
+  renderProjectSidebarState();
+});
+renderProjectSidebarState();
+
 let controller: Phase4WorkspaceController | null = null;
+let mediaDrawer: MediaDrawer | null = null;
 let phoneNotifications: PhoneNotificationController;
 const workspace = new TerminalWorkspace(
   app,
@@ -9773,8 +10255,8 @@ const workspace = new TerminalWorkspace(
     Promise.resolve(false),
   (projectId, url) =>
     controller?.addBrowserPaneFromLink(projectId, url) ?? Promise.resolve(null),
-  (projectId, paneId, target) =>
-    controller?.onPaneReordered(projectId, paneId, target),
+  (projectId, orderedPaneIds) =>
+    controller?.onPaneOrderChanged(projectId, orderedPaneIds),
   (projectId, layoutKey, ratios) =>
     controller?.onPaneRatiosChanged(projectId, layoutKey, ratios),
   (projectId, terminalId, provider, conversationId) =>
@@ -9835,6 +10317,7 @@ phoneNotifications = new PhoneNotificationController(
   phoneNotificationWebhookState,
   phoneNotificationSuccess,
   phoneNotificationError,
+  phoneNotificationSafetyCheck,
   removePhoneNotificationWebhookButton,
   testPhoneNotificationsButton,
   closeSettingsButton,
@@ -9874,20 +10357,50 @@ providerUsage.start();
 const unsubscribeAppLanguage = subscribeAppLanguage((_language: AppLanguage) => {
   phoneNotifications.refreshLocalizedUi();
   providerUsage.refreshLocalizedUi();
+  controller?.refreshLocalizedUi();
+  mediaDrawer?.refreshLocalizedUi();
+  renderProjectSidebarState();
 });
 controller = createPhase4WorkspaceController(workspace, {
   projectList,
+  projectListToggle,
+  projectSidebarContent,
+  projectFileTree: {
+    section: projectFiles,
+    toggleButton: projectFilesToggle,
+    refreshButton: refreshProjectFilesButton,
+    title: projectFilesTitle,
+    tree: projectFileTree,
+    status: projectFileTreeStatus,
+  },
   tabList,
   addTerminalButton: addButton,
   addTabButton,
   createProjectButton,
+  projectCreateMenu,
+  useExistingProjectFolderButton,
+  startProjectFromScratchButton,
   projectDialog,
+  projectDialogTitle,
+  projectDialogDescription,
   projectForm,
   projectName,
+  projectPathField,
   projectPath,
   selectProjectFolderButton,
   projectFormError,
   cancelProjectButton,
+  submitProjectButton,
+  projectRenameDialog,
+  projectRenameForm,
+  projectRenameName,
+  projectRenameError,
+  cancelProjectRenameButton,
+  confirmProjectRenameButton,
+  projectDeleteDialog,
+  projectDeleteMessage,
+  cancelProjectDeleteButton,
+  confirmProjectDeleteButton,
   upgradeButton,
   upgradeDialog,
   upgradeProjectCount,
@@ -9897,6 +10410,38 @@ controller = createPhase4WorkspaceController(workspace, {
   closeUpgradeButton,
   upgradeError,
 });
+mediaDrawer = new MediaDrawer(
+  {
+    stage: workspaceStage,
+    layer: mediaDrawerLayer,
+    panel: mediaDrawerPanel,
+    title: mediaDrawerTitle,
+    pathForm: mediaDrawerPathForm,
+    pathInput: mediaDrawerPathInput,
+    grid: mediaDrawerGrid,
+    collapseButton: mediaDrawerCollapseButton,
+    contextMenu: contentEntryMenu,
+    menuAttachButton: contentEntryAttachButton,
+    menuOpenButton: contentEntryOpenButton,
+    menuRevealButton: contentEntryRevealButton,
+    menuCopyPathButton: contentEntryCopyPathButton,
+    menuCopyNameButton: contentEntryCopyNameButton,
+    menuDeleteButton: contentEntryDeleteButton,
+    deleteDialog: contentFileDeleteDialog,
+    deleteFileName: contentFileDeleteName,
+    deleteError: contentFileDeleteError,
+    cancelDeleteButton: cancelContentFileDeleteButton,
+    confirmDeleteButton: confirmContentFileDeleteButton,
+  },
+  {
+    getProjectFolderPath: () => controller?.activeProjectFolderPath() ?? null,
+    attachFiles: (paths) => workspace.attachFilesToActivePane(paths),
+    previewDropTarget: (paneId) => workspace.setContentBrowserFileDropTarget(paneId),
+    clearDropTarget: () => workspace.clearContentBrowserFileDropTarget(),
+    attachFilesToPane: (paneId, paths) => workspace.attachFilesToPane(paneId, paths),
+    restoreFocus: () => workspace.focusActivePane(),
+  },
+);
 const paneLauncher = new PaneLauncherController(
   paneLauncherRoot,
   addButton,
@@ -9993,6 +10538,7 @@ void currentAppWindow.onCloseRequested(async (event) => {
     agentConnections.dispose();
     phoneNotifications.dispose();
     unsubscribeAppLanguage();
+    mediaDrawer?.dispose();
     controller?.dispose();
     paneLauncher.dispose();
     void workspace.dispose();
@@ -10013,6 +10559,7 @@ void currentAppWindow.onCloseRequested(async (event) => {
     agentConnections.dispose();
     phoneNotifications.dispose();
     unsubscribeAppLanguage();
+    mediaDrawer?.dispose();
     controller?.dispose();
     paneLauncher.dispose();
     // Use one backend-owned barrier instead of twenty pane-local stop IPCs. It
@@ -10038,6 +10585,7 @@ window.addEventListener("beforeunload", () => {
   agentConnections.dispose();
   phoneNotifications.dispose();
   unsubscribeAppLanguage();
+  mediaDrawer?.dispose();
   controller?.dispose();
   paneLauncher.dispose();
   void workspace.dispose();

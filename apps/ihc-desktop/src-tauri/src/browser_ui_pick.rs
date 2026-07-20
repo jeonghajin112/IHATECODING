@@ -13,6 +13,7 @@ use tauri::{Emitter, EventTarget, Manager, path::BaseDirectory};
 use uuid::Uuid;
 
 pub(crate) const BROWSER_UI_PICK_RESULT_EVENT: &str = "browser-ui-pick-result";
+pub(crate) const MEDIA_DRAWER_TOGGLE_EVENT: &str = "media-drawer-toggle-requested";
 const MAX_WEB_MESSAGE_BYTES: usize = 256 * 1024;
 const MAX_SOURCE_BYTES: usize = 16 * 1024;
 const MAX_SCREENSHOT_BYTES: usize = 16 * 1024 * 1024;
@@ -44,6 +45,15 @@ struct BrowserUiPickRequest {
     page_title: String,
     targets: Vec<BrowserUiPickTarget>,
     capture: BrowserUiPickRect,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MediaDrawerToggleRequest {
+    #[serde(rename = "type")]
+    kind: String,
+    version: u8,
+    nonce: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -161,6 +171,12 @@ struct BrowserUiPickResult {
     screenshot: bool,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MediaDrawerToggleEvent {
+    label: String,
+}
+
 #[cfg(windows)]
 pub(crate) fn install_windows_browser_ui_pick(
     webview: &webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2,
@@ -223,6 +239,16 @@ pub(crate) fn install_windows_browser_ui_pick(
                 return Ok(());
             }
             let raw_source = take_pwstr(raw_source);
+            if is_valid_media_drawer_toggle(raw_message, &raw_source, &callback_nonce) {
+                let _ = callback_app.emit_to(
+                    EventTarget::webview(crate::MAIN_WEBVIEW_LABEL),
+                    MEDIA_DRAWER_TOGGLE_EVENT,
+                    MediaDrawerToggleEvent {
+                        label: callback_label.clone(),
+                    },
+                );
+                return Ok(());
+            }
             let Ok(request) = parse_and_validate_request(raw_message, &raw_source, &callback_nonce)
             else {
                 return Ok(());
@@ -561,6 +587,17 @@ fn parse_and_validate_request(
         page_title: clean_inline(&request.page_title, 180),
         targets,
         capture,
+    })
+}
+
+fn is_valid_media_drawer_toggle(raw_message: &str, raw_source: &str, expected_nonce: &str) -> bool {
+    if raw_message.len() > 512 || validate_source_guard(raw_source).is_none() {
+        return false;
+    }
+    serde_json::from_str::<MediaDrawerToggleRequest>(raw_message).is_ok_and(|request| {
+        request.kind == "ihc-media-drawer-toggle"
+            && request.version == 1
+            && request.nonce == expected_nonce
     })
 }
 
