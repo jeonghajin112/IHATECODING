@@ -18,6 +18,7 @@ const providerIconNames = [
   "browser.svg",
   "claude-code.svg",
   "codex.svg",
+  "cursor.svg",
   "grok.svg",
   "opencode.svg",
   "powershell.svg",

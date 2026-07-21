@@ -39,7 +39,10 @@ use production_import::{
     ProductionImportError, ProductionImportErrorCode, ProductionImportPolicy,
     ProductionImportService,
 };
-use project_files::{list_project_directory, open_project_file};
+use project_files::{
+    list_project_directory, open_project_file, read_project_text_file, resolve_project_file_path,
+    save_project_text_file,
+};
 use project_store::{Phase3PreviewUpgradeInspection, ProjectStore};
 use pty::{StartTerminalResponse, TerminalEvent, TerminalManager};
 use serde::{Deserialize, Serialize};
@@ -2464,6 +2467,9 @@ pub fn run() {
             remove_empty_documents_project_directory,
             list_project_directory,
             open_project_file,
+            resolve_project_file_path,
+            read_project_text_file,
+            save_project_text_file,
             complete_agent_browser_command,
             browser_agent_snapshot,
             browser_agent_click,
@@ -2546,7 +2552,6 @@ mod documents_project_directory_tests {
             r"nested\project",
             "bad:name",
             "trailing.",
-            "trailing ",
             "CON",
             "con.txt",
             "PRN.log",
@@ -2566,6 +2571,10 @@ mod documents_project_directory_tests {
 
     #[test]
     fn project_directory_leaf_validation_keeps_valid_unicode_and_trims_outer_space() {
+        assert_eq!(
+            validate_project_directory_leaf("trailing ").unwrap(),
+            "trailing"
+        );
         assert_eq!(
             validate_project_directory_leaf("  프로젝트 🚀  ").unwrap(),
             "프로젝트 🚀"

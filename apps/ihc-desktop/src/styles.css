@@ -2440,6 +2440,116 @@ body[data-pane-resizing="true"] .terminal-resize-handle::after {
   grid-template-rows: 33px 36px minmax(0, 1fr);
 }
 
+.source-editor-pane {
+  grid-template-rows: 33px 35px minmax(0, 1fr);
+}
+
+.source-editor-pane[data-dirty="true"] .terminal-state-dot {
+  background: #777777;
+}
+
+.source-editor-toolbar {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 4px 6px;
+  border-bottom: 1px solid var(--line-soft);
+  background: var(--surface);
+}
+
+.source-editor-file-actions {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.source-editor-toolbar-button {
+  height: 25px;
+  padding: 0 8px;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  color: var(--muted);
+  background: transparent;
+  font-size: 9px;
+}
+
+.source-editor-toolbar-button:hover:not(:disabled) {
+  border-color: var(--line-soft);
+  color: var(--text);
+  background: var(--surface-active);
+}
+
+.source-editor-toolbar-button[data-primary="true"]:not(:disabled) {
+  border-color: #3d3d3d;
+  color: var(--text-secondary);
+  background: #1b1b1b;
+}
+
+.source-editor-path {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--faint);
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 8px;
+  text-align: center;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.source-editor-body {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--canvas);
+}
+
+.source-editor-textarea {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  margin: 0;
+  border: 0;
+  border-radius: 0;
+  color: #d4d4d4;
+  background: var(--canvas);
+}
+
+.source-editor-textarea {
+  resize: none;
+  padding: 12px 14px 48px;
+  outline: 0;
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.6;
+  tab-size: 2;
+  white-space: pre;
+  caret-color: #d8d8d8;
+}
+
+.source-editor-textarea:focus {
+  box-shadow: inset 0 0 0 1px #292929;
+}
+
+@container terminal-pane (max-width: 360px) {
+  .source-editor-path {
+    display: none;
+  }
+}
+
+.source-editor-close-dialog {
+  width: min(440px, calc(100vw - 36px));
+}
+
+.source-editor-close-dialog-actions {
+  flex-wrap: wrap;
+}
+
 .browser-navigation {
   display: flex;
   align-items: center;

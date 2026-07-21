@@ -252,7 +252,9 @@ test("pane title editing opens immediately and survives transient catalog writes
   const main = await source("src/main.ts");
   const terminalStart = main.indexOf("class TerminalPane {");
   const browserStart = main.indexOf("class BrowserPane {");
-  const layoutPaneStart = main.indexOf("type LayoutPane = TerminalPane | BrowserPane;");
+  const layoutPaneStart = main.indexOf(
+    "type LayoutPane = TerminalPane | BrowserPane | SourceEditorPane;",
+  );
   assert.ok(terminalStart >= 0 && browserStart > terminalStart);
   assert.ok(layoutPaneStart > browserStart);
 
@@ -719,10 +721,11 @@ test("manual tabs, compact project creation, and the mixed pane launcher are wir
 });
 
 test("settings expose localized General, Optimization, Agents, and Notifications tabs", async () => {
-  const [html, styles, main] = await Promise.all([
+  const [html, styles, main, agentCliStatus] = await Promise.all([
     source("index.html"),
     source("src/styles.css"),
     source("src/main.ts"),
+    source("src-tauri/src/agent_cli_status.rs"),
   ]);
 
   assert.match(html, /<html lang="en">/);
@@ -744,11 +747,16 @@ test("settings expose localized General, Optimization, Agents, and Notifications
   );
   assert.match(
     html,
-    /id="settings-agents-panel"[\s\S]*aria-labelledby="settings-agents-tab"[\s\S]*aria-busy="false"[\s\S]*id="refresh-agent-connections"[\s\S]*data-agent-provider="codex"[\s\S]*data-agent-provider="grok"[\s\S]*data-agent-provider="claudeCode"[\s\S]*data-agent-provider="openCode"/,
+    /id="settings-agents-panel"[\s\S]*aria-labelledby="settings-agents-tab"[\s\S]*aria-busy="false"[\s\S]*id="refresh-agent-connections"[\s\S]*data-agent-provider="codex"[\s\S]*data-agent-provider="grok"[\s\S]*data-agent-provider="claudeCode"[\s\S]*data-agent-provider="openCode"[\s\S]*data-agent-provider="cursor"/,
   );
-  for (const icon of ["codex", "grok", "claude-code", "opencode"]) {
+  for (const icon of ["codex", "grok", "claude-code", "opencode", "cursor"]) {
     assert.match(html, new RegExp(`src="/assets/provider-icons/${icon}\\.svg"`));
   }
+  assert.match(html, /data-agent-provider="cursor"[\s\S]*data-agent-status-only="true"/);
+  assert.match(agentCliStatus, /discover_cli\("agent", path\)/);
+  assert.match(agentCliStatus, /discover_cli\("cursor-agent", path\)/);
+  assert.doesNotMatch(agentCliStatus, /discover_cli\("cursor", path\)/);
+  assert.match(agentCliStatus, /\.arg\("status"\)/);
   assert.match(
     html,
     /id="settings-notifications-panel"[\s\S]*role="tabpanel"[\s\S]*aria-labelledby="settings-notifications-tab"[\s\S]*hidden[\s\S]*id="discord-notification-settings-title"[\s\S]*id="phone-notification-webhook"/,
@@ -799,7 +807,7 @@ test("settings expose localized General, Optimization, Agents, and Notifications
   assert.match(main, /this\.panel\.setAttribute\("aria-busy", String\(this\.refreshing\)\)/);
   assert.match(
     main,
-    /await this\.openAgent\(row\.launchProfile\);[\s\S]*this\.dialog\.close\(\)/,
+    /await this\.openAgent\(launchProfile\);[\s\S]*this\.dialog\.close\(\)/,
   );
   assert.match(main, /controller\.addTerminal\(launchProfile\)/);
 });

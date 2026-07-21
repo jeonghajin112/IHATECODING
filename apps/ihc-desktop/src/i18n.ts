@@ -94,6 +94,34 @@ const BACKEND_ERROR_TRANSLATIONS: Readonly<Record<string, string>> = {
 };
 
 const ENGLISH_BACKEND_ERROR_TRANSLATIONS: Readonly<Record<string, string>> = {
+  "The project-relative path is invalid.": "프로젝트 상대 경로가 올바르지 않습니다.",
+  "The requested path is not a safe regular project path.":
+    "요청한 경로가 안전한 일반 프로젝트 경로가 아닙니다.",
+  "The workspace project catalog is unavailable.":
+    "작업공간 프로젝트 목록을 사용할 수 없습니다.",
+  "The project no longer exists.": "프로젝트가 더 이상 존재하지 않습니다.",
+  "The project folder is unavailable.": "프로젝트 폴더를 사용할 수 없습니다.",
+  "The project directory no longer exists.": "프로젝트 폴더가 더 이상 존재하지 않습니다.",
+  "The project directory could not be read.": "프로젝트 폴더를 읽지 못했습니다.",
+  "The project directory reader did not complete.":
+    "프로젝트 폴더 읽기 작업이 완료되지 않았습니다.",
+  "The project file opener did not complete.": "프로젝트 파일 열기 작업이 완료되지 않았습니다.",
+  "The project file reader did not complete.": "프로젝트 파일 읽기 작업이 완료되지 않았습니다.",
+  "The project file writer did not complete.": "프로젝트 파일 저장 작업이 완료되지 않았습니다.",
+  "Select a regular project file to edit.": "편집할 일반 프로젝트 파일을 선택하세요.",
+  "The project file no longer exists.": "프로젝트 파일이 더 이상 존재하지 않습니다.",
+  "The project file could not be read.": "프로젝트 파일을 읽지 못했습니다.",
+  "The project file is too large for the lightweight editor.":
+    "프로젝트 파일이 경량 편집기에서 열기에는 너무 큽니다.",
+  "The project file is not UTF-8 text.": "프로젝트 파일이 UTF-8 텍스트가 아닙니다.",
+  "The project file is not a supported text file.": "지원하는 텍스트 파일이 아닙니다.",
+  "The project file revision is invalid.": "프로젝트 파일 버전 정보가 올바르지 않습니다.",
+  "The project file changed on disk. Reload it before saving.":
+    "디스크의 프로젝트 파일이 변경되었습니다. 저장하기 전에 다시 불러오세요.",
+  "The project file is not writable.": "프로젝트 파일에 쓸 수 없습니다.",
+  "The project file could not be saved.": "프로젝트 파일을 저장하지 못했습니다.",
+  "Windows could not atomically save the project file.":
+    "Windows에서 프로젝트 파일을 안전하게 교체 저장하지 못했습니다.",
   "Select an absolute local media folder.": "절대 경로의 로컬 미디어 폴더를 선택하세요.",
   "The media folder permission is no longer available.":
     "미디어 폴더 접근 권한을 더 이상 사용할 수 없습니다.",

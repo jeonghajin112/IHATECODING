@@ -14,7 +14,19 @@ export type ProjectFileTreeViewElements = {
   title: HTMLElement;
   tree: HTMLElement;
   status: HTMLElement;
+  onOpenFile?: ProjectFileOpenHandler;
 };
+
+export type ProjectFileOpenRequest = {
+  projectId: string;
+  projectName: string;
+  name: string;
+  pathSegments: string[];
+};
+
+export type ProjectFileOpenHandler = (
+  request: ProjectFileOpenRequest,
+) => void | Promise<void>;
 
 type ProjectFileTreeProject = {
   id: string;
@@ -58,9 +70,6 @@ export class ProjectFileTreeView {
     });
     elements.refreshButton.addEventListener("click", () => void this.refresh(), { signal });
     elements.tree.addEventListener("click", (event) => this.onTreeClick(event), { signal });
-    elements.tree.addEventListener("dblclick", (event) => this.onTreeDoubleClick(event), {
-      signal,
-    });
     elements.tree.addEventListener("keydown", (event) => this.onTreeKeyDown(event), {
       signal,
     });
@@ -322,14 +331,9 @@ export class ProjectFileTreeView {
     if (row.dataset.kind === "directory" && event.detail <= 1) {
       const segments = rowSegments(row);
       if (segments) void this.model.toggle(segments);
+    } else if (row.dataset.kind === "file" && event.detail <= 1) {
+      void this.openFileRow(row);
     }
-  }
-
-  private onTreeDoubleClick(event: MouseEvent): void {
-    const row = this.eventRow(event);
-    if (!row || row.dataset.kind !== "file") return;
-    event.preventDefault();
-    void this.openFileRow(row);
   }
 
   private onTreeKeyDown(event: KeyboardEvent): void {
@@ -412,7 +416,8 @@ export class ProjectFileTreeView {
     if (!key || !segments || !projectId || this.openingKey === key) return;
     const node = this.snapshot.visibleNodes.find((candidate) => candidate.key === key);
     if (!node || node.kind !== "file") return;
-    if (node.openable !== true) {
+    const openFile = this.elements.onOpenFile;
+    if (!openFile && node.openable !== true) {
       this.announce(
         tr(
           `${node.name} cannot be opened safely from the project tree.`,
@@ -423,7 +428,16 @@ export class ProjectFileTreeView {
     }
     this.openingKey = key;
     try {
-      await invoke("open_project_file", { projectId, pathSegments: segments });
+      if (openFile) {
+        await openFile({
+          projectId,
+          projectName: this.activeProject?.name ?? projectId,
+          name: node.name,
+          pathSegments: [...segments],
+        });
+      } else {
+        await invoke("open_project_file", { projectId, pathSegments: segments });
+      }
       this.announce(tr(`Opened ${node.name}.`, `${node.name} 파일을 열었습니다.`));
     } catch (error) {
       this.announce(projectFileTreeErrorMessage(error));

@@ -16,6 +16,14 @@ import {
   type MediaRootGrant,
   type MediaVolumeGrant,
 } from "./media-browser-core";
+import { isMarkdownFileName } from "./source-file-types";
+
+export type MediaDrawerMarkdownOpenRequest = Readonly<{
+  grantId: string;
+  rootPath: string;
+  name: string;
+  pathSegments: readonly string[];
+}>;
 
 export type MediaDrawerElements = Readonly<{
   stage: HTMLElement;
@@ -42,6 +50,7 @@ export type MediaDrawerElements = Readonly<{
 
 type MediaDrawerCallbacks = Readonly<{
   getProjectFolderPath: () => string | null;
+  openMarkdownFile: (request: MediaDrawerMarkdownOpenRequest) => Promise<boolean>;
   attachFiles: (paths: readonly string[]) => Promise<number>;
   previewDropTarget: (paneId: string) => boolean;
   clearDropTarget: () => void;
@@ -561,7 +570,7 @@ export class MediaDrawer {
     if (card?.dataset.action === "parent" || card?.dataset.action === "volume") return;
     const entry = card ? this.entryForCard(card) : null;
     if (!entry || entry.kind === "directory") return;
-    void this.attachEntry(entry);
+    void this.openMarkdownOrAttach(entry);
   }
 
   private onGridKeyDown(event: KeyboardEvent): void {
@@ -604,7 +613,7 @@ export class MediaDrawer {
     if (event.key === "Enter" || event.key === " ") {
       event.preventDefault();
       if (entry.kind === "directory") void this.loadDirectory(entry.pathSegments, undefined, true);
-      else void this.attachEntry(entry);
+      else void this.openMarkdownOrAttach(entry);
       return;
     }
     this.moveGridFocus(event, card);
@@ -633,7 +642,8 @@ export class MediaDrawer {
 
   private openContextMenu(entry: MediaBrowserEntry, clientX: number, clientY: number): void {
     this.contextEntry = entry;
-    this.elements.menuOpenButton.disabled = !entry.openable;
+    this.elements.menuOpenButton.disabled =
+      !entry.openable && !isMarkdownFileName(entry.name);
     this.elements.contextMenu.hidden = false;
     this.elements.contextMenu.style.left = "0px";
     this.elements.contextMenu.style.top = "0px";
@@ -714,6 +724,7 @@ export class MediaDrawer {
         return;
       }
       if (action === "open") {
+        if (await this.tryOpenMarkdownEntry(entry)) return;
         if (!entry.openable) return;
         await invoke("open_content_entry", {
           grantId: grant.grantId,
@@ -734,6 +745,40 @@ export class MediaDrawer {
       await invoke("write_clipboard_text", { text });
     } catch (error) {
       if (this.opened && !this.disposed) this.renderError(mediaErrorMessage(error));
+    }
+  }
+
+  private async openMarkdownOrAttach(entry: MediaBrowserEntry): Promise<void> {
+    if (!isMarkdownFileName(entry.name)) {
+      await this.attachEntry(entry);
+      return;
+    }
+    if (await this.tryOpenMarkdownEntry(entry)) return;
+    const grant = this.grant;
+    if (!grant || !entry.openable) return;
+    try {
+      await invoke("open_content_entry", {
+        grantId: grant.grantId,
+        pathSegments: [...entry.pathSegments],
+      });
+    } catch (error) {
+      if (this.opened && !this.disposed) this.renderError(mediaErrorMessage(error));
+    }
+  }
+
+  private async tryOpenMarkdownEntry(entry: MediaBrowserEntry): Promise<boolean> {
+    const grant = this.grant;
+    if (!grant || !isMarkdownFileName(entry.name)) return false;
+    try {
+      return await this.callbacks.openMarkdownFile({
+        grantId: grant.grantId,
+        rootPath: grant.rootPath,
+        name: entry.name,
+        pathSegments: [...entry.pathSegments],
+      });
+    } catch (error) {
+      if (this.opened && !this.disposed) this.renderError(mediaErrorMessage(error));
+      return true;
     }
   }
 

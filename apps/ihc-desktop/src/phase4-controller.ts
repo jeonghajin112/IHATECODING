@@ -19,11 +19,13 @@ import {
   activateWorkspaceTab,
   addBlankWorkspaceTab,
   appendProjectBrowserPane,
+  appendProjectEditorPane,
   appendProjectPane,
   appendWorkspaceProject,
   blockWorkspaceProviderResumeForAccountSwitch,
   closeWorkspaceTab,
   createWorkspaceBrowserPane,
+  createWorkspaceEditorPane,
   createWorkspaceProject,
   createWorkspaceTerminal,
   findWorkspaceProjectByFolder,
@@ -34,6 +36,7 @@ import {
   openProjectWorkspaceTab,
   removeWorkspaceProject,
   removeProjectBrowserPane,
+  removeProjectEditorPane,
   removeProjectPane,
   renameProjectBrowserPane,
   renameProjectPane,
@@ -47,8 +50,11 @@ import {
   uniqueWorkspaceProjectName,
   validateWorkspaceProjectDraft,
   validateWorkspaceProjectName,
+  projectEditorPanes,
+  sameProjectEditorPath,
   type RestoreCapacityDecision,
   type WorkspaceBrowserPane,
+  type WorkspaceEditorPane,
   type WorkspaceAgentProvider,
   type WorkspaceTerminalLaunchProfile,
 } from "./phase4-core";
@@ -66,6 +72,7 @@ import {
   ProjectFileTreeView,
   type ProjectFileTreeViewElements,
 } from "./project-file-tree-view";
+import { validateProjectPathSegments } from "./project-file-tree";
 
 type StatusTone = "normal" | "error";
 
@@ -104,6 +111,11 @@ export type Phase4RuntimePort = {
   addBrowserPane(
     projectId: string,
     browser: WorkspaceBrowserPane,
+    focus?: boolean,
+  ): unknown;
+  addEditorPane(
+    projectId: string,
+    editor: WorkspaceEditorPane,
     focus?: boolean,
   ): unknown;
   syncProject(project: WorkspaceProject): void;
@@ -253,7 +265,10 @@ export class Phase4WorkspaceController {
   ) {
     const signal = this.listeners.signal;
     this.projectListToggle = elements.projectListToggle;
-    this.projectFileTree = new ProjectFileTreeView(elements.projectFileTree);
+    this.projectFileTree = new ProjectFileTreeView({
+      ...elements.projectFileTree,
+      onOpenFile: (request) => this.openProjectFile(request.projectId, request.pathSegments),
+    });
     this.projectListToggle.addEventListener(
       "click",
       () => {
@@ -836,6 +851,21 @@ export class Phase4WorkspaceController {
       return await this.persist(
         next,
         tr("Could not save the web pane name", "웹 패널 이름을 저장하지 못했습니다"),
+      );
+    } catch (error) {
+      this.runtime.setFooterStatus(errorMessage(error), "error");
+      return false;
+    }
+  }
+
+  async onEditorPaneClosed(projectId: string, paneId: string): Promise<boolean> {
+    const state = this.currentState();
+    if (!state || !this.canMutate(false)) return false;
+    try {
+      const next = removeProjectEditorPane(state, projectId, paneId);
+      return await this.persist(
+        next,
+        tr("Could not save the editor removal", "편집기 삭제 상태를 저장하지 못했습니다"),
       );
     } catch (error) {
       this.runtime.setFooterStatus(errorMessage(error), "error");
@@ -1898,6 +1928,40 @@ export class Phase4WorkspaceController {
     return state.projects.find((project) => project.id === tab.projectId)?.folderPath ?? null;
   }
 
+  async openContentBrowserMarkdownFile(
+    grantId: string,
+    pathSegments: readonly string[],
+  ): Promise<boolean> {
+    const state = this.currentState();
+    if (!state) return false;
+    const tab = state.tabs.find((item) => item.id === state.activeTabId);
+    if (tab?.kind !== "project" || !tab.projectId) return false;
+    const project = state.projects.find((item) => item.id === tab.projectId);
+    if (!project) return false;
+
+    const absolutePath = await invoke<unknown>("resolve_content_entry_path", {
+      grantId,
+      pathSegments: [...pathSegments],
+    });
+    if (typeof absolutePath !== "string" || !absolutePath) {
+      throw new Error(tr("The selected file path is invalid.", "선택한 파일 경로가 올바르지 않습니다."));
+    }
+    const resolved = await invoke<unknown>("resolve_project_file_path", {
+      projectId: project.id,
+      absolutePath,
+    });
+    if (resolved === null) return false;
+    if (!Array.isArray(resolved)) {
+      throw new Error(tr("The selected project file is invalid.", "선택한 프로젝트 파일이 올바르지 않습니다."));
+    }
+    const projectPathSegments = validateProjectPathSegments(resolved);
+    if (projectPathSegments.length === 0) {
+      throw new Error(tr("The selected project file is invalid.", "선택한 프로젝트 파일이 올바르지 않습니다."));
+    }
+    await this.openProjectFile(project.id, projectPathSegments);
+    return true;
+  }
+
   async addTerminal(
     launchProfile: WorkspaceTerminalLaunchProfile = "powershell",
   ): Promise<void> {
@@ -2027,6 +2091,57 @@ export class Phase4WorkspaceController {
       return null;
     }
     return browser.id;
+  }
+
+  private async openProjectFile(
+    projectId: string,
+    pathSegments: readonly string[],
+  ): Promise<void> {
+    if (!this.storageWritable || !this.canPersistRuntimeMutation()) {
+      throw new Error(
+        tr(
+          "Wait for the current workspace update to finish, then try again.",
+          "현재 작업공간 업데이트가 끝난 뒤 다시 시도하세요.",
+        ),
+      );
+    }
+    const requestedPath = [...pathSegments];
+    await this.enqueueOperation(async () => {
+      const state = this.currentState();
+      const project = state?.projects.find((item) => item.id === projectId);
+      if (!state || !project) {
+        throw new Error(tr("The project no longer exists.", "프로젝트가 더 이상 없습니다."));
+      }
+
+      const existing = projectEditorPanes(project).find((pane) =>
+        sameProjectEditorPath(pane, requestedPath),
+      );
+      if (existing) {
+        this.runtime.addEditorPane(project.id, existing, true);
+        return;
+      }
+
+      const editor = createWorkspaceEditorPane(
+        this.idFactory(),
+        requestedPath,
+        requestedPath[requestedPath.length - 1] ?? tr("File", "파일"),
+      );
+      const next = appendProjectEditorPane(state, project.id, editor);
+      const saved = await this.persistNow(
+        next,
+        tr("Could not save the editor pane", "편집기 창을 저장하지 못했습니다"),
+      );
+      if (!saved) {
+        throw new Error(
+          tr("The editor pane could not be saved.", "편집기 창을 저장하지 못했습니다."),
+        );
+      }
+      if (!this.runtime.addEditorPane(project.id, editor, true)) {
+        throw new Error(
+          tr("The editor pane could not be opened.", "편집기 창을 열지 못했습니다."),
+        );
+      }
+    });
   }
 
   private async persist(next: WorkspaceState, context: string): Promise<boolean> {

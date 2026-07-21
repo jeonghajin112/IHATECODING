@@ -35,9 +35,13 @@ const MAX_NAME_BYTES: usize = 4 * 1024;
 const MAX_PATH_BYTES: usize = 32 * 1024;
 const MAX_URL_BYTES: usize = 16 * 1024;
 const MAX_BROWSER_PANE_TITLE_BYTES: usize = 4 * 80;
+const MAX_EDITOR_PANE_TITLE_BYTES: usize = 4 * 160;
+const MAX_EDITOR_PATH_DEPTH: usize = 64;
+const MAX_EDITOR_PATH_SEGMENT_BYTES: usize = 4 * 255;
 const MAX_EXTENSION_DEPTH: usize = 32;
 const MAX_EXTENSION_STRING_BYTES: usize = 64 * 1024;
 const PROJECT_BROWSER_PANES_EXTENSION: &str = "browserPanesV1";
+const PROJECT_EDITOR_PANES_EXTENSION: &str = "editorPanesV1";
 const RETIRED_PROJECT_IMAGE_PANES_EXTENSION: &str = "imagePanesV1";
 const PROJECT_PANE_ORDER_EXTENSION: &str = "paneOrderV1";
 const BACKUP_COUNT: usize = 3;
@@ -1202,12 +1206,16 @@ fn merge_preserved_extensions(incoming: &mut WorkspaceStateV1, current: &Workspa
             continue;
         };
         // Project extensions are backend-owned by default so an older/lossy
-        // frontend cannot overwrite opaque values. Browser panes and pane
-        // order are narrowly allowlisted UI-owned payloads so edits survive
-        // the next save.
+        // frontend cannot overwrite opaque values. Browser/editor panes and
+        // pane order are narrowly allowlisted UI-owned payloads so edits
+        // survive the next save.
         let incoming_browser_panes = project
             .legacy_extensions
             .get(PROJECT_BROWSER_PANES_EXTENSION)
+            .cloned();
+        let incoming_editor_panes = project
+            .legacy_extensions
+            .get(PROJECT_EDITOR_PANES_EXTENSION)
             .cloned();
         let incoming_pane_order = project
             .legacy_extensions
@@ -1220,6 +1228,11 @@ fn merge_preserved_extensions(incoming: &mut WorkspaceStateV1, current: &Workspa
             project
                 .legacy_extensions
                 .insert(PROJECT_BROWSER_PANES_EXTENSION.to_owned(), browser_panes);
+        }
+        if let Some(editor_panes) = incoming_editor_panes {
+            project
+                .legacy_extensions
+                .insert(PROJECT_EDITOR_PANES_EXTENSION.to_owned(), editor_panes);
         }
         if let Some(pane_order) = incoming_pane_order {
             project
@@ -1424,6 +1437,11 @@ fn validate_state(state: &WorkspaceStateV1) -> StorageResult<()> {
             &project.legacy_extensions,
             &mut pane_ids,
             &format!("{prefix}/legacyExtensions/{PROJECT_BROWSER_PANES_EXTENSION}"),
+        )?;
+        validate_project_editor_panes(
+            &project.legacy_extensions,
+            &mut pane_ids,
+            &format!("{prefix}/legacyExtensions/{PROJECT_EDITOR_PANES_EXTENSION}"),
         )?;
         validate_project_pane_order(
             &project.legacy_extensions,
@@ -1731,6 +1749,94 @@ fn validate_project_browser_panes(
     Ok(())
 }
 
+fn validate_project_editor_panes(
+    extensions: &BTreeMap<String, Value>,
+    pane_ids: &mut HashSet<String>,
+    pointer: &str,
+) -> StorageResult<()> {
+    let Some(value) = extensions.get(PROJECT_EDITOR_PANES_EXTENSION) else {
+        return Ok(());
+    };
+    let Value::Array(panes) = value else {
+        return Err(StorageError::invalid(
+            "The editor pane extension must be an array.",
+            pointer,
+        ));
+    };
+    for (index, pane) in panes.iter().enumerate() {
+        let pane_pointer = format!("{pointer}/{index}");
+        let Value::Object(pane) = pane else {
+            return Err(StorageError::invalid(
+                "An editor pane entry must be an object.",
+                pane_pointer,
+            ));
+        };
+        let id = required_pane_string(pane, "id", &pane_pointer, "editor")?;
+        validate_text(id, MAX_ID_BYTES, false, &format!("{pane_pointer}/id"))?;
+        if !pane_ids.insert(id.to_owned()) {
+            return Err(StorageError::invalid(
+                "Editor pane identifiers must be unique within a project.",
+                format!("{pane_pointer}/id"),
+            ));
+        }
+
+        let title = required_pane_string(pane, "title", &pane_pointer, "editor")?;
+        validate_text(
+            title,
+            MAX_EDITOR_PANE_TITLE_BYTES,
+            false,
+            &format!("{pane_pointer}/title"),
+        )?;
+
+        let path_pointer = format!("{pane_pointer}/pathSegments");
+        let Some(Value::Array(segments)) = pane.get("pathSegments") else {
+            return Err(StorageError::invalid(
+                "An editor pane path must be an array.",
+                path_pointer,
+            ));
+        };
+        if segments.is_empty() || segments.len() > MAX_EDITOR_PATH_DEPTH {
+            return Err(StorageError::invalid(
+                "An editor pane path has an invalid depth.",
+                path_pointer,
+            ));
+        }
+        for (segment_index, segment) in segments.iter().enumerate() {
+            let segment_pointer = format!("{path_pointer}/{segment_index}");
+            let Some(segment) = segment.as_str() else {
+                return Err(StorageError::invalid(
+                    "An editor pane path segment must be a string.",
+                    segment_pointer,
+                ));
+            };
+            validate_text(
+                segment,
+                MAX_EDITOR_PATH_SEGMENT_BYTES,
+                false,
+                &segment_pointer,
+            )?;
+            if segment == "."
+                || segment == ".."
+                || segment.ends_with([' ', '.'])
+                || segment.chars().any(|character| {
+                    character <= '\u{1f}'
+                        || character == '\u{7f}'
+                        || matches!(
+                            character,
+                            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'
+                        )
+                })
+            {
+                return Err(StorageError::invalid(
+                    "An editor pane path segment is invalid.",
+                    segment_pointer,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_project_pane_order(
     extensions: &BTreeMap<String, Value>,
     pane_ids: &HashSet<String>,
@@ -1783,9 +1889,18 @@ fn required_browser_pane_string<'a>(
     key: &str,
     pointer: &str,
 ) -> StorageResult<&'a str> {
+    required_pane_string(pane, key, pointer, "browser")
+}
+
+fn required_pane_string<'a>(
+    pane: &'a Map<String, Value>,
+    key: &str,
+    pointer: &str,
+    kind: &str,
+) -> StorageResult<&'a str> {
     pane.get(key).and_then(Value::as_str).ok_or_else(|| {
         StorageError::invalid(
-            "A browser pane field is missing or is not a string.",
+            &format!("A {kind} pane field is missing or is not a string."),
             format!("{pointer}/{key}"),
         )
     })
@@ -3104,6 +3219,82 @@ mod tests {
                 .unwrap()
                 .len(),
             21
+        );
+    }
+
+    #[test]
+    fn editor_panes_are_validated_owned_by_ui_and_participate_in_pane_order() {
+        let test = TestDirectory::new();
+        let store = test.open();
+        let mut initial = sample_state();
+        initial.projects[0].legacy_extensions.insert(
+            PROJECT_EDITOR_PANES_EXTENSION.to_owned(),
+            serde_json::json!([{
+                "id": "editor-one",
+                "title": "README.md",
+                "pathSegments": ["docs", "README.md"]
+            }]),
+        );
+        initial.projects[0].legacy_extensions.insert(
+            PROJECT_PANE_ORDER_EXTENSION.to_owned(),
+            serde_json::json!(["editor-one", "terminal-1"]),
+        );
+        save(&store, 0, initial);
+
+        let mut updated = sample_state();
+        updated.projects[0].legacy_extensions.insert(
+            PROJECT_EDITOR_PANES_EXTENSION.to_owned(),
+            serde_json::json!([{
+                "id": "editor-one",
+                "title": "lib.rs",
+                "pathSegments": ["src", "lib.rs"]
+            }]),
+        );
+        updated.projects[0].legacy_extensions.insert(
+            PROJECT_PANE_ORDER_EXTENSION.to_owned(),
+            serde_json::json!(["terminal-1", "editor-one"]),
+        );
+        save(&store, 1, updated);
+        let loaded = store.load().unwrap().snapshot.unwrap().state;
+        assert_eq!(
+            loaded.projects[0].legacy_extensions[PROJECT_EDITOR_PANES_EXTENSION][0]["pathSegments"],
+            serde_json::json!(["src", "lib.rs"])
+        );
+        assert_eq!(
+            loaded.projects[0].legacy_extensions[PROJECT_PANE_ORDER_EXTENSION],
+            serde_json::json!(["terminal-1", "editor-one"])
+        );
+
+        let mut invalid = sample_state();
+        invalid.projects[0].legacy_extensions.insert(
+            PROJECT_EDITOR_PANES_EXTENSION.to_owned(),
+            serde_json::json!([{
+                "id": "editor-one",
+                "title": "Secret",
+                "pathSegments": ["..", "secret.txt"]
+            }]),
+        );
+        let error = normalize_and_validate_state(&mut invalid).unwrap_err();
+        assert_eq!(error.code, StorageErrorCode::InvalidState);
+        assert_eq!(
+            error.json_pointer.as_deref(),
+            Some("/projects/0/legacyExtensions/editorPanesV1/0/pathSegments/0")
+        );
+
+        let mut conflicting = sample_state_with_auxiliary_panes();
+        conflicting.projects[0].legacy_extensions.insert(
+            PROJECT_EDITOR_PANES_EXTENSION.to_owned(),
+            serde_json::json!([{
+                "id": "browser-one",
+                "title": "Conflict",
+                "pathSegments": ["README.md"]
+            }]),
+        );
+        assert_eq!(
+            normalize_and_validate_state(&mut conflicting)
+                .unwrap_err()
+                .code,
+            StorageErrorCode::InvalidState
         );
     }
 

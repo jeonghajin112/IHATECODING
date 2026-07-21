@@ -19,6 +19,29 @@ const moduleUrl = `data:text/javascript;base64,${Buffer.from(
 ).toString("base64")}`;
 const media = await import(moduleUrl);
 
+const fileTypeBundle = await esbuild.build({
+  entryPoints: [fileURLToPath(new URL("../src/source-file-types.ts", import.meta.url))],
+  bundle: true,
+  format: "esm",
+  platform: "node",
+  target: ["node18"],
+  write: false,
+  logLevel: "silent",
+});
+const fileTypes = await import(`data:text/javascript;base64,${Buffer.from(
+  fileTypeBundle.outputFiles[0].contents,
+).toString("base64")}`);
+
+test("Markdown file detection is shared and case-insensitive", () => {
+  for (const extension of [".md", ".markdown", ".mdown", ".mkd", ".mdx"]) {
+    assert.equal(fileTypes.isMarkdownFileName(`notes${extension}`), true);
+    assert.equal(fileTypes.isMarkdownFileName(`NOTES${extension.toUpperCase()}`), true);
+    assert.equal(fileTypes.isMarkdownPath(["docs", `notes${extension}`]), true);
+  }
+  assert.equal(fileTypes.isMarkdownFileName("notes.txt"), false);
+  assert.equal(fileTypes.isMarkdownPath(["docs", "notes.md.exe"]), false);
+});
+
 test("media browser wire responses are bounded and normalized", () => {
   const grant = media.normalizeMediaRootGrant({
     grantId: "grant-1",
@@ -144,6 +167,30 @@ test("Ctrl+Space drawer is wired to secure media IPC and the active terminal att
   assert.match(drawer, /invoke<unknown>\("list_media_volumes"/);
   assert.match(drawer, /invoke<unknown>\("list_media_directory"/);
   assert.match(drawer, /invoke<unknown>\("resolve_media_files"/);
+  assert.match(
+    drawer,
+    /openMarkdownFile:\s*\(request:\s*MediaDrawerMarkdownOpenRequest\)\s*=>\s*Promise<boolean>/,
+  );
+  assert.match(
+    drawer,
+    /private async openMarkdownOrAttach[\s\S]*!isMarkdownFileName\(entry\.name\)[\s\S]*attachEntry\(entry\)[\s\S]*tryOpenMarkdownEntry\(entry\)[\s\S]*open_content_entry/,
+  );
+  assert.match(
+    drawer,
+    /private async tryOpenMarkdownEntry[\s\S]*isMarkdownFileName\(entry\.name\)[\s\S]*callbacks\.openMarkdownFile\(\{[\s\S]*grantId:\s*grant\.grantId[\s\S]*rootPath:\s*grant\.rootPath[\s\S]*name:\s*entry\.name[\s\S]*pathSegments:\s*\[\.\.\.entry\.pathSegments\]/,
+  );
+  assert.match(
+    drawer,
+    /private onGridDoubleClick[\s\S]*openMarkdownOrAttach\(entry\)/,
+  );
+  assert.match(
+    drawer,
+    /private onGridKeyDown[\s\S]*event\.key === "Enter"[\s\S]*openMarkdownOrAttach\(entry\)/,
+  );
+  assert.match(
+    drawer,
+    /action === "open"[\s\S]*tryOpenMarkdownEntry\(entry\)[\s\S]*open_content_entry/,
+  );
   assert.match(drawer, /Math\.hypot\([\s\S]*< 6/);
   assert.match(drawer, /setPointerCapture\(event\.pointerId\)/);
   assert.match(drawer, /document\.elementsFromPoint\(clientX, clientY\)[\s\S]*\.terminal-pane\[data-pane-id\]/);

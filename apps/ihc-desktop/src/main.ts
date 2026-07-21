@@ -35,16 +35,19 @@ import {
   isLoopbackBrowserUrl,
   localBrowserRetryDelayMs,
   projectBrowserPanes,
+  projectEditorPanes,
   projectPaneOrder,
   workspaceTerminalLaunchProfile,
   type PaneGeometry,
   type WorkspaceBrowserPane,
+  type WorkspaceEditorPane,
   type WorkspaceTerminalLaunchProfile,
 } from "./phase4-core";
 import {
   createPhase4WorkspaceController,
   type Phase4WorkspaceController,
 } from "./phase4-controller";
+import { SourceEditorPane } from "./source-editor-pane";
 import {
   formatProviderResetCountdown,
   formatDroppedFileReference,
@@ -226,7 +229,7 @@ type PhoneNotificationResult = {
   sent: boolean;
 };
 
-type AgentSettingsProvider = "codex" | "grok" | "claudeCode" | "openCode";
+type AgentSettingsProvider = "codex" | "grok" | "claudeCode" | "openCode" | "cursor";
 type AgentSettingsLaunchProfile = "codex" | "grok" | "claude" | "opencode";
 type AgentAuthenticationState =
   | "connected"
@@ -244,11 +247,11 @@ type AgentCliStatus = {
 
 type AgentConnectionRowElements = {
   provider: AgentSettingsProvider;
-  launchProfile: AgentSettingsLaunchProfile;
+  launchProfile: AgentSettingsLaunchProfile | null;
   root: HTMLElement;
   state: HTMLElement;
   account: HTMLElement;
-  button: HTMLButtonElement;
+  button: HTMLButtonElement | null;
 };
 
 type QueuedPhoneNotification = {
@@ -4875,7 +4878,7 @@ class BrowserPane {
   }
 }
 
-type LayoutPane = TerminalPane | BrowserPane;
+type LayoutPane = TerminalPane | BrowserPane | SourceEditorPane;
 
 type ActiveTerminalRow = {
   key: string;
@@ -4934,6 +4937,7 @@ type PaneResizeState = {
 class TerminalWorkspace {
   private readonly panes = new Map<string, TerminalPane>();
   private readonly browserPanes = new Map<string, BrowserPane>();
+  private readonly editorPanes = new Map<string, SourceEditorPane>();
   private readonly sessionOwners = new Map<string, string>();
   private readonly scheduler = new StartScheduler();
   private readonly restoredProjects = new Set<string>();
@@ -5059,6 +5063,10 @@ class TerminalWorkspace {
       title: string,
     ) => Promise<boolean>,
     private readonly onBrowserPaneClosedCallback: (
+      projectId: string,
+      paneId: string,
+    ) => Promise<boolean>,
+    private readonly onEditorPaneClosedCallback: (
       projectId: string,
       paneId: string,
     ) => Promise<boolean>,
@@ -5480,7 +5488,7 @@ class TerminalWorkspace {
     const selection = selectDroppedFilePaths(payload.paths);
     const target = this.layoutPaneAtNativeDropPosition(payload.position);
     this.clearNativeFileDropTarget();
-    if (!target || target instanceof BrowserPane) {
+    if (!(target instanceof TerminalPane)) {
       this.setFooterStatus(
         tr(
           "Drop the files over the PowerShell pane where you want to attach them.",
@@ -5537,7 +5545,7 @@ class TerminalWorkspace {
       return;
     }
     this.clearNativeFileDropTarget(false);
-    if (!pane || pane instanceof BrowserPane) return;
+    if (!(pane instanceof TerminalPane)) return;
     this.nativeFileDropTargetPaneId = pane.id;
     pane.setFileDropTarget(true, this.nativeFileDropCount);
   }
@@ -5649,6 +5657,42 @@ class TerminalWorkspace {
     return pane;
   }
 
+  addEditorPane(
+    projectId: string,
+    savedState: WorkspaceEditorPane,
+    focus = true,
+  ) {
+    if (this.disposed || projectId !== this.activeProjectId) return null;
+    const runtimeId = editorPaneRuntimeId(projectId, savedState.id);
+    const existing = this.editorPanes.get(runtimeId);
+    if (existing) {
+      if (focus) {
+        this.maximizedPaneId = null;
+        this.activatePane(existing.id, false);
+        this.updateLayout();
+      }
+      return existing;
+    }
+    const pane = new SourceEditorPane(this, projectId, savedState, runtimeId);
+    pane.setCatalogWritable(this.catalogWritable);
+    this.editorPanes.set(pane.id, pane);
+    const order = this.projectOrders.get(projectId) ?? [];
+    if (!order.includes(pane.id)) this.projectOrders.set(projectId, [...order, pane.id]);
+    this.inactivePaneBin.append(pane.element);
+    if (focus) {
+      this.maximizedPaneId = null;
+      this.activePaneId = pane.id;
+    }
+    this.updateLayout();
+    for (const visible of this.visiblePanes()) {
+      visible.setActive(focus && visible.id === pane.id);
+    }
+    pane.start();
+    if (focus) requestAnimationFrame(() => pane.focus());
+    this.renderActiveStatus();
+    return pane;
+  }
+
   restoreCapacity(
     project: WorkspaceProject,
     unloadingProjectId: string | null = null,
@@ -5661,7 +5705,9 @@ class TerminalWorkspace {
       this.restoredProjects.has(project.id) && project.id !== unloadingProjectId;
     const incoming = targetRemainsRestored
       ? 0
-      : project.terminals.length + projectBrowserPanes(project).length;
+      : project.terminals.length +
+        projectBrowserPanes(project).length +
+        projectEditorPanes(project).length;
     return evaluateWorkspaceRestoreCapacity(current, incoming);
   }
 
@@ -5745,6 +5791,7 @@ class TerminalWorkspace {
       ),
     );
     const savedBrowsers = projectBrowserPanes(project);
+    const savedEditors = projectEditorPanes(project);
     const persistentToRuntimeId = new Map<string, string>();
     for (const terminal of project.terminals) {
       persistentToRuntimeId.set(terminal.id, paneRuntimeId(project.id, terminal.id));
@@ -5752,14 +5799,21 @@ class TerminalWorkspace {
     for (const browser of savedBrowsers) {
       persistentToRuntimeId.set(browser.id, browserPaneRuntimeId(project.id, browser.id));
     }
+    for (const editor of savedEditors) {
+      persistentToRuntimeId.set(editor.id, editorPaneRuntimeId(project.id, editor.id));
+    }
     const orderedTerminals = project.terminals.map((terminal) =>
       paneRuntimeId(project.id, terminal.id),
     );
     const orderedBrowsers = savedBrowsers.map((browser) =>
       browserPaneRuntimeId(project.id, browser.id),
     );
+    const orderedEditors = savedEditors.map((editor) =>
+      editorPaneRuntimeId(project.id, editor.id),
+    );
     const terminalIds = new Set(orderedTerminals);
     const browserIds = new Set(orderedBrowsers);
+    const editorIds = new Set(orderedEditors);
     const ordered = projectPaneOrder(project)
       .map((persistentId) => persistentToRuntimeId.get(persistentId) ?? null)
       .filter((paneId): paneId is string => paneId !== null);
@@ -5795,9 +5849,20 @@ class TerminalWorkspace {
         if (existing) existing.setTitle(browser.title);
         else this.addBrowserPane(project.id, browser, false);
       }
+      for (const editor of savedEditors) {
+        const existing = this.editorPanes.get(editorPaneRuntimeId(project.id, editor.id));
+        if (!existing) this.addEditorPane(project.id, editor, false);
+      }
       for (const existing of [...this.browserPanes.values()]) {
         if (existing.projectId === project.id && !browserIds.has(existing.id)) {
           this.browserPanes.delete(existing.id);
+          existing.element.remove();
+          void existing.dispose();
+        }
+      }
+      for (const existing of [...this.editorPanes.values()]) {
+        if (existing.projectId === project.id && !editorIds.has(existing.id)) {
+          this.editorPanes.delete(existing.id);
           existing.element.remove();
           void existing.dispose();
         }
@@ -5886,6 +5951,19 @@ class TerminalWorkspace {
           return false;
         }
       }
+      for (const editor of projectEditorPanes(project)) {
+        if (!this.addEditorPane(project.id, editor, false)) {
+          void this.unloadProject(project.id);
+          this.setFooterStatus(
+            tr(
+              `Could not restore editor panes for ${project.name}.`,
+              `${project.name} 편집기 창 복원을 완료하지 못했습니다.`,
+            ),
+            "error",
+          );
+          return false;
+        }
+      }
       this.restoredProjects.add(project.id);
     }
 
@@ -5965,6 +6043,9 @@ class TerminalWorkspace {
     const browserTargets = [...this.browserPanes.values()].filter(
       (pane) => pane.projectId === projectId,
     );
+    const editorTargets = [...this.editorPanes.values()].filter(
+      (pane) => pane.projectId === projectId,
+    );
     for (const pane of targets) {
       this.onTerminalAgentWorkingChangedCallback(
         pane.projectId,
@@ -5976,6 +6057,10 @@ class TerminalWorkspace {
     }
     for (const pane of browserTargets) {
       this.browserPanes.delete(pane.id);
+      pane.element.remove();
+    }
+    for (const pane of editorTargets) {
+      this.editorPanes.delete(pane.id);
       pane.element.remove();
     }
     this.restoredProjects.delete(projectId);
@@ -5991,17 +6076,17 @@ class TerminalWorkspace {
     this.projectTerminalStates.delete(projectId);
     this.projectOrders.delete(projectId);
     this.projectRatios.delete(projectId);
-    if ([...targets, ...browserTargets].some((pane) => pane.id === this.maximizedPaneId)) {
+    if ([...targets, ...browserTargets, ...editorTargets].some((pane) => pane.id === this.maximizedPaneId)) {
       this.maximizedPaneId = null;
     }
     if (this.activeProjectId === projectId) {
       this.activeProjectId = null;
       this.activePaneId = null;
-    } else if ([...targets, ...browserTargets].some((pane) => pane.id === this.activePaneId)) {
+    } else if ([...targets, ...browserTargets, ...editorTargets].some((pane) => pane.id === this.activePaneId)) {
       this.activePaneId = null;
     }
     const stops = Promise.all([
-      ...[...targets, ...browserTargets].map((pane) => pane.dispose()),
+      ...[...targets, ...browserTargets, ...editorTargets].map((pane) => pane.dispose()),
       ...pendingAutoSleepStops,
     ]).then(() => undefined);
     const barrier = this.appendStopBarrier(stops);
@@ -6102,6 +6187,40 @@ class TerminalWorkspace {
     if (this.workspaceView === "terminals" && this.activePaneId) {
       requestAnimationFrame(() => this.layoutPane(this.activePaneId ?? "")?.focus());
     }
+  }
+
+  async closeEditorPane(paneId: string): Promise<boolean> {
+    if (!this.catalogWritable) return false;
+    const pane = this.editorPanes.get(paneId);
+    if (!pane) return false;
+    const orderedIds = this.visiblePanes().map((item) => item.id);
+    const removedIndex = orderedIds.indexOf(paneId);
+    const saved = await this.onEditorPaneClosedCallback(
+      pane.projectId,
+      pane.persistentId,
+    );
+    if (!saved || this.disposed || this.editorPanes.get(paneId) !== pane) return false;
+    this.editorPanes.delete(paneId);
+    if (this.maximizedPaneId === paneId) this.maximizedPaneId = null;
+    const order = this.projectOrders.get(pane.projectId) ?? [];
+    this.projectOrders.set(
+      pane.projectId,
+      order.filter((candidate) => candidate !== paneId),
+    );
+    pane.element.remove();
+    if (this.activePaneId === paneId) {
+      const remainingIds = this.visiblePanes().map((item) => item.id);
+      this.activePaneId =
+        remainingIds[Math.min(Math.max(0, removedIndex), remainingIds.length - 1)] ?? null;
+    }
+    for (const item of this.visiblePanes()) item.setActive(item.id === this.activePaneId);
+    this.updateLayout();
+    this.renderActiveStatus();
+    await pane.dispose();
+    if (this.workspaceView === "terminals" && this.activePaneId) {
+      requestAnimationFrame(() => this.layoutPane(this.activePaneId ?? "")?.focus());
+    }
+    return true;
   }
 
   activatePane(paneId: string, suppressFocus: boolean) {
@@ -6819,6 +6938,7 @@ class TerminalWorkspace {
     const pane = this.layoutPane(runtimeId);
     if (pane instanceof TerminalPane) return pane.terminalId;
     if (pane instanceof BrowserPane) return pane.persistentId;
+    if (pane instanceof SourceEditorPane) return pane.persistentId;
     for (const terminal of this.projectTerminalStates.get(projectId)?.values() ?? []) {
       if (paneRuntimeId(projectId, terminal.id) === runtimeId) {
         return terminal.id;
@@ -7016,6 +7136,7 @@ class TerminalWorkspace {
     ).then(() => undefined);
     this.panes.clear();
     this.browserPanes.clear();
+    this.editorPanes.clear();
     this.sessionOwners.clear();
     this.restoredProjects.clear();
     this.projectNames.clear();
@@ -7202,11 +7323,19 @@ class TerminalWorkspace {
   }
 
   private allPanes(): LayoutPane[] {
-    return [...this.panes.values(), ...this.browserPanes.values()];
+    return [
+      ...this.panes.values(),
+      ...this.browserPanes.values(),
+      ...this.editorPanes.values(),
+    ];
   }
 
   private layoutPane(paneId: string): LayoutPane | undefined {
-    return this.panes.get(paneId) ?? this.browserPanes.get(paneId);
+    return (
+      this.panes.get(paneId) ??
+      this.browserPanes.get(paneId) ??
+      this.editorPanes.get(paneId)
+    );
   }
 
   setNativeOverlayOpen(bounds: RectangleBounds | null) {
@@ -8604,7 +8733,7 @@ class AgentConnectionsController {
   ) {
     this.refreshButton.addEventListener("click", () => void this.refresh());
     for (const row of this.rows) {
-      row.button.addEventListener("click", () => void this.launch(row));
+      row.button?.addEventListener("click", () => void this.launch(row));
     }
     this.render();
   }
@@ -8642,12 +8771,13 @@ class AgentConnectionsController {
 
   private async launch(row: AgentConnectionRowElements) {
     const status = this.statuses?.get(row.provider);
-    if (this.disposed || this.launching || !status?.installed) return;
-    this.launching = row.launchProfile;
+    const launchProfile = row.launchProfile;
+    if (this.disposed || this.launching || !status?.installed || !launchProfile) return;
+    this.launching = launchProfile;
     this.lastError = null;
     this.render();
     try {
-      await this.openAgent(row.launchProfile);
+      await this.openAgent(launchProfile);
       if (!this.disposed) this.dialog.close();
     } catch (error) {
       if (this.disposed) return;
@@ -8672,18 +8802,20 @@ class AgentConnectionsController {
       row.state.textContent = this.agentStateLabel(status);
       row.account.textContent = this.agentAccountLabel(status);
 
-      const shouldConnect = status?.authState === "notAuthenticated";
-      const action = shouldConnect ? tr("Connect", "연결") : tr("Open", "열기");
-      row.button.textContent = action;
-      row.button.disabled =
-        this.refreshing || this.launching !== null || status === null || !installed;
-      row.button.setAttribute(
-        "aria-label",
-        tr(
-          `${action} ${agentProviderDisplayName(row.provider)} in the current project`,
-          `현재 프로젝트에서 ${agentProviderDisplayName(row.provider)} ${action}`,
-        ),
-      );
+      if (row.button) {
+        const shouldConnect = status?.authState === "notAuthenticated";
+        const action = shouldConnect ? tr("Connect", "연결") : tr("Open", "열기");
+        row.button.textContent = action;
+        row.button.disabled =
+          this.refreshing || this.launching !== null || status === null || !installed;
+        row.button.setAttribute(
+          "aria-label",
+          tr(
+            `${action} ${agentProviderDisplayName(row.provider)} in the current project`,
+            `현재 프로젝트에서 ${agentProviderDisplayName(row.provider)} ${action}`,
+          ),
+        );
+      }
     }
 
     this.statusElement.dataset.tone = this.lastError ? "error" : "normal";
@@ -9631,6 +9763,10 @@ function browserPaneRuntimeId(projectId: string, browserPaneId: string) {
   return `browser:${projectId.length}:${projectId}:${browserPaneId}`;
 }
 
+function editorPaneRuntimeId(projectId: string, editorPaneId: string) {
+  return `editor:${projectId.length}:${projectId}:${editorPaneId}`;
+}
+
 function agentLifecycleCorrelationKey(
   projectId: string,
   terminalId: string,
@@ -9824,6 +9960,7 @@ const AGENT_SETTINGS_PROVIDER_ORDER = [
   "grok",
   "claudeCode",
   "openCode",
+  "cursor",
 ] as const satisfies readonly AgentSettingsProvider[];
 
 function normalizeAgentCliStatuses(value: unknown): AgentCliStatus[] {
@@ -9897,6 +10034,8 @@ function agentProviderDisplayName(provider: AgentSettingsProvider) {
       return "Claude Code";
     case "openCode":
       return "OpenCode";
+    case "cursor":
+      return "Cursor";
   }
 }
 
@@ -9972,18 +10111,24 @@ function requireAgentConnectionRows(panel: HTMLElement): AgentConnectionRowEleme
     ["grok", "grok"],
     ["claudeCode", "claude"],
     ["openCode", "opencode"],
+    ["cursor", null],
   ] as const satisfies readonly (readonly [
     AgentSettingsProvider,
-    AgentSettingsLaunchProfile,
+    AgentSettingsLaunchProfile | null,
   ])[];
   return configurations.map(([provider, launchProfile]) => {
     const root = panel.querySelector<HTMLElement>(`[data-agent-provider="${provider}"]`);
     const state = root?.querySelector<HTMLElement>("[data-agent-state]");
     const account = root?.querySelector<HTMLElement>("[data-agent-account]");
-    const button = root?.querySelector<HTMLButtonElement>(
-      `[data-agent-connect="${launchProfile}"]`,
-    );
-    if (!root || !state || !account || !(button instanceof HTMLButtonElement)) {
+    const button = launchProfile
+      ? root?.querySelector<HTMLButtonElement>(`[data-agent-connect="${launchProfile}"]`) ?? null
+      : null;
+    if (
+      !root ||
+      !state ||
+      !account ||
+      (launchProfile !== null && !(button instanceof HTMLButtonElement))
+    ) {
       throw new Error(`Missing agent connection row for ${provider}`);
     }
     return { provider, launchProfile, root, state, account, button };
@@ -10247,6 +10392,8 @@ const workspace = new TerminalWorkspace(
     controller?.onPaneRenamed(projectId, paneId, title) ?? Promise.resolve(false),
   (projectId, paneId) =>
     controller?.onBrowserPaneClosed(projectId, paneId) ?? Promise.resolve(false),
+  (projectId, paneId) =>
+    controller?.onEditorPaneClosed(projectId, paneId) ?? Promise.resolve(false),
   (projectId, paneId, title) =>
     controller?.onBrowserPaneRenamed(projectId, paneId, title) ??
     Promise.resolve(false),
@@ -10439,6 +10586,8 @@ mediaDrawer = new MediaDrawer(
     previewDropTarget: (paneId) => workspace.setContentBrowserFileDropTarget(paneId),
     clearDropTarget: () => workspace.clearContentBrowserFileDropTarget(),
     attachFilesToPane: (paneId, paths) => workspace.attachFilesToPane(paneId, paths),
+    openMarkdownFile: ({ grantId, pathSegments }) =>
+      controller?.openContentBrowserMarkdownFile(grantId, pathSegments) ?? Promise.resolve(false),
     restoreFocus: () => workspace.focusActivePane(),
   },
 );

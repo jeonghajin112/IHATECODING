@@ -23,6 +23,9 @@ const AUTH_FILE_MAX_BYTES: usize = 128 * 1024;
 const CLAUDE_STDOUT_MAX_BYTES: usize = 64 * 1024;
 const CLAUDE_AUTH_TIMEOUT: Duration = Duration::from_secs(3);
 const CLAUDE_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const CURSOR_STDOUT_MAX_BYTES: usize = 64 * 1024;
+const CURSOR_STATUS_TIMEOUT: Duration = Duration::from_secs(3);
+const CURSOR_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const EMAIL_MAX_BYTES: usize = 254;
 const COMMAND_EXTENSIONS: [&str; 4] = ["exe", "cmd", "ps1", "bat"];
 
@@ -36,6 +39,8 @@ pub(crate) enum AgentCliProvider {
     ClaudeCode,
     #[serde(rename = "openCode")]
     OpenCode,
+    #[serde(rename = "cursor")]
+    Cursor,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -82,6 +87,15 @@ enum ClaudeAuthProbe {
     Unknown,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum CursorAuthProbe {
+    Known {
+        logged_in: bool,
+        email: Option<String>,
+    },
+    Unknown,
+}
+
 #[derive(Debug)]
 enum AuthFileRead {
     Missing,
@@ -104,6 +118,7 @@ pub(crate) fn read_agent_cli_statuses() -> AgentCliStatusesResponse {
     let grok_installation = discover_cli("grok", path.as_deref());
     let claude_installation = discover_cli("claude", path.as_deref());
     let opencode_installation = discover_cli("opencode", path.as_deref());
+    let cursor_installation = discover_cursor_cli(path.as_deref());
 
     let codex_authenticated = crate::provider_usage::read_provider_account("codex")
         .ok()
@@ -123,6 +138,12 @@ pub(crate) fn read_agent_cli_statuses() -> AgentCliStatusesResponse {
 
     let (opencode_status, credential_count) =
         read_opencode_auth_status(&default_opencode_auth_paths());
+    let cursor_auth = cursor_installation
+        .direct_exe
+        .as_deref()
+        .map(run_cursor_auth_status)
+        .unwrap_or(CursorAuthProbe::Unknown);
+    let (cursor_status, cursor_email) = cursor_status_from_probe(cursor_auth);
 
     AgentCliStatusesResponse {
         agents: vec![
@@ -162,14 +183,37 @@ pub(crate) fn read_agent_cli_statuses() -> AgentCliStatusesResponse {
                 email: None,
                 credential_count,
             },
+            AgentCliStatus {
+                provider: AgentCliProvider::Cursor,
+                installed: cursor_installation.installed,
+                status: cursor_status,
+                email: cursor_email,
+                credential_count: None,
+            },
         ],
     }
 }
 
+/// Cursor renamed its CLI entrypoint to `agent` in January 2026 while keeping
+/// `cursor-agent` as a compatibility alias. Never probe the `cursor` command:
+/// that belongs to the desktop editor rather than Cursor Agent CLI.
+fn discover_cursor_cli(path: Option<&OsStr>) -> CliInstallation {
+    let mut primary = discover_cli("agent", path);
+    if primary.installed {
+        // A PATH shim can make the primary entrypoint discoverable without a
+        // directly executable .exe. In that case an installed compatibility
+        // alias may still be used for the bounded, non-interactive status probe.
+        if primary.direct_exe.is_none() {
+            primary.direct_exe = discover_cli("cursor-agent", path).direct_exe;
+        }
+        return primary;
+    }
+    discover_cli("cursor-agent", path)
+}
+
 fn discover_cli(command: &str, path: Option<&OsStr>) -> CliInstallation {
-    let mut result = CliInstallation::default();
     let Some(path) = path else {
-        return result;
+        return CliInstallation::default();
     };
 
     for directory in env::split_paths(path).filter(|directory| directory.is_absolute()) {
@@ -178,13 +222,16 @@ fn discover_cli(command: &str, path: Option<&OsStr>) -> CliInstallation {
             if !is_regular_non_reparse_file(&candidate) {
                 continue;
             }
-            result.installed = true;
-            if extension == "exe" && result.direct_exe.is_none() {
-                result.direct_exe = Some(candidate);
-            }
+            // Match normal PATH resolution: once a command is found in an
+            // earlier directory, never substitute a same-named executable
+            // from a later directory for a privileged status probe.
+            return CliInstallation {
+                installed: true,
+                direct_exe: (extension == "exe").then_some(candidate),
+            };
         }
     }
-    result
+    CliInstallation::default()
 }
 
 fn is_regular_non_reparse_file(path: &Path) -> bool {
@@ -289,6 +336,169 @@ fn run_claude_auth_status(executable: &Path) -> ClaudeAuthProbe {
             email: None,
         },
         _ => ClaudeAuthProbe::Unknown,
+    }
+}
+
+fn run_cursor_auth_status(executable: &Path) -> CursorAuthProbe {
+    if !is_regular_non_reparse_file(executable)
+        || !executable
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"))
+    {
+        return CursorAuthProbe::Unknown;
+    }
+
+    let mut command = Command::new(executable);
+    command
+        .arg("status")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW);
+
+    let Ok(mut child) = command.spawn() else {
+        return CursorAuthProbe::Unknown;
+    };
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return CursorAuthProbe::Unknown;
+    };
+    let (output_sender, output_receiver) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = stdout
+            .take((CURSOR_STDOUT_MAX_BYTES + 1) as u64)
+            .read_to_end(&mut bytes);
+        let parsed =
+            if result.is_ok() && !bytes.is_empty() && bytes.len() <= CURSOR_STDOUT_MAX_BYTES {
+                parse_cursor_auth_output(&bytes)
+            } else {
+                CursorAuthProbe::Unknown
+            };
+        bytes.fill(0);
+        let _ = output_sender.send(parsed);
+    });
+
+    let started = Instant::now();
+    let exit_status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if started.elapsed() < CURSOR_STATUS_TIMEOUT => {
+                thread::sleep(CURSOR_POLL_INTERVAL);
+            }
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+
+    let Some(exit_status) = exit_status else {
+        return CursorAuthProbe::Unknown;
+    };
+    let remaining = CURSOR_STATUS_TIMEOUT.saturating_sub(started.elapsed());
+    let Ok(parsed) = output_receiver.recv_timeout(remaining) else {
+        return CursorAuthProbe::Unknown;
+    };
+    match (exit_status, parsed) {
+        (
+            status,
+            CursorAuthProbe::Known {
+                logged_in: true,
+                email,
+            },
+        ) if status.success() => CursorAuthProbe::Known {
+            logged_in: true,
+            email,
+        },
+        (
+            _,
+            CursorAuthProbe::Known {
+                logged_in: false, ..
+            },
+        ) => CursorAuthProbe::Known {
+            logged_in: false,
+            email: None,
+        },
+        _ => CursorAuthProbe::Unknown,
+    }
+}
+
+fn parse_cursor_auth_output(bytes: &[u8]) -> CursorAuthProbe {
+    let Ok(output) = std::str::from_utf8(bytes) else {
+        return CursorAuthProbe::Unknown;
+    };
+    let normalized = output.to_ascii_lowercase();
+    if [
+        "not logged in",
+        "not authenticated",
+        "unauthenticated",
+        "authentication required",
+        "sign-in required",
+        "signin required",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
+    {
+        return CursorAuthProbe::Known {
+            logged_in: false,
+            email: None,
+        };
+    }
+    if ["login successful", "logged in", "authenticated"]
+        .iter()
+        .any(|marker| normalized.contains(marker))
+    {
+        return CursorAuthProbe::Known {
+            logged_in: true,
+            email: cursor_status_email(output),
+        };
+    }
+    CursorAuthProbe::Unknown
+}
+
+fn cursor_status_email(output: &str) -> Option<String> {
+    let without_ansi = strip_ansi_csi_sequences(output);
+    without_ansi.split_whitespace().find_map(|token| {
+        let candidate = token.trim_matches(|character: char| !character.is_ascii_alphanumeric());
+        candidate
+            .contains('@')
+            .then(|| sanitize_email(candidate))
+            .flatten()
+    })
+}
+
+fn strip_ansi_csi_sequences(value: &str) -> String {
+    let mut result = String::with_capacity(value.len());
+    let mut characters = value.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character != '\u{1b}' || characters.peek() != Some(&'[') {
+            result.push(character);
+            continue;
+        }
+        let _ = characters.next();
+        for sequence_character in characters.by_ref() {
+            if ('@'..='~').contains(&sequence_character) {
+                break;
+            }
+        }
+    }
+    result
+}
+
+fn cursor_status_from_probe(probe: CursorAuthProbe) -> (AgentCliConnectionStatus, Option<String>) {
+    match probe {
+        CursorAuthProbe::Known {
+            logged_in: true,
+            email,
+        } => (AgentCliConnectionStatus::Connected, email),
+        CursorAuthProbe::Known {
+            logged_in: false, ..
+        } => (AgentCliConnectionStatus::NotAuthenticated, None),
+        CursorAuthProbe::Unknown => (AgentCliConnectionStatus::Unknown, None),
     }
 }
 
@@ -501,6 +711,13 @@ mod tests {
                     email: None,
                     credential_count: Some(2),
                 },
+                AgentCliStatus {
+                    provider: AgentCliProvider::Cursor,
+                    installed: true,
+                    status: AgentCliConnectionStatus::Connected,
+                    email: Some("cursor@example.com".to_owned()),
+                    credential_count: None,
+                },
             ],
         };
         let value = serde_json::to_value(response).unwrap();
@@ -511,6 +728,9 @@ mod tests {
         assert_eq!(value["agents"][3]["provider"], "openCode");
         assert_eq!(value["agents"][3]["status"], "unknown");
         assert_eq!(value["agents"][3]["credentialCount"], 2);
+        assert_eq!(value["agents"][4]["provider"], "cursor");
+        assert_eq!(value["agents"][4]["status"], "connected");
+        assert_eq!(value["agents"][4]["email"], "cursor@example.com");
         assert!(value["agents"][0].get("email").is_none());
     }
 
@@ -547,6 +767,69 @@ mod tests {
         let installation = discover_cli("claude", Some(OsStr::new("relative-bin")));
         assert!(!installation.installed);
         assert!(installation.direct_exe.is_none());
+    }
+
+    #[test]
+    fn cursor_prefers_agent_then_falls_back_to_cursor_agent_without_using_cursor() {
+        let primary_directory = tempfile::tempdir().unwrap();
+        let alias_directory = tempfile::tempdir().unwrap();
+        let primary = primary_directory.path().join("agent.exe");
+        let alias = alias_directory.path().join("cursor-agent.exe");
+        fs::write(&primary, b"not executed by this test").unwrap();
+        fs::write(&alias, b"not executed by this test").unwrap();
+        let joined = env::join_paths([alias_directory.path(), primary_directory.path()]).unwrap();
+
+        let installation = discover_cursor_cli(Some(&joined));
+        assert!(installation.installed);
+        assert_eq!(installation.direct_exe.as_deref(), Some(primary.as_path()));
+
+        fs::remove_file(&primary).unwrap();
+        let fallback = discover_cursor_cli(Some(&joined));
+        assert!(fallback.installed);
+        assert_eq!(fallback.direct_exe.as_deref(), Some(alias.as_path()));
+
+        fs::remove_file(&alias).unwrap();
+        fs::write(
+            primary_directory.path().join("cursor.exe"),
+            b"desktop editor",
+        )
+        .unwrap();
+        let desktop_only = discover_cursor_cli(Some(&joined));
+        assert!(!desktop_only.installed);
+        assert!(desktop_only.direct_exe.is_none());
+    }
+
+    #[test]
+    fn cursor_primary_shim_can_use_alias_exe_for_the_bounded_status_probe() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("agent.cmd"), b"primary shim").unwrap();
+        let alias = directory.path().join("cursor-agent.exe");
+        fs::write(&alias, b"not executed by this test").unwrap();
+        let joined = env::join_paths([directory.path()]).unwrap();
+
+        let installation = discover_cursor_cli(Some(&joined));
+        assert!(installation.installed);
+        assert_eq!(installation.direct_exe.as_deref(), Some(alias.as_path()));
+    }
+
+    #[test]
+    fn cursor_primary_shim_never_substitutes_a_later_agent_exe() {
+        let shim_directory = tempfile::tempdir().unwrap();
+        let later_directory = tempfile::tempdir().unwrap();
+        fs::write(shim_directory.path().join("agent.cmd"), b"primary shim").unwrap();
+        let unrelated_agent = later_directory.path().join("agent.exe");
+        let alias = later_directory.path().join("cursor-agent.exe");
+        fs::write(&unrelated_agent, b"must never execute").unwrap();
+        fs::write(&alias, b"safe compatibility alias").unwrap();
+        let joined = env::join_paths([shim_directory.path(), later_directory.path()]).unwrap();
+
+        let installation = discover_cursor_cli(Some(&joined));
+        assert!(installation.installed);
+        assert_eq!(installation.direct_exe.as_deref(), Some(alias.as_path()));
+        assert_ne!(
+            installation.direct_exe.as_deref(),
+            Some(unrelated_agent.as_path())
+        );
     }
 
     #[test]
@@ -595,6 +878,71 @@ mod tests {
         );
         assert_eq!(
             claude_status_from_probe(ClaudeAuthProbe::Unknown),
+            (AgentCliConnectionStatus::Unknown, None)
+        );
+    }
+
+    #[test]
+    fn cursor_status_parser_distinguishes_login_and_keeps_only_a_sanitized_email() {
+        assert_eq!(
+            parse_cursor_auth_output(
+                b"\xe2\x9c\x93 Login successful!\nLogged in as user@example.com\n"
+            ),
+            CursorAuthProbe::Known {
+                logged_in: true,
+                email: Some("user@example.com".to_owned())
+            }
+        );
+        assert_eq!(
+            parse_cursor_auth_output(
+                b"Login successful!\nLogged in as \x1b[32muser@example.com\x1b[0m\n"
+            ),
+            CursorAuthProbe::Known {
+                logged_in: true,
+                email: Some("user@example.com".to_owned())
+            }
+        );
+        assert_eq!(
+            parse_cursor_auth_output(b"Not logged in\nRun agent login to continue."),
+            CursorAuthProbe::Known {
+                logged_in: false,
+                email: None
+            }
+        );
+        assert_eq!(
+            parse_cursor_auth_output(b"Unauthenticated. Run agent login to continue."),
+            CursorAuthProbe::Known {
+                logged_in: false,
+                email: None
+            }
+        );
+        assert_eq!(
+            parse_cursor_auth_output(b"status endpoint: https://api.cursor.sh"),
+            CursorAuthProbe::Unknown
+        );
+    }
+
+    #[test]
+    fn cursor_probe_maps_to_the_expected_connection_states() {
+        assert_eq!(
+            cursor_status_from_probe(CursorAuthProbe::Known {
+                logged_in: true,
+                email: Some("user@example.com".to_owned())
+            }),
+            (
+                AgentCliConnectionStatus::Connected,
+                Some("user@example.com".to_owned())
+            )
+        );
+        assert_eq!(
+            cursor_status_from_probe(CursorAuthProbe::Known {
+                logged_in: false,
+                email: Some("ignored@example.com".to_owned())
+            }),
+            (AgentCliConnectionStatus::NotAuthenticated, None)
+        );
+        assert_eq!(
+            cursor_status_from_probe(CursorAuthProbe::Unknown),
             (AgentCliConnectionStatus::Unknown, None)
         );
     }

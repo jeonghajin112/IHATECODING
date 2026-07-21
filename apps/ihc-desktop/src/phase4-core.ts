@@ -15,6 +15,7 @@ export const DEFAULT_MIN_PANE_WIDTH_PX = 160;
 export const DEFAULT_INSERTION_HYSTERESIS_PX = 14;
 export const DEFAULT_SNAP_DISTANCE_PX = 8;
 export const PROJECT_BROWSER_PANES_EXTENSION = "browserPanesV1";
+export const PROJECT_EDITOR_PANES_EXTENSION = "editorPanesV1";
 export const PROJECT_PANE_ORDER_EXTENSION = "paneOrderV1";
 export const TERMINAL_LAUNCH_PROFILE_EXTENSION = "launchProfileV1";
 export const LOCAL_BROWSER_RETRY_WINDOW_MS = 5 * 60 * 1_000;
@@ -24,12 +25,22 @@ const LOCAL_BROWSER_RETRY_TAIL_MS = 15_000;
 
 const MAX_BROWSER_PANE_TITLE_LENGTH = 80;
 const MAX_BROWSER_PANE_URL_BYTES = 16 * 1024;
+const MAX_EDITOR_PANE_TITLE_LENGTH = 160;
+const MAX_EDITOR_PATH_DEPTH = 64;
+const MAX_EDITOR_PATH_SEGMENT_LENGTH = 255;
 
 export type WorkspaceBrowserPane = {
   [key: string]: unknown;
   id: string;
   title: string;
   url: string;
+};
+
+export type WorkspaceEditorPane = {
+  [key: string]: unknown;
+  id: string;
+  title: string;
+  pathSegments: string[];
 };
 
 export type WorkspaceTerminalLaunchProfile =
@@ -436,7 +447,8 @@ export function appendProjectPane(
   const project = requireProject(next, projectId);
   if (
     project.terminals.some((item) => item.id === pane.id) ||
-    projectBrowserPanes(project).some((item) => item.id === pane.id)
+    projectBrowserPanes(project).some((item) => item.id === pane.id) ||
+    projectEditorPanes(project).some((item) => item.id === pane.id)
   ) {
     throw new Error("The pane identifier is already in use.");
   }
@@ -501,7 +513,8 @@ export function appendProjectBrowserPane(
   const normalized = createWorkspaceBrowserPane(pane.id, pane.title, pane.url);
   if (
     project.terminals.some((item) => item.id === normalized.id) ||
-    browsers.some((item) => item.id === normalized.id)
+    browsers.some((item) => item.id === normalized.id) ||
+    projectEditorPanes(project).some((item) => item.id === normalized.id)
   ) {
     throw new Error("The pane identifier is already in use.");
   }
@@ -552,6 +565,111 @@ export function setProjectBrowserPaneUrl(
   return updateProjectBrowserPane(state, projectId, paneId, (pane) => {
     pane.url = normalizePersistedBrowserPaneUrl(url);
   }, modifiedAtUtc);
+}
+
+/**
+ * Persist lightweight text/Markdown editors beside browser panes without
+ * changing schema-v1. Only the project-relative identity is stored; file
+ * contents remain in the project and are re-read through the guarded backend.
+ */
+export function projectEditorPanes(project: WorkspaceProject): WorkspaceEditorPane[] {
+  const source = project.legacyExtensions[PROJECT_EDITOR_PANES_EXTENSION];
+  if (!Array.isArray(source)) return [];
+  const panes: WorkspaceEditorPane[] = [];
+  const ids = new Set([
+    ...project.terminals.map((terminal) => terminal.id),
+    ...projectBrowserPanes(project).map((pane) => pane.id),
+  ]);
+  for (const entry of source) {
+    if (!isRecord(entry)) continue;
+    try {
+      const id = String(entry.id ?? "");
+      assertOpaqueLocalId(id, "editor pane");
+      if (ids.has(id)) continue;
+      const pathSegments = normalizeEditorPathSegments(entry.pathSegments);
+      const title = normalizeEditorPaneTitle(
+        String(entry.title ?? pathSegments[pathSegments.length - 1] ?? ""),
+      );
+      ids.add(id);
+      panes.push({ ...structuredClone(entry), id, title, pathSegments });
+    } catch {
+      // Invalid opaque editor state must not prevent the project from opening.
+    }
+  }
+  return panes;
+}
+
+export function createWorkspaceEditorPane(
+  id: string,
+  pathSegments: readonly string[],
+  title = pathSegments[pathSegments.length - 1] ?? "File",
+): WorkspaceEditorPane {
+  assertOpaqueLocalId(id, "editor pane");
+  return {
+    id,
+    title: normalizeEditorPaneTitle(title),
+    pathSegments: normalizeEditorPathSegments(pathSegments),
+  };
+}
+
+export function appendProjectEditorPane(
+  state: WorkspaceState,
+  projectId: string,
+  pane: WorkspaceEditorPane,
+  modifiedAtUtc = new Date().toISOString(),
+): WorkspaceState {
+  const next = editableClone(state);
+  const project = requireProject(next, projectId);
+  const editors = projectEditorPanes(project);
+  const normalized = createWorkspaceEditorPane(pane.id, pane.pathSegments, pane.title);
+  if (
+    project.terminals.some((item) => item.id === normalized.id) ||
+    projectBrowserPanes(project).some((item) => item.id === normalized.id) ||
+    editors.some((item) => item.id === normalized.id)
+  ) {
+    throw new Error("The pane identifier is already in use.");
+  }
+  editors.push({ ...structuredClone(pane), ...normalized });
+  project.legacyExtensions[PROJECT_EDITOR_PANES_EXTENSION] = editors;
+  repairPersistedPaneOrder(project);
+  project.lastModifiedAtUtc = modifiedAtUtc;
+  return normalizeWorkspaceState(next);
+}
+
+export function removeProjectEditorPane(
+  state: WorkspaceState,
+  projectId: string,
+  paneId: string,
+  modifiedAtUtc = new Date().toISOString(),
+): WorkspaceState {
+  const next = editableClone(state);
+  const project = requireProject(next, projectId);
+  const editors = projectEditorPanes(project);
+  const index = editors.findIndex((pane) => pane.id === paneId);
+  if (index < 0) throw new Error("The requested editor pane does not exist.");
+  editors.splice(index, 1);
+  project.legacyExtensions[PROJECT_EDITOR_PANES_EXTENSION] = editors;
+  repairPersistedPaneOrder(project);
+  project.lastModifiedAtUtc = modifiedAtUtc;
+  return normalizeWorkspaceState(next);
+}
+
+export function sameProjectEditorPath(
+  pane: WorkspaceEditorPane,
+  pathSegments: readonly string[],
+): boolean {
+  let normalized: string[];
+  try {
+    normalized = normalizeEditorPathSegments(pathSegments);
+  } catch {
+    return false;
+  }
+  return (
+    pane.pathSegments.length === normalized.length &&
+    pane.pathSegments.every(
+      (segment, index) => segment.localeCompare(normalized[index], undefined, { sensitivity: "accent" }) === 0,
+    )
+  );
 }
 
 /**
@@ -1280,6 +1398,7 @@ function canonicalProjectPaneIds(project: WorkspaceProject): string[] {
   return [
     ...project.terminals.map((terminal) => terminal.id),
     ...projectBrowserPanes(project).map((pane) => pane.id),
+    ...projectEditorPanes(project).map((pane) => pane.id),
   ];
 }
 
@@ -1319,6 +1438,36 @@ function normalizePersistedBrowserPaneUrl(value: string): string {
     throw new Error("The browser pane URL is not allowed for restore.");
   }
   return parsed.href;
+}
+
+function normalizeEditorPaneTitle(value: string): string {
+  const normalized = value.trim();
+  if (!normalized) throw new Error("An editor pane title cannot be empty.");
+  if (normalized.length > MAX_EDITOR_PANE_TITLE_LENGTH) {
+    throw new Error(`An editor pane title cannot exceed ${MAX_EDITOR_PANE_TITLE_LENGTH} characters.`);
+  }
+  return normalized;
+}
+
+function normalizeEditorPathSegments(value: unknown): string[] {
+  if (!Array.isArray(value) || value.length === 0 || value.length > MAX_EDITOR_PATH_DEPTH) {
+    throw new Error("An editor pane path is invalid.");
+  }
+  return value.map((entry) => {
+    if (
+      typeof entry !== "string" ||
+      entry.length === 0 ||
+      entry.length > MAX_EDITOR_PATH_SEGMENT_LENGTH ||
+      entry === "." ||
+      entry === ".." ||
+      entry.endsWith(" ") ||
+      entry.endsWith(".") ||
+      /[<>:"/\\|?*\u0000-\u001f\u007f]/u.test(entry)
+    ) {
+      throw new Error("An editor pane path is invalid.");
+    }
+    return entry;
+  });
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

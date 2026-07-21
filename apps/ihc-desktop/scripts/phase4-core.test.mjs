@@ -531,7 +531,48 @@ test("browser pane restore ignores malformed entries and persists sixty-four mix
   );
 });
 
-test("terminal and browser panes reject identifiers used by another pane type", () => {
+test("editor panes persist project-relative paths and deduplicate files case-insensitively", () => {
+  const source = workspace();
+  const before = structuredClone(source);
+  const editor = core.createWorkspaceEditorPane(
+    "editor-one",
+    ["docs", "README.md"],
+    " README.md ",
+  );
+
+  let state = core.appendProjectEditorPane(source, "project-a", editor);
+  assert.deepEqual(source, before);
+  assert.deepEqual(core.projectEditorPanes(state.projects[0]), [
+    {
+      id: "editor-one",
+      title: "README.md",
+      pathSegments: ["docs", "README.md"],
+    },
+  ]);
+  assert.equal(
+    core.sameProjectEditorPath(
+      core.projectEditorPanes(state.projects[0])[0],
+      ["DOCS", "readme.md"],
+    ),
+    true,
+  );
+  assert.equal(
+    core.sameProjectEditorPath(
+      core.projectEditorPanes(state.projects[0])[0],
+      ["docs", "other.md"],
+    ),
+    false,
+  );
+
+  state = core.removeProjectEditorPane(state, "project-a", "editor-one");
+  assert.deepEqual(core.projectEditorPanes(state.projects[0]), []);
+  assert.throws(
+    () => core.createWorkspaceEditorPane("bad", ["..", "secret.txt"]),
+    /path is invalid/,
+  );
+});
+
+test("terminal, browser, and editor panes reject identifiers used by another pane type", () => {
   let state = workspace();
   state = core.appendProjectBrowserPane(
     state,
@@ -552,6 +593,24 @@ test("terminal and browser panes reject identifiers used by another pane type", 
       ),
     /identifier is already in use/,
   );
+  state = core.appendProjectEditorPane(
+    state,
+    "project-a",
+    core.createWorkspaceEditorPane("editor-one", ["src", "main.ts"]),
+  );
+  assert.throws(
+    () => core.appendProjectPane(state, "project-a", pane("editor-one")),
+    /identifier is already in use/,
+  );
+  assert.throws(
+    () =>
+      core.appendProjectEditorPane(
+        state,
+        "project-a",
+        core.createWorkspaceEditorPane("browser-one", ["README.md"]),
+      ),
+    /identifier is already in use/,
+  );
 });
 
 test("mixed pane order repairs stale data and persists only an exact current permutation", () => {
@@ -560,6 +619,11 @@ test("mixed pane order repairs stale data and persists only an exact current per
     state,
     "project-a",
     core.createWorkspaceBrowserPane("browser-one"),
+  );
+  state = core.appendProjectEditorPane(
+    state,
+    "project-a",
+    core.createWorkspaceEditorPane("editor-one", ["README.md"]),
   );
   state.projects[0].legacyExtensions.paneOrderV1 = [
     "browser-one",
@@ -573,9 +637,10 @@ test("mixed pane order repairs stale data and persists only an exact current per
     "pane-b",
     "pane-a",
     "pane-c",
+    "editor-one",
   ]);
 
-  const requested = ["browser-one", "pane-c", "pane-a", "pane-b"];
+  const requested = ["editor-one", "browser-one", "pane-c", "pane-a", "pane-b"];
   const before = structuredClone(state);
   const ordered = core.setProjectPaneOrder(
     state,
@@ -589,9 +654,9 @@ test("mixed pane order repairs stale data and persists only an exact current per
   assert.equal(ordered.projects[0].lastModifiedAtUtc, "2026-07-20T01:00:00Z");
 
   for (const invalid of [
-    ["browser-one", "pane-c", "pane-a"],
-    ["browser-one", "pane-c", "pane-a", "pane-a"],
-    ["browser-one", "pane-c", "pane-a", "unknown"],
+    ["editor-one", "browser-one", "pane-c", "pane-a"],
+    ["editor-one", "browser-one", "pane-c", "pane-a", "pane-a"],
+    ["editor-one", "browser-one", "pane-c", "pane-a", "unknown"],
   ]) {
     assert.throws(
       () => core.setProjectPaneOrder(ordered, "project-a", invalid),
@@ -608,12 +673,14 @@ test("mixed pane order repairs stale data and persists only an exact current per
 
   changed = core.removeProjectBrowserPane(changed, "project-a", "browser-one");
   assert.deepEqual(core.projectPaneOrder(changed.projects[0]), [
+    "editor-one",
     "pane-c",
     "pane-a",
     "pane-b",
     "pane-new",
   ]);
   assert.deepEqual(changed.projects[0].legacyExtensions.paneOrderV1, [
+    "editor-one",
     "pane-c",
     "pane-a",
     "pane-b",
@@ -627,6 +694,7 @@ test("mixed pane order repairs stale data and persists only an exact current per
   );
   changed = core.removeProjectPane(changed, "project-a", "pane-new");
   assert.deepEqual(changed.projects[0].legacyExtensions.paneOrderV1, [
+    "editor-one",
     "pane-c",
     "pane-a",
     "pane-b",

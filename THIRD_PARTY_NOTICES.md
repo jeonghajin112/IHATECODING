@@ -35,6 +35,16 @@ respective owners.
 - Changes: simplified an equivalent luminance mask and renamed the clip-path ID;
   the visible vector geometry and colors are unchanged.
 
+## Cursor icon
+
+- Source: `brand-logo-8.svg` from the official
+  [Cursor brand guidelines](https://cursor.com/brand)
+- Copyright: Anysphere, Inc. All rights reserved.
+- Local file: `apps/ihc-desktop/src/assets/provider-icons/cursor.svg`
+- Changes: cropped the official 2D dark app icon to its square mark and removed
+  the surrounding presentation canvas; the visible mark geometry and colors are
+  unchanged.
+
 ## Codex and Grok marks
 
 The Codex and Grok SVG paths were already embedded in the IHATECODING status bar
