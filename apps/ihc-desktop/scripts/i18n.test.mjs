@@ -96,7 +96,7 @@ test("static application chrome has paired English and Korean translations", () 
 test("settings wire immediate language and optimization changes with separate notification controls", () => {
   assert.match(mainSource, /languageSelect\.addEventListener\("change"[\s\S]*setAppLanguage\(language\)/);
   assert.match(mainSource, /autoSleepIdleAgentsInput\.addEventListener\("change"[\s\S]*setAutoSleepIdleAgents\(enabled\)/);
-  assert.match(mainSource, /\["general", this\.generalTab, this\.generalPanel\][\s\S]*\["optimization", this\.optimizationTab, this\.optimizationPanel\][\s\S]*\["notifications", this\.notificationsTab, this\.notificationsPanel\]/);
+  assert.match(mainSource, /\["general", this\.generalTab, this\.generalPanel\][\s\S]*\["optimization", this\.optimizationTab, this\.optimizationPanel\][\s\S]*\["agents", this\.agentsTab, this\.agentsPanel\][\s\S]*\["notifications", this\.notificationsTab, this\.notificationsPanel\]/);
   assert.match(mainSource, /testButton\.hidden = !notificationsActive[\s\S]*saveButton\.hidden = !notificationsActive/);
   assert.match(mainSource, /language:\s*getAppLanguage\(\)/);
 });
@@ -118,5 +118,19 @@ test("backend error text follows the selected application language", async () =>
   assert.equal(
     korean.localizeBackendMessage("선택한 계정을 찾지 못했습니다."),
     "선택한 계정을 찾지 못했습니다.",
+  );
+  assert.equal(
+    korean.localizeBackendMessage(
+      "A file or folder with that project name already exists in Documents.",
+    ),
+    "문서 폴더에 같은 프로젝트 이름의 파일이나 폴더가 이미 있습니다.",
+  );
+  assert.equal(
+    korean.localizeBackendMessage("The media preview could not be authorized."),
+    "미디어 미리보기 접근을 허용하지 못했습니다.",
+  );
+  assert.equal(
+    korean.localizeBackendMessage("The selected file could not be deleted."),
+    "선택한 파일을 삭제하지 못했습니다.",
   );
 });

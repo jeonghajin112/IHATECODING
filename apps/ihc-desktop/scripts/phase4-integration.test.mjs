@@ -18,7 +18,7 @@ test("the packaged runtime is wired only to the canonical Phase 4 controller", a
   assert.match(controller, /commit_phase3_preview_upgrade/);
 });
 
-test("new projects use the native single-folder picker with narrow capability", async () => {
+test("existing folders use the picker while scratch projects create a Documents child folder", async () => {
   const [html, main, controller, styles, cargo, capabilities, rust] = await Promise.all([
     source("index.html"),
     source("src/main.ts"),
@@ -29,11 +29,54 @@ test("new projects use the native single-folder picker with narrow capability", 
     source("src-tauri/src/lib.rs"),
   ]);
   assert.match(html, /id="project-path"[\s\S]*readonly/);
+  assert.match(html, /id="project-path-field"[\s\S]*id="project-path"/);
   assert.match(html, /id="select-project-folder"[\s\S]*data-i18n-en="Choose folder"[\s\S]*Choose folder/);
   assert.match(main, /requireButton\("select-project-folder"\)/);
   assert.match(controller, /open\(\{[\s\S]*directory:\s*true,[\s\S]*multiple:\s*false/);
   assert.match(controller, /projectFolderPickerPending[\s\S]*finally/);
-  assert.match(controller, /if \(!this\.elements\.projectName\.value\.trim\(\)\)/);
+  assert.match(
+    controller,
+    /private async openExistingFolderProject\(\)[\s\S]*pickProjectFolder\(defaultPath, false\)[\s\S]*openProjectDialog\(selected, "existing"\)/,
+  );
+  assert.match(
+    controller,
+    /openProjectDialog\(null, "scratch"\)[\s\S]*projectDialogMode = mode[\s\S]*const scratch = mode === "scratch"[\s\S]*projectPathField\.hidden = scratch/,
+  );
+  assert.match(
+    controller,
+    /projectPath\.required = !scratch/,
+  );
+  const createProject = controller.slice(
+    controller.indexOf("private async createProject"),
+    controller.indexOf("async addTerminal", controller.indexOf("private async createProject")),
+  );
+  assert.match(
+    createProject,
+    /projectDialogMode === "scratch"[\s\S]*invoke<string>\("create_documents_project_directory"[\s\S]*projectName[\s\S]*createWorkspaceProject/,
+  );
+  assert.match(
+    createProject,
+    /enqueueOperation\(async \(\) =>[\s\S]*const current = this\.currentState\(\)[\s\S]*create_documents_project_directory[\s\S]*persistNow/,
+  );
+  assert.match(
+    createProject,
+    /rollbackScratchProjectDirectory[\s\S]*remove_empty_documents_project_directory/,
+  );
+  assert.match(
+    createProject,
+    /validateWorkspaceProjectDraft\(projectName, this\.elements\.projectPath\.value\)[\s\S]*createWorkspaceProject/,
+  );
+  assert.match(rust, /fn create_documents_project_directory\([\s\S]*document_dir\(\)/);
+  assert.match(
+    rust,
+    /generate_handler!\[[\s\S]*create_documents_project_directory/,
+  );
+  assert.match(rust, /fn create_documents_project_directory_in\(/);
+  assert.match(rust, /fn remove_empty_documents_project_directory_in\(/);
+  assert.match(
+    rust,
+    /generate_handler!\[[\s\S]*remove_empty_documents_project_directory/,
+  );
   assert.match(styles, /\.project-path-row\s*\{[\s\S]*grid-template-columns/);
   assert.match(cargo, /tauri-plugin-dialog\s*=\s*"2"/);
   assert.match(capabilities, /"dialog:allow-open"/);
@@ -106,6 +149,18 @@ test("project browser panes restore their saved title and last accepted address"
     /const saved = await this\.workspace\.updateBrowserPaneUrl\(this\.id, url\)/,
   );
   assert.match(main, /start\(\) \{[\s\S]*this\.navigate\(this\.address\.value, false\)/);
+  assert.match(
+    core,
+    /isLoopbackBrowserUrl[\s\S]*hostname === "localhost"[\s\S]*Number\(octets\[0\]\) === 127/,
+  );
+  assert.match(
+    main,
+    /replaceWebview\(url: string\)[\s\S]*isLoopbackBrowserUrl\(url\)[\s\S]*invoke<boolean>\("probe_loopback_browser_endpoint", \{ url \}\)[\s\S]*scheduleLocalBrowserRetry\(request\)/,
+  );
+  assert.match(
+    main,
+    /setLayoutVisible\(visible: boolean\)[\s\S]*clearLocalRetryTimer\(\)[\s\S]*scheduleLocalBrowserRetry\(this\.localRetryRequest, 0\)/,
+  );
   assert.match(
     main,
     /for \(const browser of projectBrowserPanes\(project\)\)[\s\S]*this\.addBrowserPane\(project\.id, browser, false\)/,
@@ -188,15 +243,18 @@ test("project browser panes restore their saved title and last accepted address"
   );
   assert.match(
     backend,
-    /read_provider_usage,[\s\S]*read_browser_webview_url,[\s\S]*watch_browser_webview_url,/,
+    /async fn probe_loopback_browser_endpoint[\s\S]*ensure_agent_main_webview[\s\S]*spawn_blocking[\s\S]*probe_loopback_browser_addresses/,
   );
+  assert.match(backend, /probe_loopback_browser_endpoint,/);
 });
 
 test("pane title editing opens immediately and survives transient catalog writes", async () => {
   const main = await source("src/main.ts");
   const terminalStart = main.indexOf("class TerminalPane {");
   const browserStart = main.indexOf("class BrowserPane {");
-  const layoutPaneStart = main.indexOf("type LayoutPane = TerminalPane | BrowserPane;");
+  const layoutPaneStart = main.indexOf(
+    "type LayoutPane = TerminalPane | BrowserPane | SourceEditorPane;",
+  );
   assert.ok(terminalStart >= 0 && browserStart > terminalStart);
   assert.ok(layoutPaneStart > browserStart);
 
@@ -342,21 +400,49 @@ test("pane restore has no fixed count gate while user mutations remain writable-
 });
 
 test("manual tabs, compact project creation, and the mixed pane launcher are wired", async () => {
-  const [html, main, controller, styles, cargo, capability] = await Promise.all([
+  const [html, main, controller, styles, cargo, capability, build] = await Promise.all([
     source("index.html"),
     source("src/main.ts"),
     source("src/phase4-controller.ts"),
     source("src/styles.css"),
     source("src-tauri/Cargo.toml"),
     source("src-tauri/capabilities/default.json"),
+    source("scripts/build.mjs"),
   ]);
 
   assert.doesNotMatch(html, /id="project-count"/);
   assert.match(
     html,
-    /class="project-section-heading"[\s\S]*id="toggle-project-list"[\s\S]*aria-controls="project-list"[\s\S]*id="create-project"[\s\S]*id="project-list"/,
+    /id="project-sidebar"[\s\S]*class="sidebar-brand"[\s\S]*aria-label="IHATECODING"[\s\S]*src="\/assets\/app-icon\.png"[\s\S]*id="toggle-project-sidebar"[\s\S]*aria-controls="project-sidebar"[\s\S]*class="project-section-heading"[\s\S]*id="project-list"/,
   );
-  assert.match(html, /id="pane-launcher-menu"[\s\S]*id="add-powershell-pane"[\s\S]*id="add-browser-pane"/);
+  assert.match(
+    html,
+    /id="create-project"[\s\S]*aria-haspopup="menu"[\s\S]*aria-controls="project-create-menu"[\s\S]*aria-expanded="false"[\s\S]*id="project-create-menu"[\s\S]*role="menu"[\s\S]*id="use-existing-project-folder"[\s\S]*data-i18n-ko="기존 폴더 사용"[\s\S]*id="start-project-from-scratch"[\s\S]*data-i18n-ko="처음부터 시작"/,
+  );
+  assert.match(
+    build,
+    /src-tauri\/icons\/32x32\.png[\s\S]*dist\/assets\/app-icon\.png/,
+  );
+  assert.match(
+    html,
+    /id="pane-launcher-menu"[\s\S]*id="add-powershell-pane"[\s\S]*id="add-codex-pane"[\s\S]*id="add-grok-pane"[\s\S]*id="add-claude-code-pane"[\s\S]*id="add-opencode-pane"[\s\S]*id="add-browser-pane"/,
+  );
+  const launcherStart = html.indexOf('id="pane-launcher-menu"');
+  const launcherEnd = html.indexOf("</div>", launcherStart);
+  assert.ok(launcherStart >= 0 && launcherEnd > launcherStart);
+  const launcher = html.slice(launcherStart, launcherEnd);
+  assert.doesNotMatch(
+    launcher,
+    /<small|AI coding CLI|AI 코딩 CLI|New terminal|새 터미널|Split pane|분할 화면/,
+  );
+  for (const icon of ["powershell", "codex", "grok", "claude-code", "opencode", "browser"]) {
+    assert.match(
+      html,
+      new RegExp(`class="pane-launcher-icon"[\\s\\S]*?src="/assets/provider-icons/${icon}\\.svg"`),
+    );
+  }
+  assert.match(controller, /onPaneOrderChanged\([\s\S]*setProjectPaneOrder/);
+  assert.match(main, /type LayoutPane = TerminalPane \| BrowserPane/);
   assert.match(styles, /\.create-project\s*\{[\s\S]*width:\s*27px;[\s\S]*height:\s*27px/);
   assert.match(styles, /\.project-list-toggle\[aria-expanded="false"\] \.project-list-chevron/);
   assert.match(
@@ -382,7 +468,14 @@ test("manual tabs, compact project creation, and the mixed pane launcher are wir
   assert.doesNotMatch(controller, /for \(const project of state\.projects\)/);
   assert.match(
     styles,
-    /\.project-sidebar\s*\{[\s\S]*grid-template:[\s\S]*"projects" minmax\(0, 1fr\)[\s\S]*"footer" auto \/ minmax\(0, 1fr\);[\s\S]*height:\s*100%;[\s\S]*overflow:\s*hidden;/,
+    /\.project-sidebar\s*\{[\s\S]*grid-template:[\s\S]*"brand"[\s\S]*"projects" minmax\(0, 1fr\)[\s\S]*"footer" auto \/ minmax\(0, 1fr\);[\s\S]*height:\s*100%;[\s\S]*overflow:\s*hidden;/,
+  );
+  assert.match(styles, /\.sidebar-brand\s*\{[\s\S]*grid-area:\s*brand;/);
+  assert.match(styles, /\.sidebar-brand-identity\s*\{[\s\S]*align-items:\s*center;/);
+  assert.match(styles, /\.sidebar-collapse-toggle\s*\{/);
+  assert.match(
+    styles,
+    /\.shell\[data-sidebar-collapsed="true"\][\s\S]*grid-template-columns:[\s\S]*\.sidebar-brand-identity[\s\S]*display:\s*none;/,
   );
   assert.match(styles, /\.project-list\s*\{[\s\S]*grid-area:\s*projects;/);
   assert.match(styles, /\.sidebar-footer\s*\{[\s\S]*grid-area:\s*footer;/);
@@ -439,15 +532,178 @@ test("manual tabs, compact project creation, and the mixed pane launcher are wir
     /private setProjectListExpanded\(expanded: boolean\)[\s\S]*?projectList\.hidden = !expanded;[\s\S]*?setAttribute\("aria-expanded", String\(expanded\)\)/,
   );
   assert.match(controller, /setProjectListExpanded\(!expanded\)/);
+  assert.match(
+    controller,
+    /createProjectButton\.addEventListener\([\s\S]*setProjectCreateMenuOpen\(elements\.projectCreateMenu\.hidden\)/,
+  );
+  assert.match(
+    controller,
+    /useExistingProjectFolderButton\.addEventListener\([\s\S]*openExistingFolderProject\(\)[\s\S]*startProjectFromScratchButton\.addEventListener\([\s\S]*openProjectDialog\(null, "scratch"\)/,
+  );
+  assert.match(
+    controller,
+    /private setProjectCreateMenuOpen\(open: boolean[\s\S]*projectCreateMenu\.hidden = !allowed[\s\S]*createProjectButton\.setAttribute\("aria-expanded", String\(allowed\)\)/,
+  );
+  assert.match(
+    controller,
+    /private async openExistingFolderProject\(\)[\s\S]*pickProjectFolder\(defaultPath, false\)[\s\S]*findWorkspaceProjectByFolder[\s\S]*openProjectDialog\(selected, "existing"\)/,
+  );
+  assert.match(
+    styles,
+    /\.project-create-menu-root\s*\{[\s\S]*position:\s*relative;[\s\S]*\.project-create-menu\s*\{[\s\S]*position:\s*absolute;/,
+  );
   assert.doesNotMatch(controller, /button\.title\s*=\s*project\.folderPath/);
   assert.doesNotMatch(controller, /folder\.textContent\s*=\s*project\.folderPath/);
   const sidebar = controller.slice(
     controller.indexOf("private renderSidebar()"),
     controller.indexOf("private onTabKeyDown", controller.indexOf("private renderSidebar()")),
   );
-  assert.match(sidebar, /button\.append\(name\)/);
+  assert.match(sidebar, /openButton\.append\(name\)/);
   assert.doesNotMatch(sidebar, /folderPath|createElement\("small"\)/);
+  assert.match(
+    sidebar,
+    /createElement\("div"\)[\s\S]*className = "project-item"[\s\S]*className = "project-item-open"/,
+  );
+  assert.match(
+    sidebar,
+    /className = "project-item-menu-root"[\s\S]*createProjectMenuToggle\(menuLabel, menuId\)[\s\S]*className = "project-item-menu"[\s\S]*setAttribute\("role", "menu"\)[\s\S]*createProjectMenuItem\([\s\S]*"edit"[\s\S]*createProjectMenuItem\([\s\S]*"delete"/,
+  );
+  assert.match(sidebar, /menuToggle\.textContent = "…"|createProjectMenuToggle/);
+  assert.match(
+    sidebar,
+    /menuToggle\.addEventListener\("click"[\s\S]*closeProjectItemMenus\(\)[\s\S]*dataset\.menuOpen = "true"[\s\S]*menu\.hidden = false[\s\S]*setAttribute\("aria-expanded", "true"\)/,
+  );
+  assert.match(
+    sidebar,
+    /editButton\.addEventListener\("click"[\s\S]*closeProjectItemMenus\(\)[\s\S]*openProjectRenameDialog\(project\.id, menuToggle\)[\s\S]*deleteButton\.addEventListener\("click"[\s\S]*openProjectDeleteDialog\(project\.id, menuToggle\)/,
+  );
+  assert.doesNotMatch(sidebar, /project-name-editor|finishEditing|data\.editing|\beditor\b/);
+  assert.match(sidebar, /item\.append\(openButton, menuRoot\)/);
+  assert.match(
+    styles,
+    /\.project-item\[data-enabled="true"\]:hover \.project-item-menu-root,[\s\S]*\.project-item\[data-enabled="true"\]:focus-within \.project-item-menu-root[\s\S]*opacity:\s*1;[\s\S]*visibility:\s*visible;/,
+  );
+  assert.doesNotMatch(styles, /\.project-item\[data-editing="true"\]/);
+  assert.match(styles, /\.project-item-menu\s*\{[\s\S]*position:\s*absolute;/);
+  assert.match(styles, /\.project-item-menu-entry\s*\{/);
+  assert.match(
+    html,
+    /id="project-rename-dialog"[\s\S]*aria-labelledby="project-rename-title"[\s\S]*id="project-rename-form"[\s\S]*id="project-rename-name"[\s\S]*maxlength="50"[\s\S]*id="project-rename-error"[\s\S]*id="cancel-project-rename"[\s\S]*id="confirm-project-rename"/,
+  );
+  assert.match(
+    main,
+    /requireDialog\("project-rename-dialog"\)[\s\S]*requireForm\("project-rename-form"\)[\s\S]*requireInput\("project-rename-name"\)[\s\S]*requireElement\("project-rename-error"\)[\s\S]*requireButton\("cancel-project-rename"\)[\s\S]*requireButton\("confirm-project-rename"\)/,
+  );
+  const renameDialog = controller.slice(
+    controller.indexOf("private openProjectRenameDialog"),
+    controller.indexOf("private async deleteProject"),
+  );
+  assert.match(
+    renameDialog,
+    /pendingProjectRenameId = projectId[\s\S]*pendingProjectRenameTrigger = trigger[\s\S]*projectRenameName\.value = project\.name[\s\S]*setModalOverlayOpen\("project-rename", true\)[\s\S]*projectRenameDialog\.showModal\(\)[\s\S]*projectRenameName\.select\(\)/,
+  );
+  const submitRename = renameDialog.slice(
+    renameDialog.indexOf("private async submitProjectRename"),
+    renameDialog.indexOf("private async renameProject"),
+  );
+  assert.match(
+    submitRename,
+    /validateWorkspaceProjectName[\s\S]*this\.renameProject[\s\S]*projectRenameDialog\.close\(\)[\s\S]*projectRenameError\.textContent = errorMessage\(error\)/,
+  );
+  const renameProject = renameDialog.slice(renameDialog.indexOf("private async renameProject"));
+  assert.match(renameProject, /renameWorkspaceProject[\s\S]*this\.persist[\s\S]*runtime\.syncProject/);
+  assert.match(
+    controller,
+    /projectRenameForm\.addEventListener\([\s\S]*"submit"[\s\S]*event\.preventDefault\(\)[\s\S]*submitProjectRename\(\)/,
+  );
+  assert.match(
+    controller,
+    /projectRenameDialog\.addEventListener\([\s\S]*"close"[\s\S]*pendingProjectRenameId = null[\s\S]*pendingProjectRenameTrigger = null[\s\S]*setModalOverlayOpen\("project-rename", false\)[\s\S]*trigger\?\.isConnected[\s\S]*trigger\.focus\(\)/,
+  );
+  const deleteProject = controller.slice(
+    controller.indexOf("private async deleteProject"),
+    controller.indexOf("private openProjectDeleteDialog"),
+  );
+  assert.match(
+    deleteProject,
+    /removeWorkspaceProject[\s\S]*this\.persist[\s\S]*runtime\.unloadProject[\s\S]*clearProject/,
+  );
+  assert.doesNotMatch(deleteProject, /window\.confirm/);
+  const deleteDialog = controller.slice(
+    controller.indexOf("private openProjectDeleteDialog"),
+    controller.indexOf("private async openProject"),
+  );
+  assert.match(
+    deleteDialog,
+    /projectDeleteMessage\.textContent = tr[\s\S]*setModalOverlayOpen\("project-delete", true\)[\s\S]*projectDeleteDialog\.showModal\(\)[\s\S]*cancelProjectDeleteButton\.focus\(\)/,
+  );
+  assert.match(
+    controller,
+    /confirmProjectDeleteButton\.addEventListener\([\s\S]*pendingProjectDeleteId[\s\S]*projectDeleteDialog\.close\(\)[\s\S]*this\.deleteProject\(projectId\)/,
+  );
+  assert.match(
+    controller,
+    /projectDeleteDialog\.addEventListener\([\s\S]*pendingProjectDeleteTrigger[\s\S]*setModalOverlayOpen\("project-delete", false\)[\s\S]*trigger\?\.isConnected[\s\S]*trigger\.focus\(\)/,
+  );
+  assert.match(
+    html,
+    /id="project-delete-dialog"[\s\S]*aria-labelledby="project-delete-title"[\s\S]*id="project-delete-message"[\s\S]*id="project-delete-safety"[\s\S]*id="cancel-project-delete"[\s\S]*id="confirm-project-delete"/,
+  );
+  assert.match(
+    main,
+    /requireDialog\("project-delete-dialog"\)[\s\S]*requireElement\("project-delete-message"\)[\s\S]*requireButton\("cancel-project-delete"\)[\s\S]*requireButton\("confirm-project-delete"\)/,
+  );
+  assert.match(
+    main,
+    /PROJECT_SIDEBAR_COLLAPSED_KEY[\s\S]*localStorage\.getItem\(PROJECT_SIDEBAR_COLLAPSED_KEY\)[\s\S]*function renderProjectSidebarState\(\)[\s\S]*app\.dataset\.sidebarCollapsed[\s\S]*aria-expanded[\s\S]*localStorage\.setItem\(PROJECT_SIDEBAR_COLLAPSED_KEY/,
+  );
+  assert.match(
+    main,
+    /subscribeAppLanguage\([\s\S]*controller\?\.refreshLocalizedUi\(\)[\s\S]*renderProjectSidebarState\(\)/,
+  );
+  assert.match(
+    controller,
+    /element\.setAttribute\("aria-grabbed", "false"\)[\s\S]*element\.draggable = false[\s\S]*element\.dataset\.reorderable = String\(enabled\)[\s\S]*addEventListener\("pointerdown", \(event\) => this\.onTabPointerDown/,
+  );
+  assert.match(
+    controller,
+    /tabList\.addEventListener\("pointermove"[\s\S]*tabList\.addEventListener\("pointerup"[\s\S]*tabList\.addEventListener\("pointercancel"[\s\S]*"lostpointercapture"/,
+  );
+  assert.match(
+    controller,
+    /close\.draggable = false[\s\S]*close\.addEventListener\("pointerdown", \(event\) => \{[\s\S]*event\.stopPropagation\(\)/,
+  );
+  assert.match(
+    controller,
+    /refreshLocalizedUi\(\): void[\s\S]*this\.renderTabs\(\)[\s\S]*this\.renderSidebar\(\)[\s\S]*this\.setProjectListExpanded/,
+  );
+  assert.match(
+    controller,
+    /private onTabPointerDown\(event: PointerEvent, tabId: string\)[\s\S]*element\.setPointerCapture\(event\.pointerId\)[\s\S]*private onTabPointerMove\(event: PointerEvent\)[\s\S]*crossedPointerReorderThreshold\([\s\S]*horizontalReorderTarget\([\s\S]*private async onTabPointerUp\(event: PointerEvent\)[\s\S]*moveWorkspaceTabBefore\(state, draggedTabId, beforeTabId\)[\s\S]*await this\.persist\([\s\S]*this\.renderAndActivate\(\)/,
+  );
+  assert.match(
+    controller,
+    /private onTabPointerCancel\(event: PointerEvent\)[\s\S]*private onTabPointerCaptureLost\(event: PointerEvent\)[\s\S]*releasePointerCapture\(pointer\.pointerId\)/,
+  );
+  assert.match(
+    styles,
+    /\.workspace-tab\[data-reorderable="true"\]\s*\{[\s\S]*cursor:\s*grab;[\s\S]*touch-action:\s*none;/,
+  );
+  assert.match(
+    styles,
+    /\.workspace-tab\[data-dragging="true"\]\s*\{[\s\S]*transform:\s*translateX\(var\(--reorder-offset-x, 0\)\)/,
+  );
+  assert.match(styles, /\.workspace-tab\[data-drop-position="before"\]\s*\{/);
+  assert.match(styles, /\.workspace-tab\[data-drop-position="after"\]\s*\{/);
   assert.match(main, /class PaneLauncherController/);
+  assert.match(main, /controller\?\.addTerminal\("codex"\)/);
+  assert.match(main, /controller\?\.addTerminal\("grok"\)/);
+  assert.match(main, /controller\?\.addTerminal\("claude"\)/);
+  assert.match(main, /controller\?\.addTerminal\("opencode"\)/);
+  assert.match(
+    controller,
+    /async addTerminal\([\s\S]*launchProfile[\s\S]*createWorkspaceTerminal\([\s\S]*nextWorkspacePaneName\(project, launchProfile\)[\s\S]*launchProfile/,
+  );
   assert.match(main, /class BrowserPane[\s\S]*new Webview\(getCurrentWindow\(\), label/);
   assert.match(
     cargo,
@@ -464,16 +720,18 @@ test("manual tabs, compact project creation, and the mixed pane launcher are wir
   );
 });
 
-test("settings expose localized General, Optimization, and Notifications tabs", async () => {
-  const [html, styles] = await Promise.all([
+test("settings expose localized General, Optimization, Agents, and Notifications tabs", async () => {
+  const [html, styles, main, agentCliStatus] = await Promise.all([
     source("index.html"),
     source("src/styles.css"),
+    source("src/main.ts"),
+    source("src-tauri/src/agent_cli_status.rs"),
   ]);
 
   assert.match(html, /<html lang="en">/);
   assert.match(
     html,
-    /class="settings-tabs"[\s\S]*role="tablist"[\s\S]*id="settings-general-tab"[\s\S]*aria-controls="settings-general-panel"[\s\S]*aria-selected="true"[\s\S]*id="settings-optimization-tab"[\s\S]*aria-controls="settings-optimization-panel"[\s\S]*aria-selected="false"[\s\S]*id="settings-notifications-tab"[\s\S]*aria-controls="settings-notifications-panel"[\s\S]*aria-selected="false"/,
+    /class="settings-tabs"[\s\S]*role="tablist"[\s\S]*id="settings-general-tab"[\s\S]*aria-controls="settings-general-panel"[\s\S]*aria-selected="true"[\s\S]*id="settings-optimization-tab"[\s\S]*aria-controls="settings-optimization-panel"[\s\S]*aria-selected="false"[\s\S]*id="settings-agents-tab"[\s\S]*aria-controls="settings-agents-panel"[\s\S]*aria-selected="false"[\s\S]*id="settings-notifications-tab"[\s\S]*aria-controls="settings-notifications-panel"[\s\S]*aria-selected="false"/,
   );
   assert.match(
     html,
@@ -487,6 +745,18 @@ test("settings expose localized General, Optimization, and Notifications tabs", 
     html,
     /id="auto-sleep-idle-agents"[\s\S]*role="switch"[\s\S]*class="settings-switch-track"[\s\S]*class="settings-switch-thumb"/,
   );
+  assert.match(
+    html,
+    /id="settings-agents-panel"[\s\S]*aria-labelledby="settings-agents-tab"[\s\S]*aria-busy="false"[\s\S]*id="refresh-agent-connections"[\s\S]*data-agent-provider="codex"[\s\S]*data-agent-provider="grok"[\s\S]*data-agent-provider="claudeCode"[\s\S]*data-agent-provider="openCode"[\s\S]*data-agent-provider="cursor"/,
+  );
+  for (const icon of ["codex", "grok", "claude-code", "opencode", "cursor"]) {
+    assert.match(html, new RegExp(`src="/assets/provider-icons/${icon}\\.svg"`));
+  }
+  assert.match(html, /data-agent-provider="cursor"[\s\S]*data-agent-status-only="true"/);
+  assert.match(agentCliStatus, /discover_cli\("agent", path\)/);
+  assert.match(agentCliStatus, /discover_cli\("cursor-agent", path\)/);
+  assert.doesNotMatch(agentCliStatus, /discover_cli\("cursor", path\)/);
+  assert.match(agentCliStatus, /\.arg\("status"\)/);
   assert.match(
     html,
     /id="settings-notifications-panel"[\s\S]*role="tabpanel"[\s\S]*aria-labelledby="settings-notifications-tab"[\s\S]*hidden[\s\S]*id="discord-notification-settings-title"[\s\S]*id="phone-notification-webhook"/,
@@ -515,12 +785,31 @@ test("settings expose localized General, Optimization, and Notifications tabs", 
   assert.match(styles, /\.settings-panel\[hidden\]\s*\{[\s\S]*display:\s*none/);
   assert.match(
     styles,
+    /\.agent-connection-row\s*\{[\s\S]*grid-template-columns:[\s\S]*\.agent-connections-status\[data-tone="error"\]/,
+  );
+  assert.match(
+    styles,
     /\.settings-switch-track\s*\{[\s\S]*border-radius:\s*999px[\s\S]*\.settings-switch > input:checked \+ \.settings-switch-track[\s\S]*\.settings-switch-thumb[\s\S]*transform:\s*translateX\(14px\)/,
   );
   assert.match(
     styles,
     /@media \(max-width:\s*620px\)[\s\S]*\.settings-layout\s*\{[\s\S]*grid-template-columns:\s*minmax\(0, 1fr\)/,
   );
+  assert.match(main, /invoke<unknown>\("read_agent_cli_statuses"\)/);
+  assert.match(
+    main,
+    /const generation = \+\+this\.requestGeneration;[\s\S]*generation !== this\.requestGeneration/,
+  );
+  assert.match(
+    main,
+    /typeof candidate\.installed !== "boolean"[\s\S]*!isAgentAuthenticationState\(candidate\.status\)[\s\S]*statuses\.has\(candidate\.provider\)/,
+  );
+  assert.match(main, /this\.panel\.setAttribute\("aria-busy", String\(this\.refreshing\)\)/);
+  assert.match(
+    main,
+    /await this\.openAgent\(launchProfile\);[\s\S]*this\.dialog\.close\(\)/,
+  );
+  assert.match(main, /controller\.addTerminal\(launchProfile\)/);
 });
 
 test("queued starts dynamically favor the project currently on screen", async () => {

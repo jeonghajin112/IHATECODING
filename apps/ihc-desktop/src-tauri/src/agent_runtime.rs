@@ -39,6 +39,17 @@ pub(crate) enum AgentProvider {
     Grok,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum TerminalLaunchProfile {
+    #[default]
+    Powershell,
+    Codex,
+    Grok,
+    Claude,
+    Opencode,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct StableTerminalKey {
@@ -58,6 +69,20 @@ impl StableTerminalKey {
 pub(crate) struct AgentResumeBinding {
     pub(crate) provider: AgentProvider,
     pub(crate) conversation_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct TerminalLaunchRequest {
+    pub(crate) terminal_key: Option<StableTerminalKey>,
+    pub(crate) resume: Option<AgentResumeBinding>,
+    pub(crate) launch_profile: Option<TerminalLaunchProfile>,
+    #[serde(default = "default_use_embedded_browser_tools")]
+    pub(crate) use_embedded_browser_tools: bool,
+}
+
+fn default_use_embedded_browser_tools() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -99,13 +124,17 @@ pub(crate) struct TerminalLaunchPlan {
     arguments: Vec<String>,
     terminal_key: Option<StableTerminalKey>,
     binding: Option<ValidatedAgentBinding>,
+    use_embedded_browser_tools: bool,
 }
 
 impl TerminalLaunchPlan {
-    pub(crate) fn from_request(
-        terminal_key: Option<StableTerminalKey>,
-        resume: Option<AgentResumeBinding>,
-    ) -> Result<Self, String> {
+    pub(crate) fn from_request(request: TerminalLaunchRequest) -> Result<Self, String> {
+        let TerminalLaunchRequest {
+            terminal_key,
+            resume,
+            launch_profile,
+            use_embedded_browser_tools,
+        } = request;
         if let Some(key) = &terminal_key {
             key.validate()?;
         }
@@ -119,12 +148,22 @@ impl TerminalLaunchPlan {
         let mut arguments = vec!["-NoLogo".to_owned(), "-NoExit".to_owned()];
         if let Some(binding) = &binding {
             arguments.push("-EncodedCommand".to_owned());
-            arguments.push(encode_powershell(resume_script(binding)));
+            arguments.push(encode_powershell(resume_script(
+                binding,
+                use_embedded_browser_tools,
+            )));
+        } else if let Some(script) = launch_script(
+            launch_profile.unwrap_or_default(),
+            use_embedded_browser_tools,
+        ) {
+            arguments.push("-EncodedCommand".to_owned());
+            arguments.push(encode_powershell(script));
         }
         Ok(Self {
             arguments,
             terminal_key,
             binding,
+            use_embedded_browser_tools,
         })
     }
 
@@ -135,18 +174,61 @@ impl TerminalLaunchPlan {
     pub(crate) fn ownership(&self) -> Option<(&StableTerminalKey, &ValidatedAgentBinding)> {
         self.terminal_key.as_ref().zip(self.binding.as_ref())
     }
+
+    pub(crate) fn browser_tool_scope(&self) -> Option<&StableTerminalKey> {
+        self.use_embedded_browser_tools
+            .then_some(self.terminal_key.as_ref())
+            .flatten()
+    }
 }
 
-fn resume_script(binding: &ValidatedAgentBinding) -> String {
+fn launch_script(
+    profile: TerminalLaunchProfile,
+    use_embedded_browser_tools: bool,
+) -> Option<String> {
+    let bootstrap = use_embedded_browser_tools
+        .then(browser_tools_powershell_bootstrap)
+        .unwrap_or_default();
+    let command = match profile {
+        TerminalLaunchProfile::Powershell => return (!bootstrap.is_empty()).then_some(bootstrap),
+        TerminalLaunchProfile::Codex => {
+            "Start-Sleep -Milliseconds 100; if (Get-Command 'codex' -ErrorAction SilentlyContinue) { & 'codex' } else { Write-Error '[IHATECODING] Codex CLI was not found. Install the codex command and try again.' }"
+        }
+        TerminalLaunchProfile::Grok => {
+            "Start-Sleep -Milliseconds 100; if (Get-Command 'grok' -ErrorAction SilentlyContinue) { & 'grok' } else { Write-Error '[IHATECODING] Grok CLI was not found. Install the grok command and try again.' }"
+        }
+        TerminalLaunchProfile::Claude => {
+            "Start-Sleep -Milliseconds 100; if (Get-Command 'claude' -ErrorAction SilentlyContinue) { & 'claude' } else { Write-Error '[IHATECODING] Claude Code CLI was not found. Install the claude command and try again.' }"
+        }
+        TerminalLaunchProfile::Opencode => {
+            "Start-Sleep -Milliseconds 100; if (Get-Command 'opencode' -ErrorAction SilentlyContinue) { & 'opencode' } else { Write-Error '[IHATECODING] OpenCode CLI was not found. Install the opencode command and try again.' }"
+        }
+    };
+    Some(format!("{bootstrap}{command}"))
+}
+
+fn resume_script(binding: &ValidatedAgentBinding, use_embedded_browser_tools: bool) -> String {
+    let bootstrap = use_embedded_browser_tools
+        .then(browser_tools_powershell_bootstrap)
+        .unwrap_or_default();
     let id = binding.conversation_id.hyphenated();
-    match binding.provider {
+    let command = match binding.provider {
         AgentProvider::Codex => format!(
             "Start-Sleep -Milliseconds 100; $ihcAttempt=0; do {{ $ihcAttempt++; & codex resume '{id}' --dangerously-bypass-approvals-and-sandbox; $ihcExit=$LASTEXITCODE; if ($ihcExit -eq 0 -or $ihcAttempt -ge 3) {{ break }}; Start-Sleep -Milliseconds (750 * $ihcAttempt) }} while ($true)"
         ),
         AgentProvider::Grok => format!(
             "Start-Sleep -Milliseconds 100; $ihcAttempt=0; do {{ $ihcAttempt++; & grok --resume '{id}'; $ihcOk=$?; if ($ihcOk -or $ihcAttempt -ge 3) {{ break }}; Start-Sleep -Milliseconds (900 * $ihcAttempt) }} while ($true)"
         ),
-    }
+    };
+    format!("{bootstrap}{command}")
+}
+
+fn browser_tools_powershell_bootstrap() -> String {
+    // Resolve the real commands before defining the functions. The wrapper is
+    // session-local, so neither the user's global Codex config nor Chrome
+    // plugin preference is edited. It also covers `codex` typed manually in a
+    // plain PowerShell pane, not just panes launched from the Add menu.
+    r#"$global:__ihcCodexCommand = Get-Command 'codex' -CommandType Application,ExternalScript -ErrorAction SilentlyContinue | Select-Object -First 1; if ($global:__ihcCodexCommand -and $env:IHATECODING_BROWSER_MCP_EXE) { $global:__ihcCodexSource = $global:__ihcCodexCommand.Source; $global:__ihcCodexMcpCommand = "mcp_servers.ihatecoding.command='" + $env:IHATECODING_BROWSER_MCP_EXE.Replace("'", "''") + "'"; $global:__ihcCodexMcpArgs = "mcp_servers.ihatecoding.args=['--browser-mcp']"; $global:__ihcCodexChromeOff = 'plugins."chrome@openai-bundled".enabled=false'; $global:__ihcCodexBrowserOff = 'plugins."browser@openai-bundled".enabled=false'; function global:codex { & $global:__ihcCodexSource -c $global:__ihcCodexMcpCommand -c $global:__ihcCodexMcpArgs -c $global:__ihcCodexChromeOff -c $global:__ihcCodexBrowserOff @args } }; $global:__ihcClaudeCommand = Get-Command 'claude' -CommandType Application,ExternalScript -ErrorAction SilentlyContinue | Select-Object -First 1; if ($global:__ihcClaudeCommand -and $env:IHATECODING_BROWSER_MCP_EXE) { $global:__ihcClaudeSource = $global:__ihcClaudeCommand.Source; function global:claude { $ihcMcp = @{ mcpServers = @{ ihatecoding = @{ command = $env:IHATECODING_BROWSER_MCP_EXE; args = @('--browser-mcp') } } } | ConvertTo-Json -Compress -Depth 5; & $global:__ihcClaudeSource --mcp-config $ihcMcp --append-system-prompt 'When IHATECODING browser tools are available, use them for browser navigation, local web testing, visual inspection, and interaction. Do not open external Chrome unless the user explicitly asks for Chrome.' --no-chrome @args } }; "#.to_owned()
 }
 
 fn encode_powershell(script: String) -> String {
@@ -2688,6 +2770,19 @@ mod tests {
         }
     }
 
+    fn launch_request(
+        terminal_key: Option<StableTerminalKey>,
+        resume: Option<AgentResumeBinding>,
+        launch_profile: Option<TerminalLaunchProfile>,
+    ) -> TerminalLaunchRequest {
+        TerminalLaunchRequest {
+            terminal_key,
+            resume,
+            launch_profile,
+            use_embedded_browser_tools: true,
+        }
+    }
+
     fn decode_plan(plan: &TerminalLaunchPlan) -> String {
         let encoded = plan.arguments().last().unwrap();
         let bytes = BASE64_STANDARD.decode(encoded).unwrap();
@@ -2712,10 +2807,11 @@ mod tests {
     #[test]
     fn launch_plans_are_fixed_encoded_provider_commands() {
         let codex_id = Uuid::new_v4();
-        let codex = TerminalLaunchPlan::from_request(
+        let codex = TerminalLaunchPlan::from_request(launch_request(
             Some(key("codex")),
             Some(resume(AgentProvider::Codex, codex_id)),
-        )
+            None,
+        ))
         .unwrap();
         assert_eq!(
             &codex.arguments()[..3],
@@ -2728,10 +2824,11 @@ mod tests {
         assert!(!codex_script.contains("grok --resume"));
 
         let grok_id = Uuid::new_v4();
-        let grok = TerminalLaunchPlan::from_request(
+        let grok = TerminalLaunchPlan::from_request(launch_request(
             Some(key("grok")),
             Some(resume(AgentProvider::Grok, grok_id)),
-        )
+            None,
+        ))
         .unwrap();
         let grok_script = decode_plan(&grok);
         assert!(grok_script.contains(&format!("grok --resume '{grok_id}'")));
@@ -2741,19 +2838,203 @@ mod tests {
 
     #[test]
     fn invalid_uuid_and_missing_stable_key_fail_closed() {
-        let invalid = TerminalLaunchPlan::from_request(
+        let invalid = TerminalLaunchPlan::from_request(launch_request(
             Some(key("bad")),
             Some(AgentResumeBinding {
                 provider: AgentProvider::Codex,
                 conversation_id: "not-a-uuid'; Write-Host injected".to_owned(),
             }),
-        );
+            None,
+        ));
         assert!(invalid.is_err());
         assert!(
-            TerminalLaunchPlan::from_request(
+            TerminalLaunchPlan::from_request(launch_request(
                 None,
-                Some(resume(AgentProvider::Grok, Uuid::new_v4()))
-            )
+                Some(resume(AgentProvider::Grok, Uuid::new_v4())),
+                None,
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn launch_profiles_are_fixed_commands_and_resume_takes_precedence() {
+        let shell = TerminalLaunchPlan::from_request(launch_request(
+            Some(key("shell")),
+            None,
+            Some(TerminalLaunchProfile::Powershell),
+        ))
+        .unwrap();
+        assert_eq!(&shell.arguments()[..2], ["-NoLogo", "-NoExit"]);
+        let shell_script = decode_plan(&shell);
+        assert!(shell_script.contains("function global:codex"));
+        assert!(shell_script.contains("mcp_servers.ihatecoding"));
+        assert!(shell_script.contains("chrome@openai-bundled"));
+
+        let claude = TerminalLaunchPlan::from_request(launch_request(
+            Some(key("claude")),
+            None,
+            Some(TerminalLaunchProfile::Claude),
+        ))
+        .unwrap();
+        let claude_script = decode_plan(&claude);
+        assert!(claude_script.contains("Get-Command 'claude'"));
+        assert!(claude_script.contains("& 'claude'"));
+        assert!(claude_script.contains("function global:claude"));
+        assert!(claude_script.contains("--no-chrome"));
+        assert!(!claude_script.contains("opencode"));
+
+        let codex = TerminalLaunchPlan::from_request(launch_request(
+            Some(key("codex")),
+            None,
+            Some(TerminalLaunchProfile::Codex),
+        ))
+        .unwrap();
+        let codex_script = decode_plan(&codex);
+        assert!(codex_script.contains("Get-Command 'codex'"));
+        assert!(codex_script.contains("& 'codex'"));
+        assert!(codex_script.contains("mcp_servers.ihatecoding.args"));
+
+        let grok = TerminalLaunchPlan::from_request(launch_request(
+            Some(key("grok")),
+            None,
+            Some(TerminalLaunchProfile::Grok),
+        ))
+        .unwrap();
+        let grok_script = decode_plan(&grok);
+        assert!(grok_script.contains("Get-Command 'grok'"));
+        assert!(grok_script.contains("& 'grok'"));
+
+        let opencode = TerminalLaunchPlan::from_request(launch_request(
+            Some(key("opencode")),
+            None,
+            Some(TerminalLaunchProfile::Opencode),
+        ))
+        .unwrap();
+        let opencode_script = decode_plan(&opencode);
+        assert!(opencode_script.contains("Get-Command 'opencode'"));
+        assert!(opencode_script.contains("& 'opencode'"));
+        assert!(!opencode_script.contains("if (Get-Command 'claude'"));
+
+        let conversation_id = Uuid::new_v4();
+        let resumed = TerminalLaunchPlan::from_request(launch_request(
+            Some(key("resume-wins")),
+            Some(resume(AgentProvider::Codex, conversation_id)),
+            Some(TerminalLaunchProfile::Claude),
+        ))
+        .unwrap();
+        let resumed_script = decode_plan(&resumed);
+        assert!(resumed_script.contains(&format!("codex resume '{conversation_id}'")));
+        assert!(!resumed_script.contains("if (Get-Command 'claude'"));
+
+        let grok_conversation_id = Uuid::new_v4();
+        let grok_resumed = TerminalLaunchPlan::from_request(launch_request(
+            Some(key("grok-resume-wins")),
+            Some(resume(AgentProvider::Grok, grok_conversation_id)),
+            Some(TerminalLaunchProfile::Opencode),
+        ))
+        .unwrap();
+        let grok_resumed_script = decode_plan(&grok_resumed);
+        assert!(grok_resumed_script.contains(&format!("grok --resume '{grok_conversation_id}'")));
+        assert!(!grok_resumed_script.contains("if (Get-Command 'opencode'"));
+    }
+
+    #[test]
+    fn embedded_browser_tools_can_be_disabled_without_touching_global_configuration() {
+        let request = serde_json::from_value::<TerminalLaunchRequest>(serde_json::json!({
+            "terminalKey": {
+                "projectId": "project-a",
+                "terminalId": "plain-shell"
+            },
+            "resume": null,
+            "launchProfile": "powershell",
+            "useEmbeddedBrowserTools": false
+        }))
+        .unwrap();
+        let shell = TerminalLaunchPlan::from_request(request).unwrap();
+        assert_eq!(shell.arguments(), ["-NoLogo", "-NoExit"]);
+        assert!(shell.browser_tool_scope().is_none());
+
+        let request = serde_json::from_value::<TerminalLaunchRequest>(serde_json::json!({
+            "terminalKey": {
+                "projectId": "project-a",
+                "terminalId": "plain-codex"
+            },
+            "resume": null,
+            "launchProfile": "codex",
+            "useEmbeddedBrowserTools": false
+        }))
+        .unwrap();
+        let codex = TerminalLaunchPlan::from_request(request).unwrap();
+        let script = decode_plan(&codex);
+        assert!(script.contains("& 'codex'"));
+        assert!(!script.contains("mcp_servers.ihatecoding"));
+        assert!(!script.contains("chrome@openai-bundled"));
+    }
+
+    #[test]
+    fn launch_profile_wire_values_are_closed_and_backward_compatible() {
+        assert_eq!(
+            serde_json::from_str::<TerminalLaunchProfile>(r#""powershell""#).unwrap(),
+            TerminalLaunchProfile::Powershell
+        );
+        assert_eq!(
+            serde_json::from_str::<TerminalLaunchProfile>(r#""codex""#).unwrap(),
+            TerminalLaunchProfile::Codex
+        );
+        assert_eq!(
+            serde_json::from_str::<TerminalLaunchProfile>(r#""grok""#).unwrap(),
+            TerminalLaunchProfile::Grok
+        );
+        assert_eq!(
+            serde_json::from_str::<TerminalLaunchProfile>(r#""claude""#).unwrap(),
+            TerminalLaunchProfile::Claude
+        );
+        assert_eq!(
+            serde_json::from_str::<TerminalLaunchProfile>(r#""opencode""#).unwrap(),
+            TerminalLaunchProfile::Opencode
+        );
+        assert!(serde_json::from_str::<TerminalLaunchProfile>(r#""custom-command""#).is_err());
+        assert_eq!(
+            TerminalLaunchProfile::default(),
+            TerminalLaunchProfile::Powershell
+        );
+
+        let request = serde_json::from_value::<TerminalLaunchRequest>(serde_json::json!({
+            "terminalKey": {
+                "projectId": "project-a",
+                "terminalId": "pane-a"
+            },
+            "resume": null,
+            "launchProfile": "claude"
+        }))
+        .unwrap();
+        assert_eq!(request.terminal_key, Some(key("pane-a")));
+        assert_eq!(request.resume, None);
+        assert_eq!(request.launch_profile, Some(TerminalLaunchProfile::Claude));
+        let default_request = serde_json::from_value::<TerminalLaunchRequest>(serde_json::json!({
+            "terminalKey": null,
+            "resume": null
+        }))
+        .unwrap();
+        let default_plan = TerminalLaunchPlan::from_request(default_request).unwrap();
+        assert_eq!(&default_plan.arguments()[..2], ["-NoLogo", "-NoExit"]);
+        assert!(decode_plan(&default_plan).contains("function global:codex"));
+        assert!(
+            serde_json::from_value::<TerminalLaunchRequest>(serde_json::json!({
+                "terminalKey": null,
+                "resume": null,
+                "launchProfile": "powershell",
+                "command": "Remove-Item"
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<TerminalLaunchRequest>(serde_json::json!({
+                "terminalKey": null,
+                "resume": null,
+                "launchProfile": "custom-command"
+            }))
             .is_err()
         );
     }

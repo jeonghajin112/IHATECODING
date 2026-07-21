@@ -1,6 +1,7 @@
-use crate::agent_runtime::{
-    AgentResumeBinding, AgentRuntime, StableTerminalKey, TerminalLaunchPlan,
-};
+use crate::agent_browser_bridge::{AgentBrowserBridge, BROWSER_ROUTE_TOKEN_ENV};
+#[cfg(test)]
+use crate::agent_runtime::{AgentResumeBinding, StableTerminalKey};
+use crate::agent_runtime::{AgentRuntime, TerminalLaunchPlan, TerminalLaunchRequest};
 use crate::codex_notify;
 use crate::grok_notify;
 use crate::provider_accounts::{CODEX_OAUTH_ISOLATION_ENV, GROK_OAUTH_ISOLATION_ENV};
@@ -36,7 +37,6 @@ use portable_pty::ChildKiller;
 
 // This is a global defensive guard, not a user-facing or per-project pane limit.
 const MAX_TOTAL_TERMINAL_SESSIONS: usize = 5_120;
-const PREVIEW_MAX_PANES: u8 = 20;
 const LEGACY_TERMINAL_ENVIRONMENT: [(&str, &str); 3] = [
     ("TERM", "xterm-256color"),
     ("COLORTERM", "truecolor"),
@@ -125,6 +125,7 @@ pub(crate) struct StartTerminalResponse {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg(test)]
 pub(crate) struct TerminalEngineStatus {
     pub(crate) active_sessions: usize,
     pub(crate) starting_sessions: usize,
@@ -406,6 +407,7 @@ impl SpawnLimiter {
         self.available.notify_all();
     }
 
+    #[cfg(test)]
     fn snapshot(&self) -> SpawnLimiterSnapshot {
         let state = match self.state.lock() {
             Ok(state) => state,
@@ -433,6 +435,7 @@ impl Drop for SpawnPermit {
     }
 }
 
+#[cfg(test)]
 struct SpawnLimiterSnapshot {
     active: usize,
     peak: usize,
@@ -513,6 +516,7 @@ impl GlobalOutputBudget {
         self.available.notify_all();
     }
 
+    #[cfg(test)]
     fn snapshot(&self) -> GlobalOutputBudgetSnapshot {
         let state = match self.state.lock() {
             Ok(state) => state,
@@ -525,6 +529,7 @@ impl GlobalOutputBudget {
     }
 }
 
+#[cfg(test)]
 struct GlobalOutputBudgetSnapshot {
     bytes: usize,
     peak: usize,
@@ -538,6 +543,7 @@ pub(crate) struct TerminalManager {
     output_budget: Arc<GlobalOutputBudget>,
     worker_threads: Arc<AtomicUsize>,
     agent_runtime: AgentRuntime,
+    browser_bridge: Option<AgentBrowserBridge>,
     #[cfg(test)]
     start_ownership_hook: Arc<dyn StartOwnershipHook>,
 }
@@ -551,6 +557,7 @@ impl Default for TerminalManager {
             output_budget: Arc::new(GlobalOutputBudget::default()),
             worker_threads: Arc::new(AtomicUsize::new(0)),
             agent_runtime: AgentRuntime::default(),
+            browser_bridge: None,
             #[cfg(test)]
             start_ownership_hook: Arc::new(NoopStartOwnershipHook),
         }
@@ -558,9 +565,21 @@ impl Default for TerminalManager {
 }
 
 impl TerminalManager {
+    #[cfg(test)]
     pub(crate) fn with_agent_runtime(agent_runtime: AgentRuntime) -> Self {
         Self {
             agent_runtime,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn with_agent_runtime_and_browser_bridge(
+        agent_runtime: AgentRuntime,
+        browser_bridge: AgentBrowserBridge,
+    ) -> Self {
+        Self {
+            agent_runtime,
+            browser_bridge: Some(browser_bridge),
             ..Self::default()
         }
     }
@@ -578,16 +597,14 @@ impl TerminalManager {
         cwd: Option<String>,
         columns: u16,
         rows: u16,
-        terminal_key: Option<StableTerminalKey>,
-        resume: Option<AgentResumeBinding>,
+        launch: TerminalLaunchRequest,
         on_event: Channel<TerminalEvent>,
     ) -> Result<StartTerminalResponse, String> {
         self.start_with_sink_request(
             cwd,
             columns,
             rows,
-            terminal_key,
-            resume,
+            launch,
             Arc::new(TauriEventSink(on_event)),
         )
     }
@@ -600,7 +617,18 @@ impl TerminalManager {
         rows: u16,
         sink: Arc<dyn TerminalEventSink>,
     ) -> Result<StartTerminalResponse, String> {
-        self.start_with_sink_request(cwd, columns, rows, None, None, sink)
+        self.start_with_sink_request(
+            cwd,
+            columns,
+            rows,
+            TerminalLaunchRequest {
+                terminal_key: None,
+                resume: None,
+                launch_profile: None,
+                use_embedded_browser_tools: true,
+            },
+            sink,
+        )
     }
 
     fn start_with_sink_request(
@@ -608,13 +636,15 @@ impl TerminalManager {
         cwd: Option<String>,
         columns: u16,
         rows: u16,
-        terminal_key: Option<StableTerminalKey>,
-        resume: Option<AgentResumeBinding>,
+        launch: TerminalLaunchRequest,
         sink: Arc<dyn TerminalEventSink>,
     ) -> Result<StartTerminalResponse, String> {
         let cwd = validate_working_directory(cwd)?;
-        let project_id = terminal_key.as_ref().map(|key| key.project_id.clone());
-        let launch_plan = TerminalLaunchPlan::from_request(terminal_key, resume)?;
+        let project_id = launch
+            .terminal_key
+            .as_ref()
+            .map(|key| key.project_id.clone());
+        let launch_plan = TerminalLaunchPlan::from_request(launch)?;
         let size = normalized_size(columns, rows);
         let mut reservation = self.reserve_start_for_project(project_id.as_deref())?;
         let binding_lease = launch_plan
@@ -641,6 +671,15 @@ impl TerminalManager {
         let mut command = CommandBuilder::new(resolve_powershell());
         configure_terminal_environment(&mut command);
         command.args(launch_plan.arguments());
+        if let (Some(browser_bridge), Some(scope)) =
+            (&self.browser_bridge, launch_plan.browser_tool_scope())
+        {
+            let route_token = browser_bridge.issue_route(&scope.project_id, &scope.terminal_id)?;
+            let browser_mcp_exe = std::env::current_exe()
+                .map_err(|error| format!("Could not locate the IHATECODING executable: {error}"))?;
+            command.env(BROWSER_ROUTE_TOKEN_ENV, route_token);
+            command.env("IHATECODING_BROWSER_MCP_EXE", browser_mcp_exe);
+        }
         let notify_route = codex_notify::route_path(&reservation.session_id)?;
         command.env(codex_notify::NOTIFY_ROUTE_ENV, &notify_route);
         let grok_notify_route = grok_notify::route_path(&reservation.session_id)?;
@@ -895,6 +934,7 @@ impl TerminalManager {
         Ok(state)
     }
 
+    #[cfg(test)]
     pub(crate) fn status(&self) -> TerminalEngineStatus {
         let (lifecycle, entries) = match self.state.lock() {
             Ok(state) => (
@@ -1815,6 +1855,7 @@ impl OutputFlow {
         self.global.notify_all();
     }
 
+    #[cfg(test)]
     fn snapshot(&self) -> OutputFlowSnapshot {
         let state = match self.state.lock() {
             Ok(state) => state,
@@ -1826,6 +1867,7 @@ impl OutputFlow {
     }
 }
 
+#[cfg(test)]
 struct OutputFlowSnapshot {
     batches: usize,
 }
@@ -1966,6 +2008,7 @@ impl ResizeMailbox {
         state.applied = state.applied.saturating_add(1);
     }
 
+    #[cfg(test)]
     fn snapshot(&self) -> ResizeSnapshot {
         let state = match self.state.lock() {
             Ok(state) => state,
@@ -2016,6 +2059,7 @@ impl ResizeMailbox {
     }
 }
 
+#[cfg(test)]
 struct ResizeSnapshot {
     pending: bool,
     requested: u64,
@@ -2238,14 +2282,6 @@ impl Utf8StreamDecoder {
     fn finish(self) -> String {
         String::from_utf8_lossy(&self.pending).into_owned()
     }
-}
-
-pub(crate) fn phase2_initial_panes() -> u8 {
-    env::var("IHC_PHASE2_INITIAL_PANES")
-        .ok()
-        .and_then(|value| value.parse::<u8>().ok())
-        .unwrap_or(1)
-        .clamp(1, PREVIEW_MAX_PANES)
 }
 
 #[cfg(test)]
@@ -3159,11 +3195,6 @@ mod tests {
         assert_eq!(status.starting_sessions, 3);
         assert_eq!(status.max_sessions, MAX_TOTAL_TERMINAL_SESSIONS);
         drop(reservations);
-    }
-
-    #[test]
-    fn preview_pane_count_defaults_within_benchmark_limit() {
-        assert!((1..=PREVIEW_MAX_PANES).contains(&phase2_initial_panes()));
     }
 
     #[test]

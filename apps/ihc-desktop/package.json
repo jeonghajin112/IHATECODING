@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "node scripts/build.mjs --serve",
     "build": "tsc --noEmit && node scripts/build.mjs",
-    "test": "node --test scripts/i18n.test.mjs scripts/optimization-settings.test.mjs scripts/phase2-core.test.mjs scripts/phase3-core.test.mjs scripts/phase3b-core.test.mjs scripts/phase4-core.test.mjs scripts/phase4-integration.test.mjs scripts/phase5-core.test.mjs scripts/phase5-integration.test.mjs",
+    "test": "node --test scripts/agent-browser-settings.test.mjs scripts/browser-ui-pick.test.mjs scripts/footer-provider-settings.test.mjs scripts/i18n.test.mjs scripts/media-browser.test.mjs scripts/optimization-settings.test.mjs scripts/pointer-reorder.test.mjs scripts/project-file-tree.test.mjs scripts/project-file-tree-integration.test.mjs scripts/settings-browser-preview.test.mjs scripts/phase2-core.test.mjs scripts/phase3b-core.test.mjs scripts/phase4-core.test.mjs scripts/phase4-integration.test.mjs scripts/phase5-core.test.mjs scripts/phase5-integration.test.mjs",
     "tauri": "tauri"
   },
   "dependencies": {

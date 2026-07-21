@@ -15,9 +15,19 @@ export const DEFAULT_MIN_PANE_WIDTH_PX = 160;
 export const DEFAULT_INSERTION_HYSTERESIS_PX = 14;
 export const DEFAULT_SNAP_DISTANCE_PX = 8;
 export const PROJECT_BROWSER_PANES_EXTENSION = "browserPanesV1";
+export const PROJECT_EDITOR_PANES_EXTENSION = "editorPanesV1";
+export const PROJECT_PANE_ORDER_EXTENSION = "paneOrderV1";
+export const TERMINAL_LAUNCH_PROFILE_EXTENSION = "launchProfileV1";
+export const LOCAL_BROWSER_RETRY_WINDOW_MS = 5 * 60 * 1_000;
+
+const LOCAL_BROWSER_RETRY_RAMP_MS = [500, 1_000, 2_000, 4_000, 8_000] as const;
+const LOCAL_BROWSER_RETRY_TAIL_MS = 15_000;
 
 const MAX_BROWSER_PANE_TITLE_LENGTH = 80;
 const MAX_BROWSER_PANE_URL_BYTES = 16 * 1024;
+const MAX_EDITOR_PANE_TITLE_LENGTH = 160;
+const MAX_EDITOR_PATH_DEPTH = 64;
+const MAX_EDITOR_PATH_SEGMENT_LENGTH = 255;
 
 export type WorkspaceBrowserPane = {
   [key: string]: unknown;
@@ -25,6 +35,58 @@ export type WorkspaceBrowserPane = {
   title: string;
   url: string;
 };
+
+export type WorkspaceEditorPane = {
+  [key: string]: unknown;
+  id: string;
+  title: string;
+  pathSegments: string[];
+};
+
+export type WorkspaceTerminalLaunchProfile =
+  | "powershell"
+  | "codex"
+  | "grok"
+  | "claude"
+  | "opencode";
+
+export function isLoopbackBrowserUrl(rawUrl: string) {
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    return false;
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return false;
+  if (parsed.username || parsed.password) return false;
+
+  const hostname = parsed.hostname.replace(/^\[|\]$/gu, "").toLowerCase();
+  if (hostname === "localhost" || hostname === "::1") return true;
+  const octets = hostname.split(".");
+  return (
+    octets.length === 4 &&
+    octets.every((octet) => /^\d{1,3}$/u.test(octet) && Number(octet) <= 255) &&
+    Number(octets[0]) === 127
+  );
+}
+
+/**
+ * Returns the delay after the latest failed local-server probe. The first
+ * probe is immediate; retries ramp quickly and then settle at one lightweight
+ * TCP attempt every 15 seconds until the bounded restore window expires.
+ */
+export function localBrowserRetryDelayMs(
+  failedAttempts: number,
+  elapsedMs: number,
+): number | null {
+  if (!Number.isSafeInteger(failedAttempts) || failedAttempts < 1) return null;
+  if (!Number.isFinite(elapsedMs) || elapsedMs < 0 || elapsedMs >= LOCAL_BROWSER_RETRY_WINDOW_MS) {
+    return null;
+  }
+  return (
+    LOCAL_BROWSER_RETRY_RAMP_MS[failedAttempts - 1] ?? LOCAL_BROWSER_RETRY_TAIL_MS
+  );
+}
 
 export type LinearMoveCommand = "previous" | "next" | "first" | "last";
 
@@ -333,6 +395,35 @@ export function moveWorkspaceTabByKeyboard(
   return next;
 }
 
+/**
+ * Move a tab directly before another tab, or append it when the target is null.
+ * This mirrors pointer drag/drop semantics without changing tab identity,
+ * activation, project selection, or any opaque persisted fields.
+ */
+export function moveWorkspaceTabBefore(
+  state: WorkspaceState,
+  tabId: string,
+  beforeTabId: string | null,
+): WorkspaceState {
+  const next = editableClone(state);
+  const sourceIndex = next.tabs.findIndex((tab) => tab.id === tabId);
+  if (sourceIndex < 0) throw new Error("The requested workspace tab does not exist.");
+
+  if (beforeTabId === tabId) return next;
+  if (beforeTabId !== null && !next.tabs.some((tab) => tab.id === beforeTabId)) {
+    throw new Error("The requested target workspace tab does not exist.");
+  }
+
+  const [tab] = next.tabs.splice(sourceIndex, 1);
+  if (beforeTabId === null) {
+    next.tabs.push(tab);
+  } else {
+    const targetIndex = next.tabs.findIndex((item) => item.id === beforeTabId);
+    next.tabs.splice(targetIndex, 0, tab);
+  }
+  return next;
+}
+
 export function describeWorkspaceTabsForAccessibility(
   state: WorkspaceState,
 ): WorkspaceTabAccessibility[] {
@@ -354,10 +445,15 @@ export function appendProjectPane(
 ): WorkspaceState {
   const next = editableClone(state);
   const project = requireProject(next, projectId);
-  if (project.terminals.some((item) => item.id === pane.id)) {
+  if (
+    project.terminals.some((item) => item.id === pane.id) ||
+    projectBrowserPanes(project).some((item) => item.id === pane.id) ||
+    projectEditorPanes(project).some((item) => item.id === pane.id)
+  ) {
     throw new Error("The pane identifier is already in use.");
   }
   project.terminals.push(pane);
+  repairPersistedPaneOrder(project);
   project.lastModifiedAtUtc = modifiedAtUtc;
   return normalizeWorkspaceState(next);
 }
@@ -373,7 +469,7 @@ export function projectBrowserPanes(
   const source = project.legacyExtensions[PROJECT_BROWSER_PANES_EXTENSION];
   if (!Array.isArray(source)) return [];
   const panes: WorkspaceBrowserPane[] = [];
-  const ids = new Set<string>();
+  const ids = new Set(project.terminals.map((terminal) => terminal.id));
   for (const entry of source) {
     if (!isRecord(entry)) continue;
     try {
@@ -417,12 +513,14 @@ export function appendProjectBrowserPane(
   const normalized = createWorkspaceBrowserPane(pane.id, pane.title, pane.url);
   if (
     project.terminals.some((item) => item.id === normalized.id) ||
-    browsers.some((item) => item.id === normalized.id)
+    browsers.some((item) => item.id === normalized.id) ||
+    projectEditorPanes(project).some((item) => item.id === normalized.id)
   ) {
     throw new Error("The pane identifier is already in use.");
   }
   browsers.push({ ...structuredClone(pane), ...normalized });
   project.legacyExtensions[PROJECT_BROWSER_PANES_EXTENSION] = browsers;
+  repairPersistedPaneOrder(project);
   project.lastModifiedAtUtc = modifiedAtUtc;
   return normalizeWorkspaceState(next);
 }
@@ -440,6 +538,7 @@ export function removeProjectBrowserPane(
   if (index < 0) throw new Error("The requested browser pane does not exist.");
   browsers.splice(index, 1);
   project.legacyExtensions[PROJECT_BROWSER_PANES_EXTENSION] = browsers;
+  repairPersistedPaneOrder(project);
   project.lastModifiedAtUtc = modifiedAtUtc;
   return normalizeWorkspaceState(next);
 }
@@ -468,6 +567,162 @@ export function setProjectBrowserPaneUrl(
   }, modifiedAtUtc);
 }
 
+/**
+ * Persist lightweight text/Markdown editors beside browser panes without
+ * changing schema-v1. Only the project-relative identity is stored; file
+ * contents remain in the project and are re-read through the guarded backend.
+ */
+export function projectEditorPanes(project: WorkspaceProject): WorkspaceEditorPane[] {
+  const source = project.legacyExtensions[PROJECT_EDITOR_PANES_EXTENSION];
+  if (!Array.isArray(source)) return [];
+  const panes: WorkspaceEditorPane[] = [];
+  const ids = new Set([
+    ...project.terminals.map((terminal) => terminal.id),
+    ...projectBrowserPanes(project).map((pane) => pane.id),
+  ]);
+  for (const entry of source) {
+    if (!isRecord(entry)) continue;
+    try {
+      const id = String(entry.id ?? "");
+      assertOpaqueLocalId(id, "editor pane");
+      if (ids.has(id)) continue;
+      const pathSegments = normalizeEditorPathSegments(entry.pathSegments);
+      const title = normalizeEditorPaneTitle(
+        String(entry.title ?? pathSegments[pathSegments.length - 1] ?? ""),
+      );
+      ids.add(id);
+      panes.push({ ...structuredClone(entry), id, title, pathSegments });
+    } catch {
+      // Invalid opaque editor state must not prevent the project from opening.
+    }
+  }
+  return panes;
+}
+
+export function createWorkspaceEditorPane(
+  id: string,
+  pathSegments: readonly string[],
+  title = pathSegments[pathSegments.length - 1] ?? "File",
+): WorkspaceEditorPane {
+  assertOpaqueLocalId(id, "editor pane");
+  return {
+    id,
+    title: normalizeEditorPaneTitle(title),
+    pathSegments: normalizeEditorPathSegments(pathSegments),
+  };
+}
+
+export function appendProjectEditorPane(
+  state: WorkspaceState,
+  projectId: string,
+  pane: WorkspaceEditorPane,
+  modifiedAtUtc = new Date().toISOString(),
+): WorkspaceState {
+  const next = editableClone(state);
+  const project = requireProject(next, projectId);
+  const editors = projectEditorPanes(project);
+  const normalized = createWorkspaceEditorPane(pane.id, pane.pathSegments, pane.title);
+  if (
+    project.terminals.some((item) => item.id === normalized.id) ||
+    projectBrowserPanes(project).some((item) => item.id === normalized.id) ||
+    editors.some((item) => item.id === normalized.id)
+  ) {
+    throw new Error("The pane identifier is already in use.");
+  }
+  editors.push({ ...structuredClone(pane), ...normalized });
+  project.legacyExtensions[PROJECT_EDITOR_PANES_EXTENSION] = editors;
+  repairPersistedPaneOrder(project);
+  project.lastModifiedAtUtc = modifiedAtUtc;
+  return normalizeWorkspaceState(next);
+}
+
+export function removeProjectEditorPane(
+  state: WorkspaceState,
+  projectId: string,
+  paneId: string,
+  modifiedAtUtc = new Date().toISOString(),
+): WorkspaceState {
+  const next = editableClone(state);
+  const project = requireProject(next, projectId);
+  const editors = projectEditorPanes(project);
+  const index = editors.findIndex((pane) => pane.id === paneId);
+  if (index < 0) throw new Error("The requested editor pane does not exist.");
+  editors.splice(index, 1);
+  project.legacyExtensions[PROJECT_EDITOR_PANES_EXTENSION] = editors;
+  repairPersistedPaneOrder(project);
+  project.lastModifiedAtUtc = modifiedAtUtc;
+  return normalizeWorkspaceState(next);
+}
+
+export function sameProjectEditorPath(
+  pane: WorkspaceEditorPane,
+  pathSegments: readonly string[],
+): boolean {
+  let normalized: string[];
+  try {
+    normalized = normalizeEditorPathSegments(pathSegments);
+  } catch {
+    return false;
+  }
+  return (
+    pane.pathSegments.length === normalized.length &&
+    pane.pathSegments.every(
+      (segment, index) => segment.localeCompare(normalized[index], undefined, { sensitivity: "accent" }) === 0,
+    )
+  );
+}
+
+/**
+ * Resolve the UI-owned mixed pane sequence without letting stale extension
+ * data hide a real pane. Persisted valid IDs retain their relative order;
+ * panes added since the last save are appended in canonical storage order.
+ */
+export function projectPaneOrder(project: WorkspaceProject): string[] {
+  const canonical = canonicalProjectPaneIds(project);
+  const available = new Set(canonical);
+  const ordered: string[] = [];
+  const seen = new Set<string>();
+  const source = project.legacyExtensions[PROJECT_PANE_ORDER_EXTENSION];
+  if (Array.isArray(source)) {
+    for (const entry of source) {
+      if (typeof entry !== "string" || !available.has(entry) || seen.has(entry)) continue;
+      seen.add(entry);
+      ordered.push(entry);
+    }
+  }
+  for (const paneId of canonical) {
+    if (seen.has(paneId)) continue;
+    seen.add(paneId);
+    ordered.push(paneId);
+  }
+  return ordered;
+}
+
+export function setProjectPaneOrder(
+  state: WorkspaceState,
+  projectId: string,
+  orderedPaneIds: readonly string[],
+  modifiedAtUtc = new Date().toISOString(),
+): WorkspaceState {
+  const next = editableClone(state);
+  const project = requireProject(next, projectId);
+  const canonical = canonicalProjectPaneIds(project);
+  const available = new Set(canonical);
+  const seen = new Set<string>();
+  if (!Array.isArray(orderedPaneIds) || orderedPaneIds.length !== canonical.length) {
+    throw new Error("A pane order must contain every current pane exactly once.");
+  }
+  for (const paneId of orderedPaneIds) {
+    if (typeof paneId !== "string" || !available.has(paneId) || seen.has(paneId)) {
+      throw new Error("A pane order must contain every current pane exactly once.");
+    }
+    seen.add(paneId);
+  }
+  project.legacyExtensions[PROJECT_PANE_ORDER_EXTENSION] = [...orderedPaneIds];
+  project.lastModifiedAtUtc = modifiedAtUtc;
+  return normalizeWorkspaceState(next);
+}
+
 /** Append a canonical project without creating hidden runtime state. */
 export function appendWorkspaceProject(
   state: WorkspaceState,
@@ -484,6 +739,74 @@ export function appendWorkspaceProject(
     throw new Error("The project folder is already registered.");
   }
   next.projects.push(project);
+  return normalizeWorkspaceState(next);
+}
+
+/** Rename one project and every project tab that presents its canonical name. */
+export function renameWorkspaceProject(
+  state: WorkspaceState,
+  projectId: string,
+  name: string,
+  modifiedAtUtc = new Date().toISOString(),
+): WorkspaceState {
+  const next = editableClone(state);
+  const project = requireProject(next, projectId);
+  const normalized = validateWorkspaceProjectDraft(name, project.folderPath).name;
+  project.name = normalized;
+  project.lastModifiedAtUtc = modifiedAtUtc;
+  for (const tab of next.tabs) {
+    if (tab.kind === "project" && tab.projectId === projectId) tab.title = normalized;
+  }
+  return normalizeWorkspaceState(next);
+}
+
+/**
+ * Remove a project from the workspace catalog without touching its folder.
+ * Every tab referencing the project is removed atomically. If that leaves no
+ * tab, create one explicit blank replacement so the workspace remains valid.
+ */
+export function removeWorkspaceProject(
+  state: WorkspaceState,
+  projectId: string,
+  replacementTabId: string,
+): WorkspaceState {
+  const next = editableClone(state);
+  const projectIndex = next.projects.findIndex((project) => project.id === projectId);
+  if (projectIndex < 0) throw new Error("The requested workspace project does not exist.");
+
+  const activeIndex = next.tabs.findIndex((tab) => tab.id === next.activeTabId);
+  const activeRemoved = next.tabs.some(
+    (tab) => tab.id === next.activeTabId && tab.projectId === projectId,
+  );
+  const fallbackActiveTabId =
+    activeIndex >= 0
+      ? (next.tabs.slice(activeIndex + 1).find((tab) => tab.projectId !== projectId)?.id ??
+        next.tabs
+          .slice(0, activeIndex)
+          .reverse()
+          .find((tab) => tab.projectId !== projectId)?.id)
+      : next.tabs.find((tab) => tab.projectId !== projectId)?.id;
+  next.projects.splice(projectIndex, 1);
+  next.tabs = next.tabs.filter((tab) => tab.projectId !== projectId);
+
+  if (next.tabs.length === 0) {
+    assertNewTabId(next, replacementTabId);
+    next.tabs.push({
+      id: replacementTabId,
+      kind: "empty",
+      title: tr("New tab", "새 탭"),
+      projectId: null,
+      browser: null,
+      output: null,
+      extensions: {},
+    });
+    next.activeTabId = replacementTabId;
+  } else if (activeRemoved || !next.tabs.some((tab) => tab.id === next.activeTabId)) {
+    next.activeTabId = fallbackActiveTabId ?? next.tabs[0].id;
+  }
+
+  const active = next.tabs.find((tab) => tab.id === next.activeTabId) ?? null;
+  next.selectedProjectId = active?.kind === "project" ? active.projectId : null;
   return normalizeWorkspaceState(next);
 }
 
@@ -510,6 +833,7 @@ export function removeProjectPane(
   const index = project.terminals.findIndex((pane) => pane.id === paneId);
   if (index < 0) throw new Error("The requested pane does not exist.");
   project.terminals.splice(index, 1);
+  repairPersistedPaneOrder(project);
   project.lastModifiedAtUtc = modifiedAtUtc;
   return normalizeWorkspaceState(next);
 }
@@ -620,6 +944,7 @@ export function createWorkspaceTerminal(
   name: string,
   startDirectory: string,
   createdAtUtc: string,
+  launchProfile: WorkspaceTerminalLaunchProfile = "powershell",
 ): WorkspaceTerminal {
   assertOpaqueLocalId(id, "pane");
   const normalizedName = name.trim();
@@ -627,6 +952,9 @@ export function createWorkspaceTerminal(
   const normalizedDirectory = normalizeWindowsFolder(startDirectory);
   if (!isAbsoluteWindowsPath(normalizedDirectory)) {
     throw new Error("A pane start directory must be an absolute Windows path.");
+  }
+  if (!isWorkspaceTerminalLaunchProfile(launchProfile)) {
+    throw new Error("The terminal launch profile is invalid.");
   }
   return {
     id,
@@ -636,22 +964,26 @@ export function createWorkspaceTerminal(
     grokSessionId: null,
     createdAtUtc,
     completionPending: false,
-    legacyExtensions: {},
+    legacyExtensions:
+      launchProfile === "powershell"
+        ? {}
+        : { [TERMINAL_LAUNCH_PROFILE_EXTENSION]: launchProfile },
   };
+}
+
+export function workspaceTerminalLaunchProfile(
+  terminal: Pick<WorkspaceTerminal, "legacyExtensions">,
+): WorkspaceTerminalLaunchProfile {
+  const candidate = terminal.legacyExtensions[TERMINAL_LAUNCH_PROFILE_EXTENSION];
+  return isWorkspaceTerminalLaunchProfile(candidate) ? candidate : "powershell";
 }
 
 export function validateWorkspaceProjectDraft(
   name: string,
   folderPath: string,
 ): WorkspaceProjectDraft {
-  const normalizedName = name.trim();
+  const normalizedName = validateWorkspaceProjectName(name);
   const normalizedFolder = normalizeWindowsFolder(folderPath);
-  if (!normalizedName) throw new Error(tr("Enter a project name.", "프로젝트 이름을 입력하세요."));
-  if (normalizedName.length > 50) {
-    throw new Error(
-      tr("Project names must be 50 characters or fewer.", "프로젝트 이름은 50자 이하여야 합니다."),
-    );
-  }
   if (!isAbsoluteWindowsPath(normalizedFolder)) {
     throw new Error(
       tr(
@@ -661,6 +993,17 @@ export function validateWorkspaceProjectDraft(
     );
   }
   return { name: normalizedName, folderPath: normalizedFolder };
+}
+
+export function validateWorkspaceProjectName(name: string): string {
+  const normalizedName = name.trim();
+  if (!normalizedName) throw new Error(tr("Enter a project name.", "프로젝트 이름을 입력하세요."));
+  if (normalizedName.length > 50) {
+    throw new Error(
+      tr("Project names must be 50 characters or fewer.", "프로젝트 이름은 50자 이하여야 합니다."),
+    );
+  }
+  return normalizedName;
 }
 
 /** Match the legacy dialog: suggest the selected folder's final path segment. */
@@ -717,12 +1060,40 @@ export function uniqueWorkspaceProjectName(
   }
 }
 
-export function nextWorkspacePaneName(project: WorkspaceProject): string {
+export function nextWorkspacePaneName(
+  project: WorkspaceProject,
+  launchProfile: WorkspaceTerminalLaunchProfile = "powershell",
+): string {
+  if (!isWorkspaceTerminalLaunchProfile(launchProfile)) {
+    throw new Error("The terminal launch profile is invalid.");
+  }
   const names = new Set(project.terminals.map((pane) => pane.name.toLocaleLowerCase()));
+  const prefix =
+    launchProfile === "codex"
+      ? "Codex"
+      : launchProfile === "grok"
+        ? "Grok"
+        : launchProfile === "claude"
+          ? "Claude Code"
+          : launchProfile === "opencode"
+            ? "OpenCode"
+            : "PowerShell";
   for (let index = 1; ; index += 1) {
-    const candidate = `PowerShell ${index}`;
+    const candidate = `${prefix} ${index}`;
     if (!names.has(candidate.toLocaleLowerCase())) return candidate;
   }
+}
+
+function isWorkspaceTerminalLaunchProfile(
+  value: unknown,
+): value is WorkspaceTerminalLaunchProfile {
+  return (
+    value === "powershell" ||
+    value === "codex" ||
+    value === "grok" ||
+    value === "claude" ||
+    value === "opencode"
+  );
 }
 
 export function evaluateWorkspaceRestoreCapacity(
@@ -1023,6 +1394,20 @@ function updateProjectBrowserPane(
   return normalizeWorkspaceState(next);
 }
 
+function canonicalProjectPaneIds(project: WorkspaceProject): string[] {
+  return [
+    ...project.terminals.map((terminal) => terminal.id),
+    ...projectBrowserPanes(project).map((pane) => pane.id),
+    ...projectEditorPanes(project).map((pane) => pane.id),
+  ];
+}
+
+/** Keep an already-persisted mixed order valid across pane lifecycle changes. */
+function repairPersistedPaneOrder(project: WorkspaceProject): void {
+  if (!Array.isArray(project.legacyExtensions[PROJECT_PANE_ORDER_EXTENSION])) return;
+  project.legacyExtensions[PROJECT_PANE_ORDER_EXTENSION] = projectPaneOrder(project);
+}
+
 function normalizeBrowserPaneTitle(value: string): string {
   const normalized = value.trim();
   if (!normalized) throw new Error("A browser pane title cannot be empty.");
@@ -1053,6 +1438,36 @@ function normalizePersistedBrowserPaneUrl(value: string): string {
     throw new Error("The browser pane URL is not allowed for restore.");
   }
   return parsed.href;
+}
+
+function normalizeEditorPaneTitle(value: string): string {
+  const normalized = value.trim();
+  if (!normalized) throw new Error("An editor pane title cannot be empty.");
+  if (normalized.length > MAX_EDITOR_PANE_TITLE_LENGTH) {
+    throw new Error(`An editor pane title cannot exceed ${MAX_EDITOR_PANE_TITLE_LENGTH} characters.`);
+  }
+  return normalized;
+}
+
+function normalizeEditorPathSegments(value: unknown): string[] {
+  if (!Array.isArray(value) || value.length === 0 || value.length > MAX_EDITOR_PATH_DEPTH) {
+    throw new Error("An editor pane path is invalid.");
+  }
+  return value.map((entry) => {
+    if (
+      typeof entry !== "string" ||
+      entry.length === 0 ||
+      entry.length > MAX_EDITOR_PATH_SEGMENT_LENGTH ||
+      entry === "." ||
+      entry === ".." ||
+      entry.endsWith(" ") ||
+      entry.endsWith(".") ||
+      /[<>:"/\\|?*\u0000-\u001f\u007f]/u.test(entry)
+    ) {
+      throw new Error("An editor pane path is invalid.");
+    }
+    return entry;
+  });
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

@@ -13,6 +13,8 @@ test("workspace terminals use typed resume plans instead of injected commands", 
   assert.match(controller, /setResumePlans\(deriveSafeResumePlans\(state\)\)/);
   assert.match(main, /terminalKey:\s*\{\s*projectId: this\.projectId,\s*terminalId: this\.terminalId/);
   assert.match(main, /resume:\s*this\.resumePlan\.action === "resume"/);
+  assert.match(main, /launchProfile:\s*this\.launchProfile/);
+  assert.match(main, /workspaceTerminalLaunchProfile\(savedState\)/);
   assert.doesNotMatch(main, /write_terminal[\s\S]{0,300}codex resume/);
   assert.doesNotMatch(main, /write_terminal[\s\S]{0,300}grok --resume/);
 });
@@ -136,6 +138,108 @@ test("terminal clicks use guarded mode-aware cursor movement", async () => {
   );
   assert.match(styles, /\.terminal-resize-handle\s*\{[\s\S]*?cursor:\s*col-resize;/);
   assert.doesNotMatch(styles, /\.xterm-cursor-blink/);
+});
+
+test("Codex safety buffering raises one separate local and Discord attention state", async () => {
+  const [main, html, styles, backend] = await Promise.all([
+    source("src/main.ts"),
+    source("index.html"),
+    source("src/styles.css"),
+    source("src-tauri/src/phone_notify.rs"),
+  ]);
+  assert.match(main, /isCodexSafetyBufferingScreen/);
+  assert.match(
+    main,
+    /private visibleTerminalScreenText\(\)[\s\S]*buffer\.viewportY[\s\S]*translateToString\(true\)/,
+  );
+  assert.match(
+    main,
+    /terminal\.write\(data,[\s\S]*this\.observeCodexSafetyBufferingScreen\(\)/,
+  );
+  assert.match(
+    main,
+    /agentTurnState !== "working"[\s\S]*launchProfile !== "codex"[\s\S]*agentProvider !== "codex"/,
+  );
+  assert.match(main, /dataset\.safetyCheckPending = String\(pending\)/);
+  assert.match(main, /this\.acknowledgeSafetyCheck\(\)/);
+  assert.match(main, /sendBackground\(\s*"safetyCheck",\s*notificationId,/);
+  assert.match(main, /return `safety:v1:\$\{session\}:\$\{turn\}`/);
+  assert.doesNotMatch(main, /createPhoneNotificationEventId\("safety"\)/);
+  assert.match(html, /id="phone-notification-safety-check"/);
+  assert.match(styles, /data-safety-check-pending="true"[\s\S]*safety-check-glow-pulse/);
+  assert.match(backend, /PhoneNotificationKind::SafetyCheck/);
+  assert.match(backend, /"🛡️", "안전 검사 대기"/);
+});
+
+test("live CLI input owns Ctrl+A and selected-range Backspace safely", async () => {
+  const main = await source("src/main.ts");
+  const editingStart = main.indexOf(
+    "private consumeEditableTerminalShortcut(event: KeyboardEvent)",
+  );
+  const editingEnd = main.indexOf(
+    "private captureCursorClick(event: MouseEvent)",
+    editingStart,
+  );
+  assert.ok(editingStart >= 0 && editingEnd > editingStart);
+  const editing = main.slice(editingStart, editingEnd);
+
+  assert.match(
+    main,
+    /type EditableTerminalAnchor = \{[\s\S]*?bufferType: "normal" \| "alternate";[\s\S]*?absoluteRow: number;[\s\S]*?linePrefix: string;/,
+  );
+  assert.match(
+    main,
+    /onWindowTerminalKeyDown[\s\S]*?if \(this\.capturedCursorMoveInput\) return;[\s\S]*?consumeEditableTerminalShortcut\(event\)/,
+  );
+  assert.match(
+    main,
+    /attachCustomKeyEventHandler[\s\S]*?consumeSelectionCopyShortcut\(event\)[\s\S]*?consumeManualTerminalInterruptShortcut\(event\)[\s\S]*?consumeEditableTerminalShortcut\(event\)/,
+  );
+  assert.doesNotMatch(
+    editing,
+    /this\.terminal\.textarea !== document\.activeElement|event\.composedPath\(\)\.includes\(this\.viewport\)/,
+  );
+  assert.match(
+    main,
+    /anchor\?\.bufferType === buffer\.type[\s\S]*?anchor\.absoluteRow = absoluteRow/,
+  );
+  assert.match(
+    main,
+    /anchor\.bufferType !== buffer\.type[\s\S]*?line\.translateToString\(false, 0, anchor\.column\) !== anchor\.linePrefix[\s\S]*?anchor\.absoluteRow = row/,
+  );
+  assert.match(editing, /this\.terminal\.getSelectionPosition\(\)/);
+  assert.match(editing, /planEditableTerminalSelectAll\(editableLine\)/);
+  assert.match(editing, /this\.terminal\.select\(/);
+  assert.match(editing, /planEditableTerminalSelectionDelete\(/);
+  assert.match(editing, /this\.terminal\.clearSelection\(\)/);
+  assert.match(
+    editing,
+    /createTerminalArrowEvent\("keydown", direction\)[\s\S]*?createTerminalArrowEvent\("keyup", direction\)/,
+  );
+  assert.match(
+    editing,
+    /createTerminalEditingKeyEvent\("keydown", "Backspace"\)[\s\S]*?createTerminalEditingKeyEvent\("keyup", "Backspace"\)/,
+  );
+  assert.match(
+    editing,
+    /const encodedDeletion = this\.captureTerminalSelectionDeletion[\s\S]*?this\.queueInput\(\{ kind: "text", data: encodedDeletion \}\)/,
+  );
+  assert.match(
+    editing,
+    /if \(!this\.terminal\.hasSelection\(\)\) return false;[\s\S]*?selectedCursorRowTerminalLine\(selection\)[\s\S]*?if \(!editableLine\) return consume\("backspace"\);[\s\S]*?if \(!range\) return consume\("backspace"\)/,
+  );
+  assert.match(
+    main,
+    /private selectedCursorRowTerminalLine[\s\S]*?selection\.start\.y !== row[\s\S]*?selection\.end\.y !== row[\s\S]*?anchorColumn: selection\.start\.x/,
+  );
+  assert.doesNotMatch(
+    main,
+    /this\.terminal\.cols !== columnsBeforeFit[\s\S]{0,500}?this\.editableAnchor = null/,
+  );
+  assert.match(
+    main,
+    /onWindowTerminalKeyUp[\s\S]*?editableShortcutReleasePending[\s\S]*?stopImmediatePropagation\(\)/,
+  );
 });
 
 test("terminal answer selections expose reliable copy without resuming output follow", async () => {
@@ -286,12 +390,12 @@ test("terminal output coalesces adjacent TUI repaint fragments before xterm rend
   );
   assert.match(
     rendering,
-    /terminalRenderVersion = expectedRenderVersion[\s\S]*?terminal\.write\(data/,
+    /terminal\.write\(data,[\s\S]*?terminalRenderVersion = expectedRenderVersion/,
   );
   assert.match(main, /OUTPUT_RENDER_MAX_BYTES = 64 \* 1024/);
   assert.match(
     rendering,
-    /batches\.map\(\(batch\) => batch\.data\)\.join\(""\)[\s\S]*?observeRawLaunchControl\(data\)[\s\S]*?launchSensitiveWrite = this\.launchPaintWatchdog\.shouldBypassRenderTimers[\s\S]*?terminal\.write\(data/,
+    /batches\.map\(\(batch\) => batch\.data\)\.join\(""\)[\s\S]*?observeRawLaunchControl\(data\)[\s\S]*?launchSensitiveWrite = this\.launchPaintWatchdog\.shouldBypassRenderTimers[\s\S]*?observeInteractiveLaunchOutput\(false, expectedRenderVersion\)[\s\S]*?terminal\.write\(data/,
   );
   assert.doesNotMatch(
     rendering,
@@ -341,6 +445,10 @@ test("interactive CLI launch recovers a missed xterm paint without polling norma
   assert.ok(recoveryStart >= 0 && recoveryEnd > recoveryStart);
   assert.ok(renderStart >= 0 && renderEnd > renderStart);
   assert.match(
+    main,
+    /private async start\(\)[\s\S]*?this\.fitTerminal\(\);[\s\S]*?this\.armInteractiveLaunchPaintProbe\(\);[\s\S]*?const onEvent = new Channel<unknown>\(\)[\s\S]*?invoke<StartTerminalResponse>\("start_terminal"/,
+  );
+  assert.match(
     handlers,
     /key === "enter"[\s\S]*?!event\.repeat[\s\S]*?buffer\.active\.type === "normal"[\s\S]*?armInteractiveLaunchPaintProbe\(\)/,
   );
@@ -358,7 +466,7 @@ test("interactive CLI launch recovers a missed xterm paint without polling norma
   );
   assert.match(
     rendering,
-    /bufferTypeBeforeWrite = this\.terminal\.buffer\.active\.type[\s\S]*?terminalRenderVersion = expectedRenderVersion[\s\S]*?terminal\.write\(data[\s\S]*?observeInteractiveLaunchOutput[\s\S]*?buffer\.active\.type === "alternate"/,
+    /bufferTypeBeforeWrite = this\.terminal\.buffer\.active\.type[\s\S]*?observeInteractiveLaunchOutput\(false, expectedRenderVersion\)[\s\S]*?terminal\.write\(data[\s\S]*?terminalRenderVersion = expectedRenderVersion[\s\S]*?observeInteractiveLaunchOutput[\s\S]*?buffer\.active\.type === "alternate"/,
   );
   assert.match(
     recovery,
@@ -448,6 +556,14 @@ test("pane maximize is a reversible workspace view and leaves sibling sessions a
     /forceVisibleTerminalResume[\s\S]*?for \(const pane of visible\)[\s\S]*?terminalsNeedingResume\.add\(pane\)/,
   );
   assert.match(layout, /for \(const pane of terminalsNeedingResume\) pane\.resumeAfterLayout\(\)/);
+  assert.match(
+    main,
+    /resumeAfterLayout\(\) \{[\s\S]*?if \(this\.disposed\) return;[\s\S]*?const reconcile[\s\S]*?requestAnimationFrame[\s\S]*?this\.scheduleFit\(0\)/,
+  );
+  assert.match(
+    main,
+    /scheduleFit\(delay = 35\)[\s\S]*?fitTerminal\(\)[\s\S]*?pinnedXtermRendererNeedsResume\(\)[\s\S]*?resumePinnedXtermRenderer\(true\)/,
+  );
   assert.doesNotMatch(layout, /rowsHost\.replaceChildren\(\)/);
   assert.doesNotMatch(layout, /dispose\(|panes\.delete/);
   assert.match(main, /if \(projectChanged\) this\.maximizedPaneId = null/);
@@ -527,11 +643,32 @@ test("live pane dragging preserves stable thresholds, frozen preview, and outsid
   assert.match(finish, /if \(!state\.started\) \{[\s\S]*?return;/);
   assert.match(
     finish,
-    /const changed =[\s\S]*?!cancelled[\s\S]*?state\.hasValidDrop[\s\S]*?!samePaneOrder[\s\S]*?const next = changed \? state\.previewOrder : state\.originalOrder/,
+    /const changed =[\s\S]*?!cancelled[\s\S]*?state\.hasValidDrop[\s\S]*?!samePaneOrder[\s\S]*?const visibleOrder = changed \? state\.previewOrder : state\.originalOrder[\s\S]*?const next = currentOrder\.map/,
   );
+  assert.match(finish, /onPaneOrderChangedCallback\(state\.projectId, orderedPaneIds\)/);
   assert.match(
     main,
     /private clearPaneDragLayout\(state: PaneDragState\)[\s\S]*?delete pane\.element\.dataset\.dragFrozen[\s\S]*?style\.transform = ""/,
+  );
+});
+
+test("mixed terminal and browser row widths persist across project activation", async () => {
+  const [main, controller] = await Promise.all([
+    source("src/main.ts"),
+    source("src/phase4-controller.ts"),
+  ]);
+  const finishStart = main.indexOf("private finishPaneResize(");
+  const finishEnd = main.indexOf("  setFooterStatus(", finishStart);
+  assert.ok(finishStart >= 0 && finishEnd > finishStart);
+  const finish = main.slice(finishStart, finishEnd);
+  assert.match(
+    finish,
+    /projectRatios\.set\([\s\S]*?this\.onPaneRatiosChangedCallback\([\s\S]*?state\.projectId[\s\S]*?state\.row\.key[\s\S]*?state\.previewRatios/,
+  );
+  assert.doesNotMatch(finish, /browserPanes\.has|instanceof BrowserPane/);
+  assert.match(
+    controller,
+    /onPaneRatiosChanged\([\s\S]*setProjectPaneWidthRatios\([\s\S]*this\.persist\(/,
   );
 });
 
@@ -721,12 +858,20 @@ test("usage, unread badges, and the single native clipboard snapshot are wired",
   assert.match(html, /id="codex-five-hour-remaining"/);
   assert.match(html, /id="codex-weekly-remaining"/);
   assert.match(html, /id="grok-remaining"/);
-  assert.equal((html.match(/class="usage-meter"/g) ?? []).length, 3);
-  assert.equal((html.match(/class="usage-reset"/g) ?? []).length, 3);
+  assert.equal((html.match(/class="usage-meter"/g) ?? []).length, 5);
+  assert.equal((html.match(/class="usage-reset"/g) ?? []).length, 5);
   assert.match(html, /viewBox="0 0 16 16"/);
   assert.match(html, /viewBox="0 0 24 23"/);
   assert.match(main, /formatProviderResetCountdown\(limit\.resetsAt\)/);
   assert.match(main, /elements\.meter\.value = limit\.remainingPercent/);
+  assert.match(
+    main,
+    /elements\.root\.dataset\.remainingTone = providerUsageRemainingTone\(limit\.remainingPercent\)/,
+  );
+  assert.match(
+    main,
+    /renderUnsupportedLimit\([\s\S]*delete elements\.root\.dataset\.remainingTone/,
+  );
   assert.match(
     main,
     /elements\.value\.textContent = tr\(`\$\{rounded\}% remaining`, `\$\{rounded\}% 남음`\)/,
@@ -750,6 +895,20 @@ test("usage, unread badges, and the single native clipboard snapshot are wired",
     /\.provider-usage-item \+ \.provider-usage-item\s*\{[\s\S]*?margin-left:\s*16px;[\s\S]*?padding-left:\s*16px/,
   );
   assert.match(styles, /\.usage-limit\[data-available="false"\] \.usage-value/);
+  for (const [tone, color] of [
+    ["yellow", "#d6b84b"],
+    ["orange", "#df873f"],
+    ["red", "#e05a5a"],
+  ]) {
+    assert.match(
+      styles,
+      new RegExp(`\\.usage-limit\\[data-remaining-tone="${tone}"\\] \\.usage-value\\s*\\{[\\s\\S]*?color:\\s*${color}`),
+    );
+    assert.match(
+      styles,
+      new RegExp(`\\.usage-limit\\[data-remaining-tone="${tone}"\\] \\.usage-meter::\\-webkit-progress-value\\s*\\{[\\s\\S]*?background:\\s*${color}`),
+    );
+  }
   assert.match(styles, /#status\[data-tone="error"\]\s*\{[\s\S]*?display:\s*block/);
   assert.match(
     styles,
@@ -795,6 +954,32 @@ test("provider usage opens a compact account-aware popover above the status bar"
     html,
     /id="grok-usage-trigger"[\s\S]*type="button"[\s\S]*aria-haspopup="dialog"[\s\S]*aria-controls="provider-usage-popover"[\s\S]*aria-expanded="false"/,
   );
+  for (const [triggerId, provider] of [
+    ["codex-usage-trigger", "codex"],
+    ["grok-usage-trigger", "grok"],
+    ["claude-code-usage-trigger", "claudeCode"],
+    ["opencode-usage-trigger", "openCode"],
+  ]) {
+    assert.match(
+      html,
+      new RegExp(
+        `id="${triggerId}"[\\s\\S]*?data-provider="${provider}"[\\s\\S]*?aria-keyshortcuts="Alt\\+ArrowLeft Alt\\+ArrowRight"`,
+      ),
+    );
+  }
+  assert.doesNotMatch(html, /class="provider-usage-item"[^>]*draggable=/);
+  for (const [inputId, provider] of [
+    ["show-statusbar-codex", "codex"],
+    ["show-statusbar-grok", "grok"],
+    ["show-statusbar-claude-code", "claudeCode"],
+    ["show-statusbar-opencode", "openCode"],
+  ]) {
+    assert.match(
+      html,
+      new RegExp(`id="${inputId}"[^>]*data-footer-provider="${provider}"`),
+    );
+  }
+  assert.match(html, /id="statusbar-order-status"[\s\S]*aria-live="polite"/);
 
   const popoverStart = html.indexOf('id="provider-usage-popover"');
   const popoverEnd = html.indexOf("</footer>", popoverStart);
@@ -826,7 +1011,34 @@ test("provider usage opens a compact account-aware popover above the status bar"
   const controllerEnd = main.indexOf("class PhoneNotificationController", controllerStart);
   assert.ok(controllerStart >= 0 && controllerEnd > controllerStart);
   const usageController = main.slice(controllerStart, controllerEnd);
-  assert.match(usageController, /toggleDetail\("codex", this\.codexTrigger\)/);
+  assert.match(
+    usageController,
+    /for \(const provider of FOOTER_PROVIDER_IDS\)[\s\S]*this\.toggleDetail\(provider, trigger\)/,
+  );
+  assert.match(
+    usageController,
+    /subscribeFooterProviderSettings\([\s\S]*this\.applyFooterSettings\(settings, true\)/,
+  );
+  assert.match(
+    usageController,
+    /applyFooterSettings\(settings: FooterProviderSettings, closeOpenDetail: boolean\)[\s\S]*this\.requestCloseDetail\(false\)/,
+  );
+  assert.match(
+    usageController,
+    /onProviderPointerDown\([\s\S]*setPointerCapture\(event\.pointerId\)[\s\S]*onProviderPointerMove\([\s\S]*crossedPointerReorderThreshold\([\s\S]*horizontalReorderTarget\([\s\S]*onProviderPointerUp\([\s\S]*reorderFooterProvider/,
+  );
+  assert.match(
+    usageController,
+    /addEventListener\("pointermove"[\s\S]*addEventListener\("pointerup"[\s\S]*addEventListener\("pointercancel"[\s\S]*"lostpointercapture"[\s\S]*onProviderPointerCancel\([\s\S]*onProviderPointerCaptureLost\([\s\S]*releasePointerCapture\(pointer\.pointerId\)/,
+  );
+  assert.match(
+    usageController,
+    /onProviderKeyDown\([\s\S]*event\.altKey[\s\S]*event\.preventDefault\(\)[\s\S]*event\.stopPropagation\(\)[\s\S]*visibleFooterProviders\(getFooterProviderSettings\(\)\)[\s\S]*reorderProviderRelative/,
+  );
+  assert.match(
+    usageController,
+    /renderUnsupportedLimit\(this\.limits\.claudeCode\.weekly, "Claude Code"\)[\s\S]*renderUnsupportedLimit\(this\.limits\.openCode\.weekly, "OpenCode"\)/,
+  );
   assert.match(
     usageController,
     /this\.detail\.closeButton\.addEventListener\("click", \(\) => this\.requestCloseDetail\(true\)/,
@@ -837,7 +1049,7 @@ test("provider usage opens a compact account-aware popover above the status bar"
   );
   assert.match(
     usageController,
-    /onDocumentPointerDown\(event: PointerEvent\)[\s\S]*this\.detail\.popover\.contains\(target\)[\s\S]*this\.codexTrigger\.contains\(target\)[\s\S]*this\.grokTrigger\.contains\(target\)[\s\S]*this\.requestCloseDetail\(false\)/,
+    /onDocumentPointerDown\(event: PointerEvent\)[\s\S]*this\.detail\.popover\.contains\(target\)[\s\S]*Object\.values\(this\.triggers\)\.some\(\(trigger\) => trigger\.contains\(target\)\)[\s\S]*this\.requestCloseDetail\(false\)/,
   );
   assert.match(
     usageController,
@@ -947,7 +1159,7 @@ test("provider usage opens a compact account-aware popover above the status bar"
   );
 
   const workspaceStart = main.indexOf("class TerminalWorkspace");
-  const workspaceEnd = main.indexOf("class BrowserController", workspaceStart);
+  const workspaceEnd = main.indexOf("class PaneLauncherController", workspaceStart);
   assert.ok(workspaceStart >= 0 && workspaceEnd > workspaceStart);
   const workspace = main.slice(workspaceStart, workspaceEnd);
   assert.match(
@@ -970,7 +1182,10 @@ test("provider usage opens a compact account-aware popover above the status bar"
     workspace,
     /setModalOverlayOpen\(reason: string, open: boolean\)[\s\S]*setBrowserSuspensionReason\(`modal:\$\{reason\}`, open\)/,
   );
-  assert.match(main, /setModalOverlayOpen\("settings", open\)/);
+  assert.match(
+    main,
+    /open \? workspace\.prepareSettingsModal\(\) : workspace\.restoreSettingsModal\(\)/,
+  );
   assert.match(
     main,
     /async function restartForProviderAccountSwitch\(provider: AgentProvider\)[\s\S]*prepareProviderAccountRestart\(provider\)[\s\S]*invoke\("shutdown_terminal_engine"\)[\s\S]*invoke\("restart_application"\)/,
@@ -987,6 +1202,23 @@ test("provider usage opens a compact account-aware popover above the status bar"
   assert.match(
     styles,
     /\.provider-usage-item:focus-visible\s*\{[\s\S]*?outline:/,
+  );
+  assert.match(styles, /\.provider-usage-item\[hidden\]\s*\{[\s\S]*?display:\s*none/);
+  assert.match(
+    usageController,
+    /trigger\.draggable = false[\s\S]*trigger\.dataset\.reorderable = String\(visible\.has\(provider\)\)/,
+  );
+  assert.match(
+    styles,
+    /\.provider-usage-item\s*\{[\s\S]*?cursor:\s*grab;[\s\S]*?touch-action:\s*none;/,
+  );
+  assert.match(
+    styles,
+    /\.provider-usage-item\[data-dragging="true"\][\s\S]*transform:\s*translateX\(var\(--reorder-offset-x, 0\)\)/,
+  );
+  assert.match(
+    styles,
+    /\.provider-usage-item\[data-drop-position="before"\]\s*\{[\s\S]*?box-shadow:\s*inset 1px 0/,
   );
   assert.match(
     styles,
@@ -1025,11 +1257,6 @@ test("provider usage opens a compact account-aware popover above the status bar"
     assert.match(handler[1], new RegExp(`\\b${command}\\b`));
   }
 
-  assert.match(
-    backend,
-    /fn read_provider_account\([\s\S]*webview: Webview[\s\S]*ensure_agent_main_webview\(&webview\)\?/,
-  );
-  assert.match(backend, /read_provider_account,[\s\S]*play_completion_sound/);
   const summaryStart = providerUsage.indexOf("pub(crate) struct ProviderAccountSummary");
   const summaryEnd = providerUsage.indexOf("pub(crate) struct ProviderLimitUsage", summaryStart);
   assert.ok(summaryStart >= 0 && summaryEnd > summaryStart);
@@ -1073,6 +1300,10 @@ test("native Explorer drops attach to the hit-tested terminal without submitting
   );
   assert.doesNotMatch(attach, /data:\s*["'](?:\\r|\\n)["']/);
   assert.match(
+    main,
+    /private async detectDroppedFileProvider\(\): Promise<DroppedFileProvider \| null>[\s\S]*?this\.launchProfile === "claude"[\s\S]*?this\.launchProfile === "opencode"[\s\S]*?this\.agentProvider \?\? launchProvider/,
+  );
+  assert.match(
     styles,
     /\.terminal-file-drop-overlay\s*\{[\s\S]*?pointer-events:\s*none[\s\S]*?border:\s*1px dashed #4a4a4a/,
   );
@@ -1104,7 +1335,7 @@ test("Discord phone notifications keep webhooks private and bind display names e
   assert.match(html, /data-i18n-en="2\. Under Integrations → Webhooks[\s\S]*data-i18n-ko="2\. 연동 → 웹후크에서 웹후크를 만들고 URL 복사/);
   assert.match(
     html,
-    /data-i18n-en="Only the project name, CLI name[\s\S]*data-i18n-ko="프로젝트명, CLI 이름, 완료\/오류 상태만 전송합니다[\s\S]*경로, PID, 프롬프트, 답변과 원문 오류는 보내지 않습니다/,
+    /data-i18n-en="Only the project name, CLI name[\s\S]*data-i18n-ko="프로젝트명, CLI 이름, 완료\/오류\/안전 검사 상태만 전송합니다[\s\S]*경로, PID, 프롬프트, 답변과 원문 오류는 보내지 않습니다/,
   );
   assert.doesNotMatch(html, /비공개 토픽|phone-notification-topic/);
   assert.match(styles, /\.settings-button\s*\{[\s\S]*grid-template-columns/);
@@ -1261,8 +1492,90 @@ test("terminal web links open a persisted browser pane without hijacking selecti
   );
   assert.match(
     main,
-    /controller\?\.addBrowserPaneFromLink\(projectId, url\) \?\? Promise\.resolve\(\)/,
+    /controller\?\.addBrowserPaneFromLink\(projectId, url\) \?\? Promise\.resolve\(null\)/,
   );
+  assert.match(linkPane, /return browser\.id/);
+});
+
+test("agent browser commands stay inside the active IHATECODING project", async () => {
+  const [main, controller] = await Promise.all([
+    source("src/main.ts"),
+    source("src/phase4-controller.ts"),
+  ]);
+  const browserPaneStart = main.indexOf("class BrowserPane");
+  const browserPaneEnd = main.indexOf("type LayoutPane", browserPaneStart);
+  assert.ok(browserPaneStart >= 0 && browserPaneEnd > browserPaneStart);
+  const browserPane = main.slice(browserPaneStart, browserPaneEnd);
+  const workspaceStart = main.indexOf("class TerminalWorkspace");
+  const workspaceEnd = main.indexOf("class PaneLauncherController", workspaceStart);
+  assert.ok(workspaceStart >= 0 && workspaceEnd > workspaceStart);
+  const workspace = main.slice(workspaceStart, workspaceEnd);
+
+  assert.match(
+    workspace,
+    /listen<unknown>\(\s*"agent-browser-command"[\s\S]*handleAgentBrowserCommand\(payload, initialization\)/,
+  );
+  assert.match(
+    workspace,
+    /handleAgentBrowserCommand\([\s\S]*await initialization;[\s\S]*executeAgentBrowserCommand/,
+  );
+  assert.match(
+    workspace,
+    /invoke\("complete_agent_browser_command", \{ response \}\)/,
+  );
+  assert.match(
+    workspace,
+    /assertAgentBrowserCommandScope\(command\.projectId, command\.terminalId\)/,
+  );
+  assert.match(
+    workspace,
+    /projectId !== this\.activeProjectId[\s\S]*requested project is not active/,
+  );
+  assert.match(
+    workspace,
+    /this\.panes\.get\(paneRuntimeId\(projectId, terminalId\)\)/,
+  );
+  assert.match(
+    workspace,
+    /listAgentBrowserPanes\(projectId[\s\S]*pane\.projectId === projectId[\s\S]*pane\.agentDescriptor\(\)/,
+  );
+  assert.match(
+    workspace,
+    /findAgentBrowserPane\(projectId[\s\S]*browserPaneRuntimeId\(projectId, paneId\)/,
+  );
+  for (const method of ["list", "open", "navigate", "screenshot", "snapshot", "click", "type"]) {
+    assert.match(workspace, new RegExp(`case "${method}"`));
+  }
+  assert.match(
+    workspace,
+    /onTerminalWebLinkOpenedCallback\(command\.projectId, url\)[\s\S]*findAgentBrowserPane\(command\.projectId, paneId\)/,
+  );
+  assert.match(
+    workspace,
+    /agentBrowserCommandRegistrationEpoch \+= 1[\s\S]*agentBrowserCommandUnlisten\?\.\(\)/,
+  );
+
+  assert.match(
+    browserPane,
+    /agentDescriptor\(\)[\s\S]*currentUrl: this\.currentUrl[\s\S]*webviewLabel: this\.webview\?\.label \?\? null/,
+  );
+  assert.match(browserPane, /agentNavigate\([\s\S]*await this\.operationQueue/);
+  assert.match(
+    browserPane,
+    /capture_browser_webview_preview[\s\S]*return \{ dataUrl \}/,
+  );
+  assert.match(browserPane, /browser_agent_snapshot/);
+  assert.match(browserPane, /browser_agent_click/);
+  assert.match(browserPane, /browser_agent_type/);
+  assert.doesNotMatch(browserPane, /openExternal|chrome\.exe|cmd\.exe|shell\.open/);
+
+  const linkStart = controller.indexOf("async addBrowserPaneFromLink(");
+  const linkEnd = controller.indexOf("private async persist", linkStart);
+  const linkPane = controller.slice(linkStart, linkEnd);
+  assert.match(linkPane, /Promise<string \| null>/);
+  assert.match(linkPane, /runtime\.addBrowserPane\(project\.id, browser, true\)/);
+  assert.match(linkPane, /return browser\.id/);
+  assert.match(main, /workspace\.installAgentBrowserCommands\(initializationPromise\)/);
 });
 
 test("opt-in idle agent sleep preserves the active project and resumes only durable conversations", async () => {
@@ -1394,7 +1707,7 @@ test("opt-in idle agent sleep preserves the active project and resumes only dura
   );
 });
 
-test("application chrome stays monochrome except for completion alerts", async () => {
+test("application chrome stays monochrome except for completion, safety, and usage alerts", async () => {
   const styles = await source("src/styles.css");
   const completionAccentColors = new Set([
     "c7a34e",
@@ -1402,6 +1715,11 @@ test("application chrome stays monochrome except for completion alerts", async (
     "8b743d",
     "f4d57a",
     "211c10",
+    "d79448",
+    "f0aa59",
+    "d6b84b",
+    "df873f",
+    "e05a5a",
   ]);
   const colors = [...styles.matchAll(/#([0-9a-f]{3,8})\b/gi)].map((match) => match[1]);
   assert.ok(colors.length > 0);
@@ -1452,7 +1770,7 @@ test("browser UI Pick copies bounded element context without granting remote IPC
   assert.match(nativePicker, /add_WebMessageReceived/);
   assert.match(nativePicker, /TryGetWebMessageAsString/);
   assert.match(nativePicker, /decode_ui_pick_transport/);
-  assert.match(nativePicker, /__IHC_UI_PICK_V1__:/);
+  assert.match(nativePicker, /__IHC_UI_PICK_V2__:/);
   assert.match(nativePicker, /Page\.captureScreenshot/);
   assert.match(nativePicker, /UNTRUSTED PAGE METADATA/);
   assert.match(nativePicker, /terminal_platform::write_clipboard_text/);
@@ -1469,24 +1787,84 @@ test("browser UI Pick copies bounded element context without granting remote IPC
   assert.match(nativePicker, /MAX_SCREENSHOT_BYTES/);
   assert.match(nativePicker, /MAX_CAPTURE_WIDTH: f64 = 1600\.0/);
   assert.match(nativePicker, /MAX_CAPTURE_HEIGHT: f64 = 1200\.0/);
+  assert.match(nativePicker, /MAX_SELECTED_ELEMENTS: usize = 32/);
+  assert.match(nativePicker, /MAX_DESCENDANTS_PER_TARGET: usize = 64/);
+  assert.match(nativePicker, /MAX_DESCENDANTS_PER_REQUEST: usize = 256/);
+  assert.match(nativePicker, /MAX_DESCENDANT_DEPTH: usize = 24/);
+  assert.match(nativePicker, /targets: Vec<BrowserUiPickTarget>/);
+  assert.match(nativePicker, /descendants: Vec<BrowserUiPickDescendant>/);
+  assert.match(nativePicker, /metadata_truncated: bool/);
+  assert.match(nativePicker, /Meaningful descendants:/);
+  assert.match(nativePicker, /Metadata truncated: yes/);
+  assert.match(nativePicker, /Selected root index \(preserved before bounded details\)/);
+  assert.match(nativePicker, /truncate_utf8_bytes\(&mut context, maximum_body\)/);
+  assert.match(nativePicker, /Selected elements:/);
+  assert.match(nativePicker, /\[Target \{\}\]/);
   assert.match(nativePicker, /create_new\(true\)/);
   assert.match(nativePicker, /cleanup_capture_cache/);
 
   assert.match(picker, /window\.addEventListener\("contextmenu"[\s\S]*\}, true\)/);
-  assert.match(picker, /event\.shiftKey \|\| !event\.isTrusted/);
+  assert.match(picker, /if \(!event\.isTrusted\) return/);
+  assert.doesNotMatch(picker, /event\.shiftKey \|\| !event\.isTrusted/);
+  assert.match(picker, /maxSelectedElements = 32/);
+  assert.match(picker, /maxDescendantsPerTarget = 64/);
+  assert.match(picker, /maxDescendantsPerRequest = 256/);
+  assert.match(picker, /maxSerializedPayloadBytes = 240 \* 1024/);
+  assert.match(picker, /selectedEntries\.length >= maxSelectedElements[\s\S]*?return/);
+  assert.match(picker, /window\.addEventListener\("pointerdown"[\s\S]*event\.button !== 2/);
+  assert.match(picker, /window\.addEventListener\("pointermove"[\s\S]*regionDragThreshold \* regionDragThreshold/);
+  assert.match(picker, /window\.addEventListener\("pointerup"[\s\S]*applyRegionSelection\(drag\)/);
+  assert.match(picker, /window\.addEventListener\("pointercancel"/);
+  assert.match(picker, /window\.addEventListener\("lostpointercapture"/);
+  assert.match(picker, /rect\.left >= region\.left[\s\S]*rect\.right <= region\.right[\s\S]*rect\.bottom <= region\.bottom/);
+  assert.match(picker, /safeCall\(documentQuerySelectorAll, document, "\*"\)/);
+  assert.match(picker, /maxRegionScanElements = 20000/);
+  assert.match(picker, /computed\.visibility === "hidden"/);
+  assert.match(picker, /positionRegionVisual\(normalizeRegion/);
+  assert.match(picker, /const baseEntries = drag\.additive \? previous : \[\]/);
+  assert.match(picker, /armGestureSuppression\(drag\)/);
+  assert.match(picker, /if \(suppressNextContextMenu\)[\s\S]*suppressNextContextMenu = 0/);
+  assert.match(picker, /if \(suppressNextAuxClick\)[\s\S]*suppressNextAuxClick = 0/);
+  assert.match(picker, /applySingleSelection\([\s\S]*Boolean\(event\.shiftKey\)/);
+  assert.match(picker, /selectedEntries\.splice\(existingIndex, 1\)/);
+  assert.match(picker, /selectedEntries\.length === 0[\s\S]*captureGeneration \+= 1[\s\S]*clearSelection\(\)[\s\S]*return/);
+  assert.match(picker, /selectionSource && selectionSource !== currentSource/);
+  assert.match(picker, /Symbol\.for\("ihatecoding\.browser-ui-pick\.v2"\)/);
+  assert.match(picker, /const snapshot = selectedEntries\.slice\(\)/);
+  assert.match(picker, /captureSelection\(snapshot|captureSelection\(liveEntries/);
+  assert.match(picker, /version: 2[\s\S]*?targets,[\s\S]*?capture,/);
+  assert.match(picker, /const focus = visibleRects\[visibleRects\.length - 1\]/);
+  assert.match(picker, /fitFocusedStart/);
+  assert.match(picker, /window\.addEventListener\("blur", cancelSelection\)/);
+  assert.match(picker, /window\.addEventListener\("resize", cancelSelection\)/);
+  assert.match(picker, /window\.addEventListener\("scroll", cancelSelection, true\)/);
+  assert.match(picker, /window\.addEventListener\("pagehide", cancelSelection\)/);
+  assert.match(picker, /entries\.some\(\(\{ element \}\) => containsPasswordInput\(element\)\)/);
+  assert.match(picker, /safeCall\(nodeCloneNode, outlineTemplate, false\)/);
+  assert.match(picker, /safeCall\(nodeAppendChild, root, outline\)/);
+  assert.match(picker, /safeCall\(nodeRemoveChild, parent, node\)/);
   assert.match(picker, /safeCall\(composedPath, event\)/);
   assert.match(picker, /safeCall\(preventDefault, event\)/);
   assert.match(picker, /safeCall\(stopImmediatePropagation, event\)/);
   assert.match(picker, /input\[type="password"\]/);
   assert.match(picker, /elementQuerySelector/);
+  assert.match(picker, /collectMeaningfulDescendants/);
+  assert.match(picker, /parentIndex: nearestCapturedAncestorIndex/);
+  assert.match(picker, /descendantsTruncated: hierarchy\.truncated/);
+  assert.match(picker, /metadataTruncated: false/);
+  assert.match(picker, /serializedPayloadBytes\(message\) > maxSerializedPayloadBytes/);
+  assert.match(picker, /Math\.floor\(remainingDescendants \/ remainingTargets\)/);
+  assert.match(picker, /const batchSize = Math\.max\(1, Math\.ceil\(maximum \/ 16\)\)/);
+  assert.match(picker, /trimPropertyRound\(message\.targets, field\)/);
+  assert.match(picker, /trimStringRound\(message\.targets, "selector", 96\)/);
   assert.match(picker, /await new Promise\(\(resolve\) => nextFrame[\s\S]*await new Promise\(\(resolve\) => nextFrame/);
   assert.match(picker, /generation !== captureGeneration/);
-  assert.match(picker, /Math\.min\(window\.innerWidth, 1600/);
-  assert.match(picker, /Math\.min\(window\.innerHeight, 1200/);
+  assert.match(picker, /Math\.min\(\s*window\.innerWidth,\s*1600/);
+  assert.match(picker, /Math\.min\(\s*window\.innerHeight,\s*1200/);
   assert.match(picker, /data-ihc-ui-pick", "anchor"/);
   assert.match(picker, /background-color/);
-  assert.match(picker, /messagePrefix = "__IHC_UI_PICK_V1__:"/);
-  assert.match(picker, /postMessage\(messagePrefix \+ JSON\.stringify\(message\)\)/);
+  assert.match(picker, /messagePrefix = "__IHC_UI_PICK_V2__:"/);
+  assert.match(picker, /postMessage\(messagePrefix \+ jsonStringify\(message\)\)/);
   assert.doesNotMatch(
     picker,
     /element\.value|localStorage|sessionStorage|document\.cookie|outerHTML|sourceHint|data-ihc-source/,

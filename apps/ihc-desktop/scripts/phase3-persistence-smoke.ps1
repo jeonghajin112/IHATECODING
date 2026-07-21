@@ -77,7 +77,6 @@ public static class IhcSmokeNativeProcess
 }
 
 $previewStoreEnvironmentVariable = 'IHATECODING_RUST_PREVIEW_PROJECTS_DIR'
-$legacyPaneEnvironmentVariable = 'IHC_PHASE2_INITIAL_PANES'
 $catalogFileName = 'projects-v1.json'
 $smokeDirectoryPrefix = 'ihatecoding-phase3-smoke-'
 $smokeMarkerFileName = '.ihatecoding-phase3-smoke-root'
@@ -1000,10 +999,6 @@ try {
         $previewStoreEnvironmentVariable,
         'Process'
     )
-    $previousLegacyPaneCount = [Environment]::GetEnvironmentVariable(
-        $legacyPaneEnvironmentVariable,
-        'Process'
-    )
     $cycleResults = New-Object System.Collections.Generic.List[object]
 
     try {
@@ -1012,9 +1007,6 @@ try {
             $storeDirectory,
             'Process'
         )
-        # Prevent a caller's Phase 2 override from influencing this catalog-only test.
-        [Environment]::SetEnvironmentVariable($legacyPaneEnvironmentVariable, $null, 'Process')
-
         Assert-CatalogInvariant `
             -CatalogPath $catalogPath `
             -ExpectedBytes $expectedCatalogBytes `
@@ -1057,11 +1049,6 @@ try {
         [Environment]::SetEnvironmentVariable(
             $previewStoreEnvironmentVariable,
             $previousPreviewStore,
-            'Process'
-        )
-        [Environment]::SetEnvironmentVariable(
-            $legacyPaneEnvironmentVariable,
-            $previousLegacyPaneCount,
             'Process'
         )
     }

@@ -31,6 +31,8 @@ const GROK_WINDOW_MINUTES: i64 = 10_080;
 pub(crate) struct ProviderUsageResponse {
     pub(crate) codex: ProviderUsage,
     pub(crate) grok: ProviderUsage,
+    pub(crate) claude_code: ProviderUsage,
+    pub(crate) open_code: ProviderUsage,
     pub(crate) read_at: String,
 }
 
@@ -217,6 +219,12 @@ fn read_provider_usage_at(paths: UsagePaths, now: SystemTime) -> ProviderUsageRe
     ProviderUsageResponse {
         codex: read_codex(paths.codex_sessions.as_deref(), now_millis),
         grok: read_grok(paths.grok_log.as_deref(), now_millis),
+        // Neither Claude Code nor OpenCode currently exposes a stable local
+        // subscription-quota contract. Claude's auth status can identify the
+        // signed-in account, and OpenCode can report configured providers, but
+        // presenting either as a quota percentage would be fabricated data.
+        claude_code: empty_provider(),
+        open_code: empty_provider(),
         read_at: format_rfc3339_millis(now_millis).unwrap_or_else(epoch_rfc3339),
     }
 }
@@ -1187,6 +1195,8 @@ mod tests {
                 updated_at: Some("1970-01-01T00:00:05Z".into()),
             },
             grok: empty_provider(),
+            claude_code: empty_provider(),
+            open_code: empty_provider(),
             read_at: "1970-01-01T00:00:01Z".into(),
         };
         let encoded = serde_json::to_string(&response).expect("serialize response");
@@ -1195,6 +1205,8 @@ mod tests {
         assert!(encoded.contains("\"usedPercent\":25.0"));
         assert!(encoded.contains("\"resetsAt\":\"1970-01-01T00:00:10Z\""));
         assert!(encoded.contains("\"readAt\":\"1970-01-01T00:00:01Z\""));
+        assert!(encoded.contains("\"claudeCode\""));
+        assert!(encoded.contains("\"openCode\""));
         assert!(!encoded.contains("remainingPercent"));
         assert!(!encoded.contains("path"));
         assert!(!encoded.contains("transcript"));
@@ -1254,7 +1266,32 @@ mod tests {
         let response = read_provider_usage_at(paths(None, None), fixed_now());
         assert_eq!(response.codex, empty_provider());
         assert_eq!(response.grok, empty_provider());
+        assert_eq!(response.claude_code, empty_provider());
+        assert_eq!(response.open_code, empty_provider());
         assert_eq!(response.read_at, "2023-11-14T22:13:20Z");
+    }
+
+    #[test]
+    fn provider_usage_contract_includes_unsupported_clis_without_inventing_limits() {
+        let response = read_provider_usage_at(paths(None, None), fixed_now());
+        let value = serde_json::to_value(response).expect("serialize provider usage");
+
+        assert_eq!(
+            value["claudeCode"],
+            json!({
+                "fiveHour": null,
+                "weekly": null,
+                "updatedAt": null
+            })
+        );
+        assert_eq!(
+            value["openCode"],
+            json!({
+                "fiveHour": null,
+                "weekly": null,
+                "updatedAt": null
+            })
+        );
     }
 
     #[test]

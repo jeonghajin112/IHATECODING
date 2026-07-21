@@ -1,7 +1,7 @@
 [package]
 name = "ihatecoding"
 version = "1.0.0"
-description = "Lightweight multi-terminal workspace for Codex and Grok"
+description = "The AI workspace for autonomous development"
 authors = ["IHATECODING contributors"]
 edition = "2024"
 
@@ -26,7 +26,7 @@ custom-protocol = ["tauri/custom-protocol"]
 # browser beside terminal panes.
 # Native WebView handles are version-coupled to Tauri's Wry dependencies.
 # Keep the minor release pinned when using `Webview::with_webview` below.
-tauri = { version = "~2.11.5", features = ["image-png", "unstable"] }
+tauri = { version = "~2.11.5", features = ["image-png", "protocol-asset", "unstable"] }
 tauri-plugin-dialog = "2"
 portable-pty = "0.9.0"
 base64 = "0.22"

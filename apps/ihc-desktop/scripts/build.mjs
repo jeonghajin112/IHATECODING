@@ -6,6 +6,23 @@ import { fileURLToPath } from "node:url";
 const serve = process.argv.includes("--serve");
 const outputDirectory = new URL("../dist/", import.meta.url);
 const assetDirectory = new URL("../dist/assets/", import.meta.url);
+const providerIconSourceDirectory = new URL(
+  "../src/assets/provider-icons/",
+  import.meta.url,
+);
+const providerIconOutputDirectory = new URL(
+  "../dist/assets/provider-icons/",
+  import.meta.url,
+);
+const providerIconNames = [
+  "browser.svg",
+  "claude-code.svg",
+  "codex.svg",
+  "cursor.svg",
+  "grok.svg",
+  "opencode.svg",
+  "powershell.svg",
+];
 const entryPoint = fileURLToPath(new URL("../src/main.ts", import.meta.url));
 const scriptOutput = fileURLToPath(
   new URL("../dist/assets/main.js", import.meta.url),
@@ -14,9 +31,22 @@ const serveDirectory = fileURLToPath(outputDirectory);
 
 await rm(outputDirectory, { recursive: true, force: true });
 await mkdir(assetDirectory, { recursive: true });
+await mkdir(providerIconOutputDirectory, { recursive: true });
 await copyFile(
   new URL("../index.html", import.meta.url),
   new URL("../dist/index.html", import.meta.url),
+);
+await copyFile(
+  new URL("../src-tauri/icons/32x32.png", import.meta.url),
+  new URL("../dist/assets/app-icon.png", import.meta.url),
+);
+await Promise.all(
+  providerIconNames.map((name) =>
+    copyFile(
+      new URL(name, providerIconSourceDirectory),
+      new URL(name, providerIconOutputDirectory),
+    ),
+  ),
 );
 
 const context = await esbuild.context({

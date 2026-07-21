@@ -2,6 +2,7 @@ import { normalizeWorkspaceState } from "./phase3b-core";
 import { formatAppNumber, tr } from "./i18n";
 
 export type AgentProvider = "codex" | "grok";
+export type DroppedFileProvider = AgentProvider | "claude" | "opencode";
 
 export type RectangleBounds = {
   left: number;
@@ -119,6 +120,17 @@ export type ProviderLimitUsage = {
   updatedAt: string;
 };
 
+export type ProviderUsageRemainingTone = "normal" | "yellow" | "orange" | "red";
+
+export function providerUsageRemainingTone(
+  remainingPercent: number,
+): ProviderUsageRemainingTone {
+  if (remainingPercent <= 10) return "red";
+  if (remainingPercent <= 30) return "orange";
+  if (remainingPercent <= 50) return "yellow";
+  return "normal";
+}
+
 export type ProviderAccountAuthMode = "chatgpt" | "apiKey" | "xai";
 
 export type ProviderAccountSummary = {
@@ -150,6 +162,8 @@ export type ProviderUsage = {
 export type ProviderUsageResponse = {
   codex: ProviderUsage;
   grok: ProviderUsage;
+  claudeCode: ProviderUsage;
+  openCode: ProviderUsage;
   readAt: string;
 };
 
@@ -171,6 +185,33 @@ export function scanTerminalLaunchControl(tail: string, data: string) {
     detected: TERMINAL_LAUNCH_CONTROL_PATTERN.test(combined),
     tail: combined.slice(-TERMINAL_LAUNCH_ESCAPE_TAIL_LENGTH),
   };
+}
+
+/**
+ * Codex renders safety buffering as a modal inside its alternate-screen TUI.
+ * Call this with xterm's current visible-screen text, not raw PTY bytes: raw
+ * output contains cursor rewrites and old scrollback can retain a dismissed
+ * modal long after it is no longer actionable.
+ */
+export function isCodexSafetyBufferingScreen(screenText: string) {
+  const text = screenText.replace(/\s+/g, " ").trim().toLowerCase();
+  if (!text) return false;
+
+  const retry = text.includes("retry with a faster model");
+  const keepWaiting =
+    text.includes("keep waiting") || text.includes("dismiss and keep waiting");
+  const currentPrompt = text.includes(
+    "our systems are thinking a bit more about this request before responding.",
+  );
+  const legacyHeader = text.includes("additional safety checks");
+  const legacyPrompt = text.includes(
+    "this request requires additional safety checks, which can take extra time.",
+  );
+
+  return (
+    (currentPrompt && (retry || keepWaiting)) ||
+    (legacyHeader && legacyPrompt && (retry || keepWaiting))
+  );
 }
 
 export type TerminalDirectPaintState = {
@@ -205,6 +246,87 @@ export function shouldForceDirectTerminalRefresh(
     (state.firstBatchAfterIdle ||
       state.millisecondsSinceLastForcedRefresh >= minimumIntervalMs)
   );
+}
+
+export type EditableTerminalLine = {
+  row: number;
+  anchorColumn: number;
+  cursorColumn: number;
+  lineEndColumn: number;
+};
+
+export type TerminalBufferSelection = {
+  start: { x: number; y: number };
+  end: { x: number; y: number };
+};
+
+export type EditableTerminalRange = {
+  row: number;
+  startColumn: number;
+  endColumn: number;
+};
+
+function isSafeTerminalCoordinate(value: number) {
+  return Number.isSafeInteger(value) && value >= 0;
+}
+
+function isValidEditableTerminalLine(line: EditableTerminalLine) {
+  return (
+    isSafeTerminalCoordinate(line.row) &&
+    isSafeTerminalCoordinate(line.anchorColumn) &&
+    isSafeTerminalCoordinate(line.cursorColumn) &&
+    isSafeTerminalCoordinate(line.lineEndColumn) &&
+    line.anchorColumn <= line.cursorColumn &&
+    line.cursorColumn <= line.lineEndColumn
+  );
+}
+
+/**
+ * Produces the single-row xterm selection used by Ctrl+A. The caller still
+ * verifies that this row belongs to the live normal-buffer input prompt.
+ */
+export function planEditableTerminalSelectAll(
+  line: EditableTerminalLine,
+): EditableTerminalRange | null {
+  if (!isValidEditableTerminalLine(line) || line.lineEndColumn <= line.anchorColumn) {
+    return null;
+  }
+  return {
+    row: line.row,
+    startColumn: line.anchorColumn,
+    endColumn: line.lineEndColumn,
+  };
+}
+
+/**
+ * Accepts Backspace deletion only when xterm's complete selection is wholly
+ * inside the one live editable row. Output and cross-row selections fail closed.
+ */
+export function planEditableTerminalSelectionDelete(
+  line: EditableTerminalLine,
+  selection: TerminalBufferSelection | undefined,
+): EditableTerminalRange | null {
+  if (!isValidEditableTerminalLine(line) || !selection) return null;
+  const coordinates = [
+    selection.start.x,
+    selection.start.y,
+    selection.end.x,
+    selection.end.y,
+  ];
+  if (!coordinates.every(isSafeTerminalCoordinate)) return null;
+  if (selection.start.y !== line.row || selection.end.y !== line.row) return null;
+  if (
+    selection.start.x < line.anchorColumn ||
+    selection.end.x > line.lineEndColumn ||
+    selection.start.x >= selection.end.x
+  ) {
+    return null;
+  }
+  return {
+    row: line.row,
+    startColumn: selection.start.x,
+    endColumn: selection.end.x,
+  };
 }
 
 /**
@@ -514,6 +636,8 @@ export function normalizeProviderUsageResponse(value: unknown): ProviderUsageRes
   return {
     codex: normalizeProviderUsage(response.codex, "codex"),
     grok: normalizeProviderUsage(response.grok, "grok"),
+    claudeCode: normalizeProviderUsage(response.claudeCode, "claudeCode"),
+    openCode: normalizeProviderUsage(response.openCode, "openCode"),
     readAt: requireRfc3339(response.readAt, "readAt"),
   };
 }
@@ -530,7 +654,7 @@ export function millisecondsUntilNextProviderUsageReset(
   requireFiniteNumber(nowUnixMs, "current time");
   let nearestDelayMs: number | null = null;
 
-  for (const provider of [usage.codex, usage.grok]) {
+  for (const provider of [usage.codex, usage.grok, usage.claudeCode, usage.openCode]) {
     for (const limit of [provider.fiveHour, provider.weekly]) {
       if (limit === null) continue;
       const delayMs = Date.parse(limit.resetsAt) - nowUnixMs;
@@ -726,17 +850,24 @@ export function isLikelyImageFilePath(path: string): boolean {
 
 /**
  * Codex turns a pasted image path into a real image attachment. Other agent
- * files use their @-file reference syntax; a plain shell receives only an
- * inert quoted path. Windows file names cannot contain a double quote.
+ * files use their @-file reference syntax; a plain PowerShell receives a
+ * single-quoted literal so `$()`, variables, and backticks never interpolate.
  */
 export function formatDroppedFileReference(
-  provider: AgentProvider | null | undefined,
+  provider: DroppedFileProvider | null | undefined,
   path: string,
 ): string {
   const quotedPath = `"${path}"`;
   if (provider === "codex" && isLikelyImageFilePath(path)) return quotedPath;
-  if (provider === "codex" || provider === "grok") return `@${quotedPath}`;
-  return quotedPath;
+  if (
+    provider === "codex" ||
+    provider === "grok" ||
+    provider === "claude" ||
+    provider === "opencode"
+  ) {
+    return `@${quotedPath}`;
+  }
+  return `'${path.replace(/'/g, "''")}'`;
 }
 
 export type TerminalShortcutEvent = Readonly<{

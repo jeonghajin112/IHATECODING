@@ -36,6 +36,7 @@ pub(crate) struct PhoneNotificationSettings {
     pub(crate) webhook_configured: bool,
     pub(crate) notify_on_success: bool,
     pub(crate) notify_on_error: bool,
+    pub(crate) notify_on_safety_check: bool,
 }
 
 #[derive(Deserialize)]
@@ -46,6 +47,7 @@ pub(crate) struct SavePhoneNotificationSettingsRequest {
     pub(crate) clear_webhook: bool,
     pub(crate) notify_on_success: bool,
     pub(crate) notify_on_error: bool,
+    pub(crate) notify_on_safety_check: bool,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -53,6 +55,7 @@ pub(crate) struct SavePhoneNotificationSettingsRequest {
 pub(crate) enum PhoneNotificationKind {
     Success,
     Error,
+    SafetyCheck,
     Test,
 }
 
@@ -78,6 +81,7 @@ struct RuntimeSettings {
     webhook_url: Option<String>,
     notify_on_success: bool,
     notify_on_error: bool,
+    notify_on_safety_check: bool,
 }
 
 impl Default for RuntimeSettings {
@@ -87,6 +91,7 @@ impl Default for RuntimeSettings {
             webhook_url: None,
             notify_on_success: true,
             notify_on_error: true,
+            notify_on_safety_check: true,
         }
     }
 }
@@ -98,6 +103,7 @@ impl RuntimeSettings {
             webhook_configured: self.webhook_url.is_some(),
             notify_on_success: self.notify_on_success,
             notify_on_error: self.notify_on_error,
+            notify_on_safety_check: self.notify_on_safety_check,
         }
     }
 }
@@ -110,6 +116,12 @@ struct DiskSettings {
     protected_webhook: Option<String>,
     notify_on_success: bool,
     notify_on_error: bool,
+    #[serde(default = "default_enabled_notification_kind")]
+    notify_on_safety_check: bool,
+}
+
+const fn default_enabled_notification_kind() -> bool {
+    true
 }
 
 pub(crate) struct PhoneNotificationService {
@@ -197,6 +209,7 @@ impl PhoneNotificationService {
         next.enabled = request.enabled;
         next.notify_on_success = request.notify_on_success;
         next.notify_on_error = request.notify_on_error;
+        next.notify_on_safety_check = request.notify_on_safety_check;
         if next.enabled && next.webhook_url.is_none() {
             return Err("Configure a Discord webhook before enabling notifications.".to_owned());
         }
@@ -507,6 +520,7 @@ fn load_settings(path: &Path) -> Option<RuntimeSettings> {
         webhook_url,
         notify_on_success: disk.notify_on_success,
         notify_on_error: disk.notify_on_error,
+        notify_on_safety_check: disk.notify_on_safety_check,
     })
 }
 
@@ -528,6 +542,7 @@ fn save_settings(path: &Path, settings: &RuntimeSettings) -> Result<(), String> 
         protected_webhook,
         notify_on_success: settings.notify_on_success,
         notify_on_error: settings.notify_on_error,
+        notify_on_safety_check: settings.notify_on_safety_check,
     };
     let bytes = serde_json::to_vec_pretty(&disk)
         .map_err(|_| "Could not encode phone notification settings.".to_owned())?;
@@ -651,9 +666,11 @@ fn notification_payload(
     let (icon, status) = match (kind, korean) {
         (PhoneNotificationKind::Success, false) => ("✅", "completed"),
         (PhoneNotificationKind::Error, false) => ("⚠️", "error"),
+        (PhoneNotificationKind::SafetyCheck, false) => ("🛡️", "waiting for a safety check"),
         (PhoneNotificationKind::Test, false) => ("🔔", "Discord notification test"),
         (PhoneNotificationKind::Success, true) => ("✅", "작업 완료"),
         (PhoneNotificationKind::Error, true) => ("⚠️", "오류 발생"),
+        (PhoneNotificationKind::SafetyCheck, true) => ("🛡️", "안전 검사 대기"),
         (PhoneNotificationKind::Test, true) => ("🔔", "Discord 알림 테스트"),
     };
     let content = format!(
@@ -685,6 +702,7 @@ fn kind_enabled(settings: &RuntimeSettings, kind: PhoneNotificationKind) -> bool
     match kind {
         PhoneNotificationKind::Success => settings.notify_on_success,
         PhoneNotificationKind::Error => settings.notify_on_error,
+        PhoneNotificationKind::SafetyCheck => settings.notify_on_safety_check,
         PhoneNotificationKind::Test => true,
     }
 }
@@ -974,6 +992,7 @@ mod tests {
             clear_webhook,
             notify_on_success: true,
             notify_on_error: true,
+            notify_on_safety_check: true,
         }
     }
 
@@ -994,6 +1013,7 @@ mod tests {
             webhook_url: Some(VALID_WEBHOOK.to_owned()),
             notify_on_success: true,
             notify_on_error: true,
+            notify_on_safety_check: true,
         };
         service
     }
@@ -1005,6 +1025,7 @@ mod tests {
             webhook_url: Some(VALID_WEBHOOK.to_owned()),
             notify_on_success: true,
             notify_on_error: true,
+            notify_on_safety_check: true,
         }
         .public();
         let json = serde_json::to_string(&public).unwrap();
@@ -1087,6 +1108,44 @@ mod tests {
         .unwrap();
         assert!(String::from_utf8(english).unwrap().contains("completed"));
         assert!(String::from_utf8(korean).unwrap().contains("작업 완료"));
+    }
+
+    #[test]
+    fn safety_check_payload_is_distinct_and_existing_settings_default_to_enabled() {
+        let english = notification_payload(
+            PhoneNotificationKind::SafetyCheck,
+            "IHATECODING",
+            "MAIN",
+            Some("en"),
+        )
+        .unwrap();
+        let korean = notification_payload(
+            PhoneNotificationKind::SafetyCheck,
+            "IHATECODING",
+            "MAIN",
+            Some("ko"),
+        )
+        .unwrap();
+        assert!(
+            String::from_utf8(english)
+                .unwrap()
+                .contains("waiting for a safety check")
+        );
+        assert!(
+            String::from_utf8(korean)
+                .unwrap()
+                .contains("안전 검사 대기")
+        );
+
+        let legacy: DiskSettings = serde_json::from_value(serde_json::json!({
+            "version": SETTINGS_VERSION,
+            "enabled": false,
+            "protectedWebhook": null,
+            "notifyOnSuccess": true,
+            "notifyOnError": true
+        }))
+        .unwrap();
+        assert!(legacy.notify_on_safety_check);
     }
 
     #[test]

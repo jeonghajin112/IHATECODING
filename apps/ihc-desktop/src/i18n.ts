@@ -93,6 +93,126 @@ const BACKEND_ERROR_TRANSLATIONS: Readonly<Record<string, string>> = {
   "CLI 로그인 인수가 안전하지 않습니다.": "The CLI login arguments are unsafe.",
 };
 
+const ENGLISH_BACKEND_ERROR_TRANSLATIONS: Readonly<Record<string, string>> = {
+  "The project-relative path is invalid.": "프로젝트 상대 경로가 올바르지 않습니다.",
+  "The requested path is not a safe regular project path.":
+    "요청한 경로가 안전한 일반 프로젝트 경로가 아닙니다.",
+  "The workspace project catalog is unavailable.":
+    "작업공간 프로젝트 목록을 사용할 수 없습니다.",
+  "The project no longer exists.": "프로젝트가 더 이상 존재하지 않습니다.",
+  "The project folder is unavailable.": "프로젝트 폴더를 사용할 수 없습니다.",
+  "The project directory no longer exists.": "프로젝트 폴더가 더 이상 존재하지 않습니다.",
+  "The project directory could not be read.": "프로젝트 폴더를 읽지 못했습니다.",
+  "The project directory reader did not complete.":
+    "프로젝트 폴더 읽기 작업이 완료되지 않았습니다.",
+  "The project file opener did not complete.": "프로젝트 파일 열기 작업이 완료되지 않았습니다.",
+  "The project file reader did not complete.": "프로젝트 파일 읽기 작업이 완료되지 않았습니다.",
+  "The project file writer did not complete.": "프로젝트 파일 저장 작업이 완료되지 않았습니다.",
+  "Select a regular project file to edit.": "편집할 일반 프로젝트 파일을 선택하세요.",
+  "The project file no longer exists.": "프로젝트 파일이 더 이상 존재하지 않습니다.",
+  "The project file could not be read.": "프로젝트 파일을 읽지 못했습니다.",
+  "The project file is too large for the lightweight editor.":
+    "프로젝트 파일이 경량 편집기에서 열기에는 너무 큽니다.",
+  "The project file is not UTF-8 text.": "프로젝트 파일이 UTF-8 텍스트가 아닙니다.",
+  "The project file is not a supported text file.": "지원하는 텍스트 파일이 아닙니다.",
+  "The project file revision is invalid.": "프로젝트 파일 버전 정보가 올바르지 않습니다.",
+  "The project file changed on disk. Reload it before saving.":
+    "디스크의 프로젝트 파일이 변경되었습니다. 저장하기 전에 다시 불러오세요.",
+  "The project file is not writable.": "프로젝트 파일에 쓸 수 없습니다.",
+  "The project file could not be saved.": "프로젝트 파일을 저장하지 못했습니다.",
+  "Windows could not atomically save the project file.":
+    "Windows에서 프로젝트 파일을 안전하게 교체 저장하지 못했습니다.",
+  "Select an absolute local media folder.": "절대 경로의 로컬 미디어 폴더를 선택하세요.",
+  "The media folder permission is no longer available.":
+    "미디어 폴더 접근 권한을 더 이상 사용할 수 없습니다.",
+  "The media-relative path is invalid.": "미디어 상대 경로가 올바르지 않습니다.",
+  "The requested path is not a safe regular media path.":
+    "요청한 경로가 안전한 일반 미디어 경로가 아닙니다.",
+  "The selected media folder is unavailable.": "선택한 미디어 폴더를 사용할 수 없습니다.",
+  "The media directory no longer exists.": "미디어 폴더가 더 이상 존재하지 않습니다.",
+  "The media directory could not be read.": "미디어 폴더를 읽지 못했습니다.",
+  "Select a regular media file.": "일반 미디어 파일을 선택하세요.",
+  "A media path component is not a directory.": "미디어 경로의 일부가 폴더가 아닙니다.",
+  "The requested media entry no longer exists.": "요청한 미디어 항목이 더 이상 존재하지 않습니다.",
+  "The requested media entry could not be inspected.": "요청한 미디어 항목을 확인하지 못했습니다.",
+  "The requested media entry is not a directory.": "요청한 미디어 항목이 폴더가 아닙니다.",
+  "The requested media entry is not a regular file.": "요청한 미디어 항목이 일반 파일이 아닙니다.",
+  "This file type cannot be previewed in the media browser.":
+    "콘텐츠 브라우저에서 미리 볼 수 없는 파일 형식입니다.",
+  "Select no more than 20 media files at once.": "미디어 파일은 한 번에 최대 20개까지 선택하세요.",
+  "Select no more than 20 files at once.": "파일은 한 번에 최대 20개까지 선택하세요.",
+  "Too many media folders are open. Restart the application to clear old permissions.":
+    "열린 미디어 폴더가 너무 많습니다. 이전 권한을 지우려면 앱을 다시 시작하세요.",
+  "The media permission store is unavailable.": "미디어 접근 권한 저장소를 사용할 수 없습니다.",
+  "The selected media folder crosses a symbolic link or reparse point.":
+    "선택한 미디어 폴더 경로에 심볼릭 링크 또는 재분석 지점이 있습니다.",
+  "The media folder grant did not complete.": "미디어 폴더 접근 허용 작업이 완료되지 않았습니다.",
+  "The media folder picker did not complete.": "미디어 폴더 선택 작업이 완료되지 않았습니다.",
+  "The media location opener did not complete.": "콘텐츠 위치 열기 작업이 완료되지 않았습니다.",
+  "The media volume reader did not complete.": "저장소 목록 읽기 작업이 완료되지 않았습니다.",
+  "The requested media location is not a regular file or directory.":
+    "요청한 콘텐츠 위치가 일반 파일 또는 폴더가 아닙니다.",
+  "The available Windows storage volumes could not be read.":
+    "사용 가능한 Windows 저장소를 읽지 못했습니다.",
+  "The available Windows storage volumes changed while being read.":
+    "읽는 동안 사용 가능한 Windows 저장소 목록이 변경되었습니다.",
+  "The media directory reader did not complete.": "미디어 폴더 읽기 작업이 완료되지 않았습니다.",
+  "The media preview could not be authorized.": "미디어 미리보기 접근을 허용하지 못했습니다.",
+  "The media selection resolver did not complete.": "미디어 선택 확인 작업이 완료되지 않았습니다.",
+  "The content selection resolver did not complete.": "콘텐츠 선택 확인 작업이 완료되지 않았습니다.",
+  "The content entry opener did not complete.": "콘텐츠 열기 작업이 완료되지 않았습니다.",
+  "The file manager opener did not complete.": "파일 탐색기 열기 작업이 완료되지 않았습니다.",
+  "The content path resolver did not complete.": "콘텐츠 경로 확인 작업이 완료되지 않았습니다.",
+  "The content file deleter did not complete.": "콘텐츠 파일 삭제 작업이 완료되지 않았습니다.",
+  "The selected content could not be opened.": "선택한 콘텐츠를 열지 못했습니다.",
+  "The file manager could not reveal the selected content.":
+    "파일 탐색기에서 선택한 콘텐츠를 표시하지 못했습니다.",
+  "The selected file no longer exists.": "선택한 파일이 더 이상 존재하지 않습니다.",
+  "The selected file could not be deleted.": "선택한 파일을 삭제하지 못했습니다.",
+  "This file type can execute commands and cannot be opened from the content browser.":
+    "명령을 실행할 수 있는 파일 형식이라 콘텐츠 브라우저에서 직접 열 수 없습니다.",
+  "Windows could not open the selected content with its default application.":
+    "Windows 기본 앱으로 선택한 콘텐츠를 열지 못했습니다.",
+  "Windows Explorer could not reveal the selected content.":
+    "Windows 파일 탐색기에서 선택한 콘텐츠를 표시하지 못했습니다.",
+  "The project name cannot be a relative path component.":
+    "프로젝트 이름에는 상대 경로를 사용할 수 없습니다.",
+  "The project name cannot end with a space or period.":
+    "프로젝트 이름은 공백이나 마침표로 끝날 수 없습니다.",
+  "The project name contains characters that Windows does not allow in folder names.":
+    "프로젝트 이름에 Windows 폴더에서 사용할 수 없는 문자가 있습니다.",
+  "The project name is reserved by Windows.": "Windows에서 예약된 이름은 사용할 수 없습니다.",
+  "The project folder path cannot be represented as Unicode.":
+    "프로젝트 폴더 경로를 유니코드로 표현할 수 없습니다.",
+  "The project folder did not resolve to an absolute path.":
+    "프로젝트 폴더가 절대 경로로 확인되지 않았습니다.",
+  "The Documents folder is unavailable.": "문서 폴더를 사용할 수 없습니다.",
+  "The configured Documents path is not a folder.": "설정된 문서 경로가 폴더가 아닙니다.",
+  "The Documents folder could not be resolved safely.":
+    "문서 폴더의 안전한 경로를 확인하지 못했습니다.",
+  "A file or folder with that project name already exists in Documents.":
+    "문서 폴더에 같은 프로젝트 이름의 파일이나 폴더가 이미 있습니다.",
+  "The project folder could not be created in Documents.":
+    "문서 폴더에 프로젝트 폴더를 만들지 못했습니다.",
+  "The new project folder could not be resolved safely.":
+    "새 프로젝트 폴더의 안전한 경로를 확인하지 못했습니다.",
+  "The new project folder could not be inspected safely.":
+    "새 프로젝트 폴더를 안전하게 확인하지 못했습니다.",
+  "The new project folder is not a safe regular directory.":
+    "새 프로젝트 폴더가 안전한 일반 폴더가 아닙니다.",
+  "The new project folder resolved outside Documents.":
+    "새 프로젝트 폴더가 문서 폴더 밖의 경로로 확인되었습니다.",
+  "The new project folder is no longer empty and was left unchanged.":
+    "새 프로젝트 폴더가 더 이상 비어 있지 않아 그대로 유지했습니다.",
+  "The empty project folder could not be removed safely.":
+    "빈 프로젝트 폴더를 안전하게 제거하지 못했습니다.",
+  "The Documents folder could not be located.": "문서 폴더의 위치를 찾지 못했습니다.",
+  "The project folder creation worker did not complete.":
+    "프로젝트 폴더 생성 작업이 완료되지 않았습니다.",
+  "The project folder cleanup worker did not complete.":
+    "프로젝트 폴더 정리 작업이 완료되지 않았습니다.",
+};
+
 export function resolveAppLanguage(
   storedLanguage: string | null | undefined,
   systemLanguages: readonly string[] = [],
@@ -123,7 +243,13 @@ export function formatAppNumber(value: number): string {
 }
 
 export function localizeBackendMessage(message: string): string {
-  if (currentLanguage === "ko") return message;
+  if (currentLanguage === "ko") {
+    let localized = message;
+    for (const [english, korean] of Object.entries(ENGLISH_BACKEND_ERROR_TRANSLATIONS)) {
+      localized = localized.split(english).join(korean);
+    }
+    return localized;
+  }
   let localized = message;
   for (const [korean, english] of Object.entries(BACKEND_ERROR_TRANSLATIONS)) {
     localized = localized.split(korean).join(english);
