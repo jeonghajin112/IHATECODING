@@ -64,6 +64,158 @@ test("layoutFor preserves the compact grid and grows rows without exceeding five
   }
 });
 
+test("layoutPlanFor fills trailing final-row gaps from the panes directly above", () => {
+  const compact = (count) => {
+    const plan = core.layoutPlanFor(count);
+    return {
+      columns: plan.columns,
+      rows: plan.rows,
+      placements: plan.placements.map(
+        ({ index, row, column, rowSpan }) => `${index}:${row},${column}x${rowSpan}`,
+      ),
+    };
+  };
+
+  assert.deepEqual(compact(3), {
+    columns: 2,
+    rows: 2,
+    placements: ["0:0,0x1", "1:0,1x2", "2:1,0x1"],
+  });
+  assert.deepEqual(compact(5), {
+    columns: 3,
+    rows: 2,
+    placements: ["0:0,0x1", "1:0,1x1", "2:0,2x2", "3:1,0x1", "4:1,1x1"],
+  });
+  assert.deepEqual(compact(10), {
+    columns: 4,
+    rows: 3,
+    placements: [
+      "0:0,0x1",
+      "1:0,1x1",
+      "2:0,2x1",
+      "3:0,3x1",
+      "4:1,0x1",
+      "5:1,1x1",
+      "6:1,2x2",
+      "7:1,3x2",
+      "8:2,0x1",
+      "9:2,1x1",
+    ],
+  });
+  assert.deepEqual(compact(17), {
+    columns: 5,
+    rows: 4,
+    placements: [
+      "0:0,0x1",
+      "1:0,1x1",
+      "2:0,2x1",
+      "3:0,3x1",
+      "4:0,4x1",
+      "5:1,0x1",
+      "6:1,1x1",
+      "7:1,2x1",
+      "8:1,3x1",
+      "9:1,4x1",
+      "10:2,0x1",
+      "11:2,1x1",
+      "12:2,2x2",
+      "13:2,3x2",
+      "14:2,4x2",
+      "15:3,0x1",
+      "16:3,1x1",
+    ],
+  });
+  assert.deepEqual(compact(21), {
+    columns: 5,
+    rows: 5,
+    placements: [
+      "0:0,0x1",
+      "1:0,1x1",
+      "2:0,2x1",
+      "3:0,3x1",
+      "4:0,4x1",
+      "5:1,0x1",
+      "6:1,1x1",
+      "7:1,2x1",
+      "8:1,3x1",
+      "9:1,4x1",
+      "10:2,0x1",
+      "11:2,1x1",
+      "12:2,2x1",
+      "13:2,3x1",
+      "14:2,4x1",
+      "15:3,0x1",
+      "16:3,1x2",
+      "17:3,2x2",
+      "18:3,3x2",
+      "19:3,4x2",
+      "20:4,0x1",
+    ],
+  });
+});
+
+test("layoutPlanFor covers every grid cell exactly once and preserves pane order", () => {
+  const empty = core.layoutPlanFor(0);
+  assert.deepEqual(empty, { columns: 1, rows: 1, placements: [] });
+
+  for (let count = 1; count <= 100; count += 1) {
+    const plan = core.layoutPlanFor(count);
+    assert.deepEqual(
+      { columns: plan.columns, rows: plan.rows },
+      core.layoutFor(count),
+      `pane count ${count} keeps the established grid dimensions`,
+    );
+    assert.equal(plan.placements.length, count, `pane count ${count}`);
+
+    const covered = Array.from({ length: plan.rows }, () =>
+      Array(plan.columns).fill(null),
+    );
+    let previousOrigin = -1;
+
+    for (const [expectedIndex, placement] of plan.placements.entries()) {
+      assert.deepEqual(
+        Object.keys(placement).sort(),
+        ["column", "index", "row", "rowSpan"],
+        `pane ${expectedIndex} has no horizontal-span metadata`,
+      );
+      assert.equal(placement.index, expectedIndex, `pane count ${count} order`);
+      assert.ok(placement.row >= 0 && placement.row < plan.rows);
+      assert.ok(placement.column >= 0 && placement.column < plan.columns);
+      assert.ok(
+        placement.rowSpan === 1 || placement.rowSpan === 2,
+        `pane ${expectedIndex} has a supported vertical span`,
+      );
+      assert.ok(
+        placement.row + placement.rowSpan <= plan.rows,
+        `pane ${expectedIndex} stays inside the grid`,
+      );
+
+      const origin = placement.row * plan.columns + placement.column;
+      assert.ok(origin > previousOrigin, `pane count ${count} preserves row-major order`);
+      previousOrigin = origin;
+
+      for (let row = placement.row; row < placement.row + placement.rowSpan; row += 1) {
+        assert.equal(
+          covered[row][placement.column],
+          null,
+          `pane count ${count} does not overlap at ${row},${placement.column}`,
+        );
+        covered[row][placement.column] = placement.index;
+      }
+    }
+
+    for (let row = 0; row < plan.rows; row += 1) {
+      for (let column = 0; column < plan.columns; column += 1) {
+        assert.notEqual(
+          covered[row][column],
+          null,
+          `pane count ${count} fills ${row},${column}`,
+        );
+      }
+    }
+  }
+});
+
 test("clampPaneCount normalizes the lower bound without imposing a product maximum", () => {
   assert.equal(core.clampPaneCount(Number.NaN), 1);
   assert.equal(core.clampPaneCount(Number.POSITIVE_INFINITY), 1);

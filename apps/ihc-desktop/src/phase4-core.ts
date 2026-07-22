@@ -3,6 +3,7 @@ import {
   MAX_WORKSPACE_TABS,
   cloneWorkspaceState,
   normalizeWorkspaceState,
+  parsePaneRatioLayoutKey,
   setProjectPaneWidthRatios,
   type WorkspaceProject,
   type WorkspaceState,
@@ -18,6 +19,7 @@ export const PROJECT_BROWSER_PANES_EXTENSION = "browserPanesV1";
 export const PROJECT_EDITOR_PANES_EXTENSION = "editorPanesV1";
 export const PROJECT_PANE_ORDER_EXTENSION = "paneOrderV1";
 export const TERMINAL_LAUNCH_PROFILE_EXTENSION = "launchProfileV1";
+export const CLINE_SESSION_ID_EXTENSION = "clineSessionIdV1";
 export const LOCAL_BROWSER_RETRY_WINDOW_MS = 5 * 60 * 1_000;
 
 const LOCAL_BROWSER_RETRY_RAMP_MS = [500, 1_000, 2_000, 4_000, 8_000] as const;
@@ -28,6 +30,7 @@ const MAX_BROWSER_PANE_URL_BYTES = 16 * 1024;
 const MAX_EDITOR_PANE_TITLE_LENGTH = 160;
 const MAX_EDITOR_PATH_DEPTH = 64;
 const MAX_EDITOR_PATH_SEGMENT_LENGTH = 255;
+const MAX_CLINE_SESSION_ID_LENGTH = 128;
 
 export type WorkspaceBrowserPane = {
   [key: string]: unknown;
@@ -48,7 +51,30 @@ export type WorkspaceTerminalLaunchProfile =
   | "codex"
   | "grok"
   | "claude"
-  | "opencode";
+  | "opencode"
+  | "cline"
+  | "cursor";
+
+/**
+ * Cline session identifiers are provider-owned opaque strings rather than the
+ * UUIDs used by Codex and Grok. Keep the accepted alphabet shell-neutral so a
+ * persisted identifier can never become PowerShell syntax when it is resumed.
+ */
+export function isValidClineSessionId(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length >= 1 &&
+    value.length <= MAX_CLINE_SESSION_ID_LENGTH &&
+    /^[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(value)
+  );
+}
+
+export function workspaceTerminalClineSessionId(
+  terminal: Pick<WorkspaceTerminal, "legacyExtensions">,
+): string | null {
+  const candidate = terminal.legacyExtensions[CLINE_SESSION_ID_EXTENSION];
+  return isValidClineSessionId(candidate) ? candidate : null;
+}
 
 export function isLoopbackBrowserUrl(rawUrl: string) {
   let parsed: URL;
@@ -895,11 +921,94 @@ export function setTerminalAgentConversation(
     terminal.codexThreadId = null;
     terminal.grokSessionId = normalizedConversationId;
   }
+  delete terminal.legacyExtensions[CLINE_SESSION_ID_EXTENSION];
   if (terminal.legacyExtensions.resumeBlocked === true) {
     delete terminal.legacyExtensions.resumeBlocked;
   }
   project.lastModifiedAtUtc = modifiedAtUtc;
   return normalizeWorkspaceState(next);
+}
+
+/** Persist one Cline session against its stable terminal for app relaunch. */
+export function setTerminalClineSessionId(
+  state: WorkspaceState,
+  projectId: string,
+  terminalId: string,
+  sessionId: string,
+  modifiedAtUtc = new Date().toISOString(),
+): WorkspaceState {
+  if (!isValidClineSessionId(sessionId)) {
+    throw new Error("The Cline session identifier is invalid.");
+  }
+  const next = editableClone(state);
+  const project = requireProject(next, projectId);
+  const terminal = project.terminals.find((item) => item.id === terminalId);
+  if (!terminal) throw new Error("The requested pane does not exist.");
+  if (workspaceTerminalLaunchProfile(terminal) !== "cline") {
+    throw new Error("The requested pane is not a Cline terminal.");
+  }
+
+  for (const candidateProject of next.projects) {
+    for (const candidate of candidateProject.terminals) {
+      if (candidateProject.id === projectId && candidate.id === terminalId) continue;
+      if (
+        workspaceTerminalClineSessionId(candidate)?.toLowerCase() ===
+        sessionId.toLowerCase()
+      ) {
+        throw new Error("The Cline session is already owned by another pane.");
+      }
+    }
+  }
+
+  terminal.codexThreadId = null;
+  terminal.grokSessionId = null;
+  terminal.legacyExtensions[CLINE_SESSION_ID_EXTENSION] = sessionId;
+  if (terminal.legacyExtensions.resumeBlocked === true) {
+    delete terminal.legacyExtensions.resumeBlocked;
+  }
+  project.lastModifiedAtUtc = modifiedAtUtc;
+  return normalizeWorkspaceState(next);
+}
+
+/** Remove a stale Cline resume target without changing the terminal profile. */
+export function clearTerminalClineSessionId(
+  state: WorkspaceState,
+  projectId: string,
+  terminalId: string,
+  expectedSessionId: string,
+  modifiedAtUtc = new Date().toISOString(),
+): WorkspaceState {
+  if (!isValidClineSessionId(expectedSessionId)) {
+    throw new Error("The expected Cline session identifier is invalid.");
+  }
+  const next = editableClone(state);
+  const project = requireProject(next, projectId);
+  const terminal = project.terminals.find((item) => item.id === terminalId);
+  if (!terminal) throw new Error("The requested pane does not exist.");
+  if (workspaceTerminalLaunchProfile(terminal) !== "cline") {
+    throw new Error("The requested pane is not a Cline terminal.");
+  }
+  const current = workspaceTerminalClineSessionId(terminal);
+  if (current?.toLowerCase() !== expectedSessionId.toLowerCase()) {
+    throw new Error("The Cline session changed before it could be cleared.");
+  }
+  delete terminal.legacyExtensions[CLINE_SESSION_ID_EXTENSION];
+  if (terminal.legacyExtensions.resumeBlocked === true) {
+    delete terminal.legacyExtensions.resumeBlocked;
+  }
+  project.lastModifiedAtUtc = modifiedAtUtc;
+  return normalizeWorkspaceState(next);
+}
+
+export function terminalClineSessionChanged(
+  previous: WorkspaceTerminal,
+  next: WorkspaceTerminal,
+): boolean {
+  return (
+    workspaceTerminalClineSessionId(previous) !== workspaceTerminalClineSessionId(next) ||
+    (previous.legacyExtensions.resumeBlocked === true) !==
+      (next.legacyExtensions.resumeBlocked === true)
+  );
 }
 
 /**
@@ -915,6 +1024,7 @@ export function terminalAgentBindingChanged(
   return (
     previous.codexThreadId !== next.codexThreadId ||
     previous.grokSessionId !== next.grokSessionId ||
+    workspaceTerminalClineSessionId(previous) !== workspaceTerminalClineSessionId(next) ||
     (previous.legacyExtensions.resumeBlocked === true) !==
       (next.legacyExtensions.resumeBlocked === true)
   );
@@ -1077,7 +1187,11 @@ export function nextWorkspacePaneName(
           ? "Claude Code"
           : launchProfile === "opencode"
             ? "OpenCode"
-            : "PowerShell";
+            : launchProfile === "cline"
+              ? "Cline"
+              : launchProfile === "cursor"
+                ? "Cursor"
+                : "PowerShell";
   for (let index = 1; ; index += 1) {
     const candidate = `${prefix} ${index}`;
     if (!names.has(candidate.toLocaleLowerCase())) return candidate;
@@ -1092,7 +1206,9 @@ function isWorkspaceTerminalLaunchProfile(
     value === "codex" ||
     value === "grok" ||
     value === "claude" ||
-    value === "opencode"
+    value === "opencode" ||
+    value === "cline" ||
+    value === "cursor"
   );
 }
 
@@ -1327,8 +1443,8 @@ export function resizeProjectPaneBoundaryHorizontal(
   ) {
     throw new Error("Resize handles must connect adjacent sibling panes.");
   }
-  const keyColumns = /^([1-5])x[1-4]:row-[0-3]$/.exec(request.layoutKey);
-  if (!keyColumns || Number(keyColumns[1]) !== request.rowPaneIds.length) {
+  const layout = parsePaneRatioLayoutKey(request.layoutKey);
+  if (!layout || layout.columns !== request.rowPaneIds.length) {
     throw new Error("The layout key does not match the resized row.");
   }
   const ratios =

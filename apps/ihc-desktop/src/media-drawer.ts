@@ -6,11 +6,14 @@ import {
   localizeBackendMessage,
 } from "./i18n";
 import {
+  classifyContentFileVisual,
   mediaEntryKey,
   normalizeMediaDirectoryResponse,
   normalizeMediaRootGrant,
   normalizeMediaVolumeList,
   normalizeResolvedMediaFiles,
+  type ContentFileFamily,
+  type ContentFileVisual,
   type MediaBrowserEntry,
   type MediaDirectoryResponse,
   type MediaRootGrant,
@@ -843,8 +846,10 @@ export class MediaDrawer {
 
   private createDragGhost(entry: MediaBrowserEntry): HTMLElement {
     const ghost = document.createElement("div");
+    const visual = classifyContentFileVisual(entry);
     ghost.className = "content-file-drag-ghost";
-    const icon = this.createFileTypeIcon(entry);
+    ghost.dataset.fileFamily = visual.family;
+    const icon = this.createFileTypeIcon(entry, visual);
     icon.classList.add("content-file-drag-ghost-icon");
     const name = document.createElement("span");
     name.textContent = entry.name;
@@ -1104,10 +1109,13 @@ export class MediaDrawer {
   ): HTMLButtonElement {
     const card = document.createElement("button");
     const key = mediaEntryKey(entry.pathSegments);
+    const visual = classifyContentFileVisual(entry);
     card.type = "button";
     card.className = "media-card";
     card.dataset.key = key;
     card.dataset.kind = entry.kind;
+    card.dataset.fileFamily = visual.family;
+    card.dataset.fileRestricted = String(visual.restricted);
     card.dataset.entryIndex = String(entryIndex);
     card.dataset.selected = "false";
     card.tabIndex = initiallyFocusable ? 0 : -1;
@@ -1117,6 +1125,11 @@ export class MediaDrawer {
       "aria-label",
       entry.kind === "directory"
         ? tr(`Open folder ${entry.name}`, `${entry.name} 폴더 열기`)
+        : visual.restricted
+          ? tr(
+              `${entry.name}, ${contentFileFamilyLabel(visual.family)}, opening restricted`,
+              `${entry.name}, ${contentFileFamilyLabel(visual.family)}, 열기 제한`,
+            )
         : tr(`Open ${entry.name}`, `${entry.name} 열기`),
     );
 
@@ -1128,10 +1141,10 @@ export class MediaDrawer {
       folder.className = "media-card-folder-icon";
       preview.append(folder);
     } else if (entry.kind === "file") {
-      preview.append(this.createFileTypeIcon(entry));
+      preview.append(this.createFileTypeIcon(entry, visual));
     } else {
       preview.dataset.previewPending = String(Boolean(entry.previewPath));
-      const fallback = this.createFileTypeIcon(entry);
+      const fallback = this.createFileTypeIcon(entry, visual);
       fallback.classList.add("media-card-fallback");
       preview.append(fallback);
       if (entry.kind === "video") {
@@ -1152,20 +1165,29 @@ export class MediaDrawer {
     meta.textContent =
       entry.kind === "directory"
         ? tr("Folder", "폴더")
-        : `${fileKindLabel(entry.kind)} · ${formatFileSize(entry.sizeBytes)}`;
+        : `${contentFileFamilyLabel(visual.family)} · ${formatFileSize(entry.sizeBytes)}${
+            visual.restricted ? ` · ${tr("Restricted", "열기 제한")}` : ""
+          }`;
     details.append(meta);
     card.append(preview, details);
     return card;
   }
 
-  private createFileTypeIcon(entry: MediaBrowserEntry): HTMLElement {
+  private createFileTypeIcon(
+    entry: MediaBrowserEntry,
+    visual: ContentFileVisual = classifyContentFileVisual(entry),
+  ): HTMLElement {
     const icon = document.createElement("span");
     icon.className = "media-card-file-icon";
+    icon.dataset.fileFamily = visual.family;
     icon.setAttribute("aria-hidden", "true");
+    const marker = document.createElement("span");
+    marker.className = "media-card-file-marker";
+    marker.textContent = visual.marker;
     const extension = document.createElement("span");
     extension.className = "media-card-file-extension";
-    extension.textContent = compactExtension(entry.name, entry.kind);
-    icon.append(extension);
+    extension.textContent = visual.extension;
+    icon.append(marker, extension);
     return icon;
   }
 
@@ -1358,20 +1380,19 @@ function formatFileSize(value: number | null): string {
   return `${new Intl.NumberFormat(appLocale(), { maximumFractionDigits: unit === 0 ? 0 : 1 }).format(amount)} ${units[unit]}`;
 }
 
-function fileKindLabel(kind: MediaBrowserEntry["kind"]): string {
-  if (kind === "image") return tr("Image", "이미지");
-  if (kind === "video") return tr("Video", "동영상");
-  if (kind === "directory") return tr("Folder", "폴더");
-  return tr("File", "파일");
-}
-
-function compactExtension(name: string, kind: MediaBrowserEntry["kind"]): string {
-  const extension = name.includes(".") ? (name.split(".").pop() ?? "") : "";
-  const normalized = extension.replace(/[^a-z0-9]/gi, "").toUpperCase();
-  if (normalized) return normalized.slice(0, 5);
-  if (kind === "image") return "IMG";
-  if (kind === "video") return "VID";
-  return "FILE";
+function contentFileFamilyLabel(family: ContentFileFamily): string {
+  if (family === "image") return tr("Image", "이미지");
+  if (family === "video") return tr("Video", "동영상");
+  if (family === "audio") return tr("Audio", "오디오");
+  if (family === "code") return tr("Code", "코드");
+  if (family === "document") return tr("Document", "문서");
+  if (family === "data") return tr("Data", "데이터");
+  if (family === "config") return tr("Config", "설정");
+  if (family === "archive") return tr("Archive", "압축 파일");
+  if (family === "font") return tr("Font", "글꼴");
+  if (family === "executable") return tr("Executable", "실행 파일");
+  if (family === "folder") return tr("Folder", "폴더");
+  return tr("Other", "기타");
 }
 
 function mediaErrorMessage(error: unknown): string {

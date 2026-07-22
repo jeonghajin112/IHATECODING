@@ -1,18 +1,22 @@
 mod agent_browser_bridge;
 mod agent_cli_status;
 mod agent_runtime;
+mod android_emulator;
 mod browser_agent_automation;
 mod browser_preview;
 mod browser_ui_pick;
+mod cline_session;
 mod codex_notify;
 mod grok_notify;
 mod legacy_import;
 mod media_browser;
+mod openai_status;
 mod phone_notify;
 mod production_import;
 mod project_files;
 mod project_store;
 mod provider_accounts;
+mod provider_lifecycle;
 mod provider_usage;
 mod pty;
 mod terminal_platform;
@@ -23,6 +27,7 @@ use agent_runtime::{
     AgentBindingSnapshot, AgentDiscovery, AgentDiscoveryRequest, AgentEvent, AgentProvider,
     AgentResumeBinding, AgentRuntime, StableTerminalKey,
 };
+use android_emulator::{get_android_emulator_status, launch_android_emulator};
 use browser_agent_automation::{browser_agent_click, browser_agent_snapshot, browser_agent_type};
 use browser_preview::capture_browser_webview_preview;
 use legacy_import::{
@@ -335,6 +340,19 @@ impl BrowserWebviewUrlWatchState {
 #[tauri::command]
 fn read_provider_usage() -> provider_usage::ProviderUsageResponse {
     provider_usage::read_provider_usage()
+}
+
+#[tauri::command]
+async fn read_openai_status(
+    webview: Webview,
+    service: State<'_, Arc<openai_status::OpenAiStatusService>>,
+    force_refresh: bool,
+) -> Result<openai_status::OpenAiStatusSnapshot, String> {
+    ensure_agent_main_webview(&webview)?;
+    let service = service.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || service.read(force_refresh))
+        .await
+        .map_err(|_| "The OpenAI status worker did not complete.".to_owned())?
 }
 
 #[tauri::command]
@@ -973,6 +991,81 @@ fn detect_terminal_agent(
 ) -> Result<Option<agent_runtime::AgentProvider>, String> {
     let root_process_id = manager.root_process_id(&session_id)?;
     Ok(root_process_id.and_then(terminal_platform::detect_terminal_agent))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DiscoverClineSessionRequest {
+    session_id: String,
+    cwd: String,
+    not_before_utc: String,
+    current_session_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RecoverClineSessionRequest {
+    cwd: String,
+    not_before_utc: String,
+    not_after_utc: String,
+    excluded_session_ids: Vec<String>,
+}
+
+#[tauri::command]
+async fn cline_session_exists(webview: Webview, session_id: String) -> Result<bool, String> {
+    ensure_agent_main_webview(&webview)?;
+    tauri::async_runtime::spawn_blocking(move || cline_session::session_exists(&session_id))
+        .await
+        .map_err(|_| "The Cline session validation worker failed.".to_owned())?
+}
+
+#[tauri::command]
+async fn discover_cline_session(
+    webview: Webview,
+    manager: State<'_, TerminalManager>,
+    agent_runtime: State<'_, AgentRuntime>,
+    request: DiscoverClineSessionRequest,
+) -> Result<Option<String>, String> {
+    ensure_agent_main_webview(&webview)?;
+    let root_process_id = manager.root_process_id(&request.session_id)?;
+    let process_tree_ids = root_process_id
+        .map(terminal_platform::terminal_process_tree_ids)
+        .unwrap_or_default();
+    let cwd = request.cwd;
+    let not_before_utc = request.not_before_utc;
+    let current_session_id = request.current_session_id;
+    let discovered = tauri::async_runtime::spawn_blocking(move || {
+        cline_session::discover_session_with_preferred(
+            &process_tree_ids,
+            &cwd,
+            &not_before_utc,
+            current_session_id.as_deref(),
+        )
+    })
+    .await
+    .map_err(|_| "The Cline session discovery worker failed.".to_owned())??;
+    if let Some(session_id) = discovered.as_deref() {
+        agent_runtime.bind_cline_profile_session(&request.session_id, session_id)?;
+    }
+    Ok(discovered)
+}
+
+#[tauri::command]
+async fn recover_cline_session(
+    webview: Webview,
+    request: RecoverClineSessionRequest,
+) -> Result<Option<String>, String> {
+    ensure_agent_main_webview(&webview)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        cline_session::recover_recent_session(
+            &request.cwd,
+            &request.not_before_utc,
+            &request.not_after_utc,
+            &request.excluded_session_ids,
+        )
+    })
+    .await
+    .map_err(|_| "The Cline session recovery worker failed.".to_owned())?
 }
 
 #[derive(Deserialize)]
@@ -2406,6 +2499,7 @@ pub fn run() {
         .manage(MediaBrowserService::default())
         .manage(project_store)
         .manage(provider_account_service)
+        .manage(Arc::new(openai_status::OpenAiStatusService::default()))
         .manage(Arc::new(BrowserWebviewUrlWatchState::default()))
         .setup(move |app| {
             browser_bridge.start(app.handle().clone())?;
@@ -2454,7 +2548,10 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             read_provider_usage,
+            read_openai_status,
             read_agent_cli_statuses,
+            get_android_emulator_status,
+            launch_android_emulator,
             open_media_location,
             list_media_volumes,
             list_media_directory,
@@ -2491,6 +2588,9 @@ pub fn run() {
             read_clipboard_snapshot,
             write_clipboard_text,
             detect_terminal_agent,
+            cline_session_exists,
+            discover_cline_session,
+            recover_cline_session,
             discover_agent_conversation,
             acknowledge_codex_completion,
             acknowledge_grok_completion,
@@ -2535,6 +2635,10 @@ pub fn run_codex_notifier_if_requested() -> Option<i32> {
 
 pub fn run_grok_notifier_if_requested() -> Option<i32> {
     grok_notify::run_if_requested()
+}
+
+pub fn run_agent_lifecycle_hook_if_requested() -> Option<i32> {
+    provider_lifecycle::run_if_requested()
 }
 
 #[cfg(test)]

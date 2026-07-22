@@ -41,6 +41,8 @@ pub(crate) enum AgentCliProvider {
     OpenCode,
     #[serde(rename = "cursor")]
     Cursor,
+    #[serde(rename = "cline")]
+    Cline,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -119,6 +121,7 @@ pub(crate) fn read_agent_cli_statuses() -> AgentCliStatusesResponse {
     let claude_installation = discover_cli("claude", path.as_deref());
     let opencode_installation = discover_cli("opencode", path.as_deref());
     let cursor_installation = discover_cursor_cli(path.as_deref());
+    let cline_installation = discover_cli("cline", path.as_deref());
 
     let codex_authenticated = crate::provider_usage::read_provider_account("codex")
         .ok()
@@ -188,6 +191,16 @@ pub(crate) fn read_agent_cli_statuses() -> AgentCliStatusesResponse {
                 installed: cursor_installation.installed,
                 status: cursor_status,
                 email: cursor_email,
+                credential_count: None,
+            },
+            AgentCliStatus {
+                provider: AgentCliProvider::Cline,
+                installed: cline_installation.installed,
+                // Cline has no bounded, non-interactive authentication-status
+                // command. Do not execute its interactive auth/config flows or
+                // inspect credential values merely to populate this summary.
+                status: AgentCliConnectionStatus::Unknown,
+                email: None,
                 credential_count: None,
             },
         ],
@@ -718,6 +731,13 @@ mod tests {
                     email: Some("cursor@example.com".to_owned()),
                     credential_count: None,
                 },
+                AgentCliStatus {
+                    provider: AgentCliProvider::Cline,
+                    installed: true,
+                    status: AgentCliConnectionStatus::Unknown,
+                    email: None,
+                    credential_count: None,
+                },
             ],
         };
         let value = serde_json::to_value(response).unwrap();
@@ -731,6 +751,9 @@ mod tests {
         assert_eq!(value["agents"][4]["provider"], "cursor");
         assert_eq!(value["agents"][4]["status"], "connected");
         assert_eq!(value["agents"][4]["email"], "cursor@example.com");
+        assert_eq!(value["agents"][5]["provider"], "cline");
+        assert_eq!(value["agents"][5]["status"], "unknown");
+        assert_eq!(value["agents"][5]["installed"], true);
         assert!(value["agents"][0].get("email").is_none());
     }
 
@@ -743,6 +766,17 @@ mod tests {
         let joined = env::join_paths([directory.path()]).unwrap();
 
         let installation = discover_cli("claude", Some(&joined));
+        assert!(installation.installed);
+        assert!(installation.direct_exe.is_none());
+    }
+
+    #[test]
+    fn discovers_cline_from_a_normal_windows_command_shim() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("cline.cmd"), b"npm command shim").unwrap();
+        let joined = env::join_paths([directory.path()]).unwrap();
+
+        let installation = discover_cli("cline", Some(&joined));
         assert!(installation.installed);
         assert!(installation.direct_exe.is_none());
     }

@@ -18,6 +18,60 @@ test("the packaged runtime is wired only to the canonical Phase 4 controller", a
   assert.match(controller, /commit_phase3_preview_upgrade/);
 });
 
+test("Cline session IDs are captured durably and passed only through the typed resume field", async () => {
+  const [main, controller, core, lib, runtime, discovery] = await Promise.all([
+    source("src/main.ts"),
+    source("src/phase4-controller.ts"),
+    source("src/phase4-core.ts"),
+    source("src-tauri/src/lib.rs"),
+    source("src-tauri/src/agent_runtime.rs"),
+    source("src-tauri/src/cline_session.rs"),
+  ]);
+  assert.match(core, /CLINE_SESSION_ID_EXTENSION = "clineSessionIdV1"/);
+  assert.doesNotMatch(core, /scanClineSessionSummary/);
+  assert.match(controller, /async onClineSessionDiscovered\([\s\S]*setTerminalClineSessionId[\s\S]*persistNow/);
+  assert.match(controller, /async onClineSessionInvalidated\([\s\S]*clearTerminalClineSessionId[\s\S]*persistNow/);
+  assert.match(main, /clineSessionId:[\s\S]*this\.launchProfile === "cline" \? this\.clineSessionId : null/);
+  assert.match(main, /invoke<string \| null>\("discover_cline_session"/);
+  assert.match(main, /invoke<boolean>\("cline_session_exists"/);
+  assert.match(main, /CLINE_DISCOVERY_WINDOW_MS/);
+  assert.match(main, /associateClineSession\(/);
+  assert.doesNotMatch(main, /observeClineSessionOutput|Session Summary[\s\S]*cline --id/);
+  assert.match(lib, /discover_cline_session/);
+  assert.match(lib, /cline_session_exists/);
+  assert.match(runtime, /\$ihcClineArgs=@\('--tui'\)/);
+  assert.match(runtime, /\$ihcClineArgs \+= @\('--id', '\{session_id\}'\)/);
+  assert.match(runtime, /& 'cline' @ihcClineArgs/);
+  assert.match(discovery, /process_tree_ids\.contains\(&record\.pid\)/);
+  assert.match(discovery, /candidates\.len\(\) == 1/);
+  assert.doesNotMatch(discovery, /process_matches\.is_empty[\s\S]*candidates/);
+  assert.doesNotMatch(main, /write_terminal[\s\S]{0,300}cline\s+--tui\s+--id/);
+});
+
+test("legacy Cline panes have a conservative stopped-session recovery command", async () => {
+  const [controller, lib, discovery] = await Promise.all([
+    source("src/phase4-controller.ts"),
+    source("src-tauri/src/lib.rs"),
+    source("src-tauri/src/cline_session.rs"),
+  ]);
+  assert.match(lib, /struct RecoverClineSessionRequest/);
+  assert.match(lib, /async fn recover_cline_session/);
+  assert.match(lib, /cline_session::recover_recent_session/);
+  assert.match(lib, /discover_cline_session,[\s\S]*recover_cline_session,/);
+  assert.match(discovery, /record\.ended_at\.as_deref\(\)/);
+  assert.match(discovery, /session_has_user_message\(root, directory_name\)/);
+  assert.match(discovery, /excluded\.contains\(&directory_name\.to_ascii_lowercase\(\)\)/);
+  assert.match(discovery, /candidates\.sort_unstable_by/);
+  assert.doesNotMatch(discovery, /MAX_RECENT_SESSION_DIRECTORIES|directories\.truncate\(/);
+  assert.match(controller, /await this\.backfillLegacyClineSessions\(\)[\s\S]*this\.renderAndActivate\(\)/);
+  assert.match(controller, /unboundByCwd\.get\(candidate\.cwdKey\) !== 1/);
+  assert.match(controller, /invoke<string \| null>\("recover_cline_session"/);
+  assert.match(controller, /excludedSessionIds: \[\.\.\.owned\]/);
+  assert.match(controller, /if \(!sessionId\) \{[\s\S]*recoveryIncomplete = true/);
+  assert.match(controller, /if \(recoveryIncomplete\) \{[\s\S]*if \(!recoveredAny\) return true/);
+  assert.match(controller, /setTerminalClineSessionId\([\s\S]*CLINE_SESSION_BACKFILL_EXTENSION/);
+});
+
 test("existing folders use the picker while scratch projects create a Documents child folder", async () => {
   const [html, main, controller, styles, cargo, capabilities, rust] = await Promise.all([
     source("index.html"),
@@ -425,17 +479,30 @@ test("manual tabs, compact project creation, and the mixed pane launcher are wir
   );
   assert.match(
     html,
-    /id="pane-launcher-menu"[\s\S]*id="add-powershell-pane"[\s\S]*id="add-codex-pane"[\s\S]*id="add-grok-pane"[\s\S]*id="add-claude-code-pane"[\s\S]*id="add-opencode-pane"[\s\S]*id="add-browser-pane"/,
+    /id="pane-launcher-menu"[\s\S]*id="add-powershell-pane"[\s\S]*id="add-codex-pane"[\s\S]*id="add-grok-pane"[\s\S]*id="add-claude-code-pane"[\s\S]*id="add-opencode-pane"[\s\S]*id="add-cline-pane"[\s\S]*id="add-cursor-pane"[\s\S]*id="add-browser-pane"/,
   );
   const launcherStart = html.indexOf('id="pane-launcher-menu"');
   const launcherEnd = html.indexOf("</div>", launcherStart);
   assert.ok(launcherStart >= 0 && launcherEnd > launcherStart);
   const launcher = html.slice(launcherStart, launcherEnd);
+  assert.match(
+    html,
+    /aria-controls="pane-launcher-menu"[\s\S]*class="pane-launcher-primary"[\s\S]*class="pane-launcher-plus"[\s\S]*data-i18n-en="Add" data-i18n-ko="추가"[\s\S]*class="pane-launcher-chevron"[\s\S]*<svg/,
+  );
   assert.doesNotMatch(
     launcher,
     /<small|AI coding CLI|AI 코딩 CLI|New terminal|새 터미널|Split pane|분할 화면/,
   );
-  for (const icon of ["powershell", "codex", "grok", "claude-code", "opencode", "browser"]) {
+  for (const icon of [
+    "powershell",
+    "codex",
+    "grok",
+    "claude-code",
+    "opencode",
+    "cline",
+    "cursor",
+    "browser",
+  ]) {
     assert.match(
       html,
       new RegExp(`class="pane-launcher-icon"[\\s\\S]*?src="/assets/provider-icons/${icon}\\.svg"`),
@@ -472,6 +539,10 @@ test("manual tabs, compact project creation, and the mixed pane launcher are wir
   );
   assert.match(styles, /\.sidebar-brand\s*\{[\s\S]*grid-area:\s*brand;/);
   assert.match(styles, /\.sidebar-brand-identity\s*\{[\s\S]*align-items:\s*center;/);
+  assert.match(
+    styles,
+    /\.pane-launcher-toggle\s*\{[\s\S]*grid-template-columns:\s*auto 22px;[\s\S]*border-radius:\s*5px;[\s\S]*\.pane-launcher-toggle\[aria-expanded="true"\][\s\S]*\.pane-launcher-chevron svg\s*\{[\s\S]*transform:\s*rotate\(180deg\);/,
+  );
   assert.match(styles, /\.sidebar-collapse-toggle\s*\{/);
   assert.match(
     styles,
@@ -479,6 +550,10 @@ test("manual tabs, compact project creation, and the mixed pane launcher are wir
   );
   assert.match(styles, /\.project-list\s*\{[\s\S]*grid-area:\s*projects;/);
   assert.match(styles, /\.sidebar-footer\s*\{[\s\S]*grid-area:\s*footer;/);
+  assert.match(
+    styles,
+    /\.sidebar-footer\s*\{[\s\S]*min-height:\s*40px;[\s\S]*padding:\s*2px 10px;[\s\S]*border-top:\s*1px solid var\(--line-soft\);/,
+  );
   assert.match(
     styles,
     /:root\s*\{[\s\S]*--canvas:\s*#070707;[\s\S]*--line-soft:\s*#171717;[\s\S]*--text:\s*#f2f2f2;/,
@@ -720,6 +795,54 @@ test("manual tabs, compact project creation, and the mixed pane launcher are wir
   );
 });
 
+test("Android Emulator is a localized standalone launcher with an explicit AVD choice", async () => {
+  const [html, main] = await Promise.all([
+    source("index.html"),
+    source("src/main.ts"),
+  ]);
+
+  const menuStart = html.indexOf('id="pane-launcher-menu"');
+  const menuEnd = html.indexOf("</div>", menuStart);
+  assert.ok(menuStart >= 0 && menuEnd > menuStart);
+  const menu = html.slice(menuStart, menuEnd);
+  assert.match(menu, /id="launch-android-emulator"/);
+  assert.match(menu, /src="\/assets\/provider-icons\/android-emulator\.svg"/);
+  assert.match(
+    menu,
+    /data-i18n-en="Android Emulator"[\s\S]*data-i18n-ko="[^"]+"/,
+  );
+
+  assert.match(
+    html,
+    /id="android-emulator-dialog"[\s\S]*id="android-emulator-options"[\s\S]*id="android-emulator-status"[\s\S]*id="cancel-android-emulator"[\s\S]*id="confirm-android-emulator"/,
+  );
+  const dialogStart = html.indexOf('id="android-emulator-dialog"');
+  const dialogEnd = html.indexOf("</dialog>", dialogStart);
+  assert.ok(dialogStart >= 0 && dialogEnd > dialogStart);
+  const dialog = html.slice(dialogStart, dialogEnd);
+  assert.match(dialog, /data-i18n-en=/);
+  assert.match(dialog, /data-i18n-ko=/);
+
+  const controllerStart = main.indexOf("class AndroidEmulatorLauncherController");
+  const controllerEnd = main.indexOf("class ", controllerStart + 6);
+  assert.ok(controllerStart >= 0 && controllerEnd > controllerStart);
+  const controller = main.slice(controllerStart, controllerEnd);
+  assert.match(controller, /invoke<unknown>\("get_android_emulator_status"\)/);
+  assert.match(
+    controller,
+    /invoke<unknown>\("launch_android_emulator",\s*\{\s*avdName\s*\}\)/,
+  );
+  assert.match(controller, /normalizeAndroidEmulatorStatus/);
+  assert.match(controller, /normalizeAndroidEmulatorLaunchResult/);
+  assert.match(controller, /\.avds\.length === 1/);
+  assert.match(controller, /showModal\(\)/);
+  assert.match(controller, /input\[name="android-emulator-avd"\]:checked/);
+  assert.match(controller, /normalizeAndroidVirtualDeviceName/);
+  assert.match(controller, /launchDevice\(avdName\)/);
+  assert.match(main, /requireButton\("launch-android-emulator"\)/);
+  assert.match(main, /new AndroidEmulatorLauncherController\(/);
+});
+
 test("settings expose localized General, Optimization, Agents, and Notifications tabs", async () => {
   const [html, styles, main, agentCliStatus] = await Promise.all([
     source("index.html"),
@@ -747,12 +870,13 @@ test("settings expose localized General, Optimization, Agents, and Notifications
   );
   assert.match(
     html,
-    /id="settings-agents-panel"[\s\S]*aria-labelledby="settings-agents-tab"[\s\S]*aria-busy="false"[\s\S]*id="refresh-agent-connections"[\s\S]*data-agent-provider="codex"[\s\S]*data-agent-provider="grok"[\s\S]*data-agent-provider="claudeCode"[\s\S]*data-agent-provider="openCode"[\s\S]*data-agent-provider="cursor"/,
+    /id="settings-agents-panel"[\s\S]*aria-labelledby="settings-agents-tab"[\s\S]*aria-busy="false"[\s\S]*id="refresh-agent-connections"[\s\S]*data-agent-provider="codex"[\s\S]*data-agent-provider="grok"[\s\S]*data-agent-provider="claudeCode"[\s\S]*data-agent-provider="openCode"[\s\S]*data-agent-provider="cline"[\s\S]*data-agent-provider="cursor"/,
   );
-  for (const icon of ["codex", "grok", "claude-code", "opencode", "cursor"]) {
+  for (const icon of ["codex", "grok", "claude-code", "opencode", "cursor", "cline"]) {
     assert.match(html, new RegExp(`src="/assets/provider-icons/${icon}\\.svg"`));
   }
-  assert.match(html, /data-agent-provider="cursor"[\s\S]*data-agent-status-only="true"/);
+  assert.match(html, /data-agent-provider="cursor"[\s\S]*data-agent-connect="cursor"/);
+  assert.match(html, /data-agent-provider="cline"[\s\S]*data-agent-connect="cline"/);
   assert.match(agentCliStatus, /discover_cli\("agent", path\)/);
   assert.match(agentCliStatus, /discover_cli\("cursor-agent", path\)/);
   assert.doesNotMatch(agentCliStatus, /discover_cli\("cursor", path\)/);
@@ -857,4 +981,76 @@ test("tabs stay above actions and pane interactions use overlay-only guides", as
   assert.match(styles, /\.terminal-row\s*\{[\s\S]*display:\s*flex/);
   assert.match(styles, /\.pane-interaction-overlay\s*\{[\s\S]*pointer-events:\s*none/);
   assert.match(styles, /\.terminal-resize-handle\s*\{[\s\S]*cursor:\s*col-resize/);
+});
+
+test("incomplete final rows fill the bottom band without spacer cells", async () => {
+  const [main, styles] = await Promise.all([
+    source("src/main.ts"),
+    source("src/styles.css"),
+  ]);
+  const updateLayoutStart = main.indexOf("  private updateLayout(");
+  const updateLayoutEnd = main.indexOf("\n  private updateControls()", updateLayoutStart);
+  assert.ok(updateLayoutStart >= 0 && updateLayoutEnd > updateLayoutStart);
+  const updateLayout = main.slice(updateLayoutStart, updateLayoutEnd);
+
+  assert.match(main, /\blayoutPlanFor,?/);
+  assert.match(updateLayout, /const layoutPlan = layoutPlanFor\(visible\.length\)/);
+  assert.match(
+    updateLayout,
+    /layoutPlan\.placements\.find\(\(placement\) => placement\.rowSpan > 1\)/,
+  );
+  assert.match(
+    updateLayout,
+    /rowElement\.className = "terminal-row terminal-row--bottom-fill-band"/,
+  );
+  assert.match(updateLayout, /rowElement\.style\.gridRow = "span 2"/);
+  assert.match(
+    updateLayout,
+    /pane\.element\.style\.gridColumn = String\(placement\.column \+ 1\)/,
+  );
+  assert.match(
+    updateLayout,
+    /pane\.element\.style\.gridRow =[\s\S]{0,180}placement\.rowSpan > 1[\s\S]{0,180}`\$\{localRow\} \/ span \$\{placement\.rowSpan\}`/,
+  );
+
+  const topRowStart = updateLayout.indexOf("        const topRow: ActiveTerminalRow");
+  const bottomRowStart = updateLayout.indexOf("        const bottomRow: ActiveTerminalRow");
+  const bandRegistrationStart = updateLayout.indexOf(
+    "        this.activeRows.set(`${key}:band-top`, topRow)",
+  );
+  assert.ok(topRowStart >= 0 && bottomRowStart > topRowStart);
+  assert.ok(bandRegistrationStart > bottomRowStart);
+  const topRow = updateLayout.slice(topRowStart, bottomRowStart);
+  const bottomRow = updateLayout.slice(bottomRowStart, bandRegistrationStart);
+  assert.match(topRow, /\bkey,[\s\S]*ratios: \[\.\.\.ratios\],[\s\S]*columns,/);
+  assert.match(bottomRow, /\bkey,[\s\S]*ratios: \[\.\.\.ratios\],[\s\S]*columns,/);
+  assert.match(
+    updateLayout,
+    /this\.activeRows\.set\(`\$\{key\}:band-top`, topRow\);[\s\S]{0,100}this\.activeRows\.set\(`\$\{key\}:band-bottom`, bottomRow\);/,
+  );
+  assert.match(
+    main,
+    /if \(row\.element\.dataset\.bottomFillBand === "true"\) \{[\s\S]{0,180}row\.element\.style\.gridTemplateColumns = ratios/,
+  );
+  assert.doesNotMatch(main, /terminal-row-spacer/);
+  assert.match(
+    styles,
+    /\.terminal-row--bottom-fill-band\s*\{[\s\S]{0,180}display:\s*grid;[\s\S]{0,180}grid-template-rows:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\);/,
+  );
+});
+
+test("pane drag slot selection prefers containment before center distance", async () => {
+  const main = await source("src/main.ts");
+  const helperStart = main.indexOf("function closestPaneSlotIndex(");
+  const helperEnd = main.indexOf("\nfunction vectorAngleRadians(", helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart);
+  const helper = main.slice(helperStart, helperEnd);
+  assert.match(
+    helper,
+    /const containingIndex = slots\.findIndex\(\(slot\) =>[\s\S]*paneGeometryContainsPoint\(slot, point\.x, point\.y\)/,
+  );
+  assert.match(helper, /if \(containingIndex >= 0\) return containingIndex;/);
+  assert.ok(
+    helper.indexOf("return containingIndex") < helper.indexOf("distanceToPaneCenter"),
+  );
 });

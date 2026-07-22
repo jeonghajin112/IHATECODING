@@ -2,6 +2,27 @@ export const MAX_MEDIA_SELECTION = 20;
 
 export type MediaEntryKind = "directory" | "image" | "video" | "file";
 
+export type ContentFileFamily =
+  | "folder"
+  | "image"
+  | "video"
+  | "audio"
+  | "code"
+  | "document"
+  | "data"
+  | "config"
+  | "archive"
+  | "font"
+  | "executable"
+  | "generic";
+
+export type ContentFileVisual = Readonly<{
+  family: ContentFileFamily;
+  extension: string;
+  marker: string;
+  restricted: boolean;
+}>;
+
 export type MediaBrowserEntry = Readonly<{
   name: string;
   pathSegments: string[];
@@ -32,6 +53,145 @@ export type MediaDirectoryResponse = Readonly<{
   entries: MediaBrowserEntry[];
   truncated: boolean;
 }>;
+
+const IMAGE_EXTENSIONS = new Set([
+  "avif", "bmp", "gif", "heic", "heif", "ico", "jpeg", "jpg", "png", "svg", "tif",
+  "tiff", "webp",
+]);
+const VIDEO_EXTENSIONS = new Set([
+  "avi", "m4v", "mkv", "mov", "mp4", "mpeg", "mpg", "webm", "wmv",
+]);
+const AUDIO_EXTENSIONS = new Set([
+  "aac", "aiff", "alac", "flac", "m4a", "mp3", "ogg", "opus", "wav", "wma",
+]);
+const CODE_EXTENSIONS = new Set([
+  "astro", "c", "cc", "clj", "cljs", "cpp", "cs", "css", "dart", "ex", "exs", "fs",
+  "fsx", "go", "h", "hpp", "html", "java", "js", "jsx", "kt", "kts", "less", "lua",
+  "m", "mjs", "mm", "php", "pl", "ps1", "py", "r", "rb", "rs", "sass", "scala",
+  "scss", "sh", "sol", "svelte", "swift", "tsx", "ts", "vue", "zig",
+]);
+const DOCUMENT_EXTENSIONS = new Set([
+  "doc", "docx", "epub", "md", "markdown", "mdown", "mdx", "mkd", "odf", "odg", "odp",
+  "ods", "odt", "pdf", "ppt", "pptx", "rtf", "tex", "txt", "xls", "xlsx",
+]);
+const DATA_EXTENSIONS = new Set([
+  "arrow", "csv", "db", "db3", "json", "jsonc", "jsonl", "ndjson", "parquet", "sqlite",
+  "sqlite3", "sql", "tsv", "xml",
+]);
+const CONFIG_EXTENSIONS = new Set([
+  "cfg", "conf", "config", "env", "ini", "lock", "properties", "toml", "yaml", "yml",
+]);
+const ARCHIVE_EXTENSIONS = new Set([
+  "7z", "bz2", "cab", "gz", "iso", "rar", "tar", "tar.bz2", "tar.gz", "tar.xz", "tgz",
+  "xz", "zip",
+]);
+const FONT_EXTENSIONS = new Set([
+  "eot", "otc", "otf", "ttc", "ttf", "woff", "woff2",
+]);
+const EXECUTABLE_EXTENSIONS = new Set([
+  "apk", "appx", "appxbundle", "bin", "cmd", "com", "cpl", "dll", "dmg", "exe", "ipa",
+  "jar", "lnk", "msi", "msix", "msixbundle", "reg", "scr", "sys", "wasm",
+]);
+const CODE_FILE_NAMES = new Set([
+  "cmakelists.txt", "dockerfile", "gemfile", "justfile", "makefile", "rakefile",
+]);
+const CONFIG_FILE_NAMES = new Set([
+  ".dockerignore", ".editorconfig", ".env", ".gitattributes", ".gitignore", ".npmrc",
+  ".prettierignore", ".prettierrc", ".yarnrc", "cargo.lock", "cargo.toml", "composer.json",
+  "deno.json", "deno.jsonc", "package-lock.json", "package.json", "pnpm-lock.yaml", "tsconfig.json",
+  "vite.config.js", "vite.config.ts", "yarn.lock",
+]);
+const CONTENT_FILE_MARKERS: Readonly<Record<ContentFileFamily, string>> = {
+  folder: "DIR",
+  image: "IMG",
+  video: "▶",
+  audio: "♪",
+  code: "</>",
+  document: "TXT",
+  data: "{}",
+  config: "CFG",
+  archive: "ZIP",
+  font: "Aa",
+  executable: ">_",
+  generic: "FILE",
+};
+
+export function classifyContentFileVisual(
+  entry: Pick<MediaBrowserEntry, "name" | "kind" | "openable">,
+): ContentFileVisual {
+  const normalizedName = entry.name.trim().toLowerCase();
+  const extension = contentFileExtension(normalizedName);
+  let family: ContentFileFamily;
+
+  if (entry.kind === "directory") {
+    family = "folder";
+  } else if (entry.kind === "image" || IMAGE_EXTENSIONS.has(extension)) {
+    family = "image";
+  } else if (entry.kind === "video" || VIDEO_EXTENSIONS.has(extension)) {
+    family = "video";
+  } else if (AUDIO_EXTENSIONS.has(extension)) {
+    family = "audio";
+  } else if (CODE_FILE_NAMES.has(normalizedName)) {
+    family = "code";
+  } else if (CONFIG_FILE_NAMES.has(normalizedName) || isConfigFileName(normalizedName, extension)) {
+    family = "config";
+  } else if (CODE_EXTENSIONS.has(extension)) {
+    family = "code";
+  } else if (DOCUMENT_EXTENSIONS.has(extension)) {
+    family = "document";
+  } else if (DATA_EXTENSIONS.has(extension)) {
+    family = "data";
+  } else if (ARCHIVE_EXTENSIONS.has(extension)) {
+    family = "archive";
+  } else if (FONT_EXTENSIONS.has(extension)) {
+    family = "font";
+  } else if (EXECUTABLE_EXTENSIONS.has(extension) || !entry.openable) {
+    family = "executable";
+  } else {
+    family = "generic";
+  }
+
+  return {
+    family,
+    extension: contentFileExtensionLabel(entry.name, entry.kind, family),
+    marker: CONTENT_FILE_MARKERS[family],
+    restricted: !entry.openable,
+  };
+}
+
+function contentFileExtension(name: string): string {
+  for (const compound of ["tar.bz2", "tar.gz", "tar.xz"] as const) {
+    if (name.endsWith(`.${compound}`)) return compound;
+  }
+  if (name.startsWith(".") && name.indexOf(".", 1) < 0) return name.slice(1);
+  const separator = name.lastIndexOf(".");
+  return separator >= 0 && separator < name.length - 1 ? name.slice(separator + 1) : "";
+}
+
+function contentFileExtensionLabel(
+  name: string,
+  kind: MediaEntryKind,
+  family: ContentFileFamily,
+): string {
+  const normalizedName = name.trim().toLowerCase();
+  if (kind === "directory") return "DIR";
+  const extension = contentFileExtension(normalizedName).replace(/[^a-z0-9.]/g, "").toUpperCase();
+  if (extension === "TAR.BZ2") return "TBZ2";
+  if (extension) return extension.slice(0, 6);
+  if (CODE_FILE_NAMES.has(normalizedName)) return normalizedName === "dockerfile" ? "DOCKER" : "CODE";
+  if (CONFIG_FILE_NAMES.has(normalizedName)) return "CONFIG";
+  if (family === "image") return "IMG";
+  if (family === "video") return "VID";
+  if (family === "audio") return "AUDIO";
+  return "FILE";
+}
+
+function isConfigFileName(name: string, extension: string): boolean {
+  if (CONFIG_EXTENSIONS.has(extension)) return true;
+  if (name.startsWith(".env.")) return true;
+  if (/^(?:eslint|prettier|stylelint|tailwind|vite|vitest|webpack)\.config\./.test(name)) return true;
+  return /(?:^|[.-])config\.(?:js|cjs|mjs|ts|json)$/.test(name);
+}
 
 export function normalizeMediaRootGrant(value: unknown): MediaRootGrant {
   const record = requireRecord(value, "media root grant");

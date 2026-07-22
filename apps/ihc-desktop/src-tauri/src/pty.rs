@@ -5,6 +5,7 @@ use crate::agent_runtime::{AgentRuntime, TerminalLaunchPlan, TerminalLaunchReque
 use crate::codex_notify;
 use crate::grok_notify;
 use crate::provider_accounts::{CODEX_OAUTH_ISOLATION_ENV, GROK_OAUTH_ISOLATION_ENV};
+use crate::provider_lifecycle;
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use serde::Serialize;
 use std::{
@@ -625,6 +626,7 @@ impl TerminalManager {
                 terminal_key: None,
                 resume: None,
                 launch_profile: None,
+                cline_session_id: None,
                 use_embedded_browser_tools: true,
             },
             sink,
@@ -654,6 +656,21 @@ impl TerminalManager {
                     .claim_for_start(&reservation.session_id, terminal_key, binding)
             })
             .transpose()?;
+        let profile_lifecycle = launch_plan
+            .profile_lifecycle()
+            .map(|(terminal_key, provider, cline_session_id)| {
+                let lifecycle =
+                    provider_lifecycle::prepare_launch(&reservation.session_id, provider)?;
+                let lease = self.agent_runtime.claim_profile_for_start(
+                    &reservation.session_id,
+                    terminal_key,
+                    provider,
+                    lifecycle.route(),
+                    cline_session_id,
+                )?;
+                Ok::<_, String>((lifecycle, lease))
+            })
+            .transpose()?;
         let spawn_permit = self.spawn_limiter.acquire()?;
 
         let pair = native_pty_system()
@@ -671,6 +688,11 @@ impl TerminalManager {
         let mut command = CommandBuilder::new(resolve_powershell());
         configure_terminal_environment(&mut command);
         command.args(launch_plan.arguments());
+        if let Some((lifecycle, _)) = &profile_lifecycle {
+            for (name, value) in lifecycle.environment() {
+                command.env(name, value);
+            }
+        }
         if let (Some(browser_bridge), Some(scope)) =
             (&self.browser_bridge, launch_plan.browser_tool_scope())
         {
@@ -750,6 +772,9 @@ impl TerminalManager {
         reservation.committed = true;
         if let Some(binding_lease) = binding_lease {
             binding_lease.commit();
+        }
+        if let Some((_, profile_lease)) = profile_lifecycle {
+            profile_lease.commit();
         }
         workers.release_reaper();
 
@@ -1466,6 +1491,7 @@ fn spawn_workers(
             agent_runtime.unbind(&wait_id);
             codex_notify::remove_route(&wait_id);
             grok_notify::remove_route(&wait_id);
+            provider_lifecycle::remove_route(&wait_id);
             // The session-removal notification is the public stop barrier. Keep it
             // last so a replacement session cannot claim the same conversation
             // before all agent ownership and notification routes are released.

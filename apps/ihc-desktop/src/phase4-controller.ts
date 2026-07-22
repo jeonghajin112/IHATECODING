@@ -21,6 +21,7 @@ import {
   appendProjectBrowserPane,
   appendProjectEditorPane,
   appendProjectPane,
+  clearTerminalClineSessionId,
   appendWorkspaceProject,
   blockWorkspaceProviderResumeForAccountSwitch,
   closeWorkspaceTab,
@@ -44,14 +45,19 @@ import {
   setProjectBrowserPaneUrl,
   setProjectPaneOrder,
   setTerminalAgentConversation,
+  setTerminalClineSessionId,
   sortWorkspaceProjectsByRecentModification,
   suggestWorkspaceProjectName,
   terminalAgentBindingChanged,
+  terminalClineSessionChanged,
   uniqueWorkspaceProjectName,
   validateWorkspaceProjectDraft,
   validateWorkspaceProjectName,
   projectEditorPanes,
+  isValidClineSessionId,
   sameProjectEditorPath,
+  workspaceTerminalClineSessionId,
+  workspaceTerminalLaunchProfile,
   type RestoreCapacityDecision,
   type WorkspaceBrowserPane,
   type WorkspaceEditorPane,
@@ -90,6 +96,15 @@ type StorageStatus = {
   revision: number | null;
 };
 
+type RecoverClineSessionRequest = {
+  cwd: string;
+  notBeforeUtc: string;
+  notAfterUtc: string;
+  excludedSessionIds: string[];
+};
+
+const CLINE_SESSION_BACKFILL_EXTENSION = "clineSessionBackfillV1";
+
 type Phase3PreviewInspection = {
   available: boolean;
   projectCount: number;
@@ -119,6 +134,11 @@ export type Phase4RuntimePort = {
     focus?: boolean,
   ): unknown;
   syncProject(project: WorkspaceProject): void;
+  ownsTerminalRuntimeSession(
+    projectId: string,
+    terminalId: string,
+    runtimeSessionId: string,
+  ): boolean;
   setResumePlans(plans: SafeResumePlan[]): void;
   setTerminalCompletionPending(
     projectId: string,
@@ -257,6 +277,7 @@ export class Phase4WorkspaceController {
   private tabDropTargetId: string | null = null;
   private tabDropPosition: "before" | "after" | null = null;
   private suppressTabClickUntil = 0;
+  private readonly clineBackfillNotAfterUtc = new Date().toISOString();
 
   constructor(
     private readonly runtime: Phase4RuntimePort,
@@ -807,6 +828,134 @@ export class Phase4WorkspaceController {
     });
   }
 
+  /** Durably associate an opaque Cline session before the next app relaunch. */
+  async onClineSessionDiscovered(
+    projectId: string,
+    terminalId: string,
+    runtimeSessionId: string,
+    sessionId: string,
+  ): Promise<boolean> {
+    if (
+      !this.canPersistRuntimeMutation() ||
+      !this.runtime.ownsTerminalRuntimeSession(projectId, terminalId, runtimeSessionId)
+    ) {
+      return false;
+    }
+
+    return this.enqueueOperation(async () => {
+      if (!this.runtime.ownsTerminalRuntimeSession(projectId, terminalId, runtimeSessionId)) {
+        return false;
+      }
+      const state = this.currentState();
+      const terminal = state?.projects
+        .find((project) => project.id === projectId)
+        ?.terminals.find((item) => item.id === terminalId);
+      if (!state || !terminal) return false;
+
+      try {
+        const next = setTerminalClineSessionId(
+          state,
+          projectId,
+          terminalId,
+          sessionId,
+        );
+        const nextTerminal = next.projects
+          .find((project) => project.id === projectId)
+          ?.terminals.find((item) => item.id === terminalId);
+        if (nextTerminal && terminalClineSessionChanged(terminal, nextTerminal)) {
+          const saved = await this.persistNow(
+            next,
+            tr(
+              "Could not save the Cline session link",
+              "Cline 세션 연결을 저장하지 못했습니다",
+            ),
+          );
+          if (!saved) return false;
+          if (!this.runtime.ownsTerminalRuntimeSession(projectId, terminalId, runtimeSessionId)) {
+            const committed = this.currentState();
+            if (!committed) return false;
+            const rollback = clearTerminalClineSessionId(
+              committed,
+              projectId,
+              terminalId,
+              sessionId,
+            );
+            await this.persistNow(
+              rollback,
+              tr(
+                "Could not roll back an obsolete Cline session link",
+                "더 이상 유효하지 않은 Cline 세션 연결을 되돌리지 못했습니다",
+              ),
+            );
+            const rolledBack = this.currentState();
+            if (rolledBack) {
+              this.runtime.setResumePlans(deriveSafeResumePlans(rolledBack));
+              const rolledBackProject = rolledBack.projects.find(
+                (item) => item.id === projectId,
+              );
+              if (rolledBackProject) this.runtime.syncProject(rolledBackProject);
+            }
+            return false;
+          }
+        }
+
+        const committed = this.currentState();
+        if (!committed) return false;
+        this.runtime.setResumePlans(deriveSafeResumePlans(committed));
+        const committedProject = committed.projects.find((item) => item.id === projectId);
+        if (committedProject) this.runtime.syncProject(committedProject);
+        return true;
+      } catch (error) {
+        this.runtime.setFooterStatus(errorMessage(error), "error");
+        return false;
+      }
+    });
+  }
+
+  /** Durably forget a Cline resume target that no longer exists on disk. */
+  async onClineSessionInvalidated(
+    projectId: string,
+    terminalId: string,
+    expectedSessionId: string,
+  ): Promise<boolean> {
+    if (!this.canPersistRuntimeMutation()) return false;
+
+    return this.enqueueOperation(async () => {
+      const state = this.currentState();
+      const terminal = state?.projects
+        .find((project) => project.id === projectId)
+        ?.terminals.find((item) => item.id === terminalId);
+      if (!state || !terminal) return false;
+
+      try {
+        const next = clearTerminalClineSessionId(
+          state,
+          projectId,
+          terminalId,
+          expectedSessionId,
+        );
+        const saved = await this.persistNow(
+          next,
+          tr(
+            "Could not clear the unavailable Cline session",
+            "사용할 수 없는 Cline 세션을 정리하지 못했습니다",
+          ),
+        );
+        if (!saved) return false;
+
+        const committed = this.currentState();
+        if (!committed) return false;
+        this.runtime.setResumePlans(deriveSafeResumePlans(committed));
+        const committedProject = committed.projects.find((item) => item.id === projectId);
+        if (committedProject) this.runtime.syncProject(committedProject);
+        return true;
+      } catch (error) {
+        this.runtime.setFooterStatus(errorMessage(error), "error");
+        return false;
+      }
+    });
+  }
+
   setTerminalAgentWorking(projectId: string, terminalId: string, working: boolean): void {
     this.projectActivity.setTerminalWorking(projectId, terminalId, working);
     this.refreshProjectActivity(projectId);
@@ -1003,6 +1152,10 @@ export class Phase4WorkspaceController {
           return false;
         }
       }
+      if (!(await this.backfillLegacyClineSessions())) {
+        this.renderAndActivate();
+        return false;
+      }
       this.renderAndActivate();
       return true;
     } catch (error) {
@@ -1023,6 +1176,114 @@ export class Phase4WorkspaceController {
     } finally {
       this.refreshControls();
     }
+  }
+
+  private async backfillLegacyClineSessions(): Promise<boolean> {
+    const initial = this.currentState();
+    if (
+      !initial ||
+      this.session?.access !== "ready" ||
+      initial.legacyExtensions[CLINE_SESSION_BACKFILL_EXTENSION] === true
+    ) {
+      return true;
+    }
+
+    const owned = new Set<string>();
+    let recoveryIncomplete = false;
+    const unbound: Array<{
+      projectId: string;
+      terminal: WorkspaceTerminal;
+      cwdKey: string;
+    }> = [];
+    const unboundByCwd = new Map<string, number>();
+    for (const project of initial.projects) {
+      for (const terminal of project.terminals) {
+        const sessionId = workspaceTerminalClineSessionId(terminal);
+        if (sessionId) {
+          owned.add(sessionId.toLowerCase());
+          continue;
+        }
+        if (workspaceTerminalLaunchProfile(terminal) !== "cline") continue;
+        const cwdKey = normalizedClineRecoveryPath(terminal.startDirectory);
+        if (!cwdKey || !terminal.createdAtUtc) {
+          recoveryIncomplete = true;
+          continue;
+        }
+        unbound.push({ projectId: project.id, terminal, cwdKey });
+        unboundByCwd.set(cwdKey, (unboundByCwd.get(cwdKey) ?? 0) + 1);
+      }
+    }
+
+    let next = initial;
+    let recoveredAny = false;
+    // Recovery calls and durable claims are deliberately serialized. Along
+    // with the exclusion set this prevents two panes from claiming one Cline
+    // conversation during startup.
+    for (const candidate of unbound) {
+      if (unboundByCwd.get(candidate.cwdKey) !== 1) {
+        recoveryIncomplete = true;
+        continue;
+      }
+      let sessionId: string | null;
+      try {
+        const request: RecoverClineSessionRequest = {
+          cwd: candidate.terminal.startDirectory,
+          notBeforeUtc: candidate.terminal.createdAtUtc!,
+          notAfterUtc: this.clineBackfillNotAfterUtc,
+          excludedSessionIds: [...owned],
+        };
+        sessionId = await invoke<string | null>("recover_cline_session", { request });
+      } catch {
+        recoveryIncomplete = true;
+        continue;
+      }
+      if (!sessionId) {
+        recoveryIncomplete = true;
+        continue;
+      }
+      if (!isValidClineSessionId(sessionId) || owned.has(sessionId.toLowerCase())) {
+        recoveryIncomplete = true;
+        continue;
+      }
+      try {
+        next = setTerminalClineSessionId(
+          next,
+          candidate.projectId,
+          candidate.terminal.id,
+          sessionId,
+        );
+        owned.add(sessionId.toLowerCase());
+        recoveredAny = true;
+      } catch {
+        recoveryIncomplete = true;
+      }
+    }
+
+    // An absent result is deliberately retryable. The provider may still be
+    // flushing ended_at after the previous app instance exited, multiple
+    // same-cwd panes may need later disambiguation, or a bounded scan may have
+    // failed. Persist any independently proven claims, but never write the
+    // global completion marker while one eligible pane remains unresolved.
+    if (recoveryIncomplete) {
+      if (!recoveredAny) return true;
+      return this.persistNow(
+        next,
+        tr(
+          "Could not save the partial Cline conversation recovery",
+          "부분적으로 복구한 Cline 대화를 저장하지 못했습니다",
+        ),
+      );
+    }
+
+    const marked = structuredClone(next) as WorkspaceState;
+    marked.legacyExtensions[CLINE_SESSION_BACKFILL_EXTENSION] = true;
+    return this.persistNow(
+      marked,
+      tr(
+        "Could not save the Cline conversation recovery",
+        "Cline 대화 복구를 저장하지 못했습니다",
+      ),
+    );
   }
 
   private renderAndActivate(): void {
@@ -2507,6 +2768,16 @@ function storageAccessMessage(session: WorkspaceSession): string {
 
 function localizeBuiltInTabTitle(title: string): string {
   return isBuiltInTabTitle(title) ? tr("New tab", "새 탭") : title;
+}
+
+function normalizedClineRecoveryPath(value: string): string | null {
+  const trimmed = value.trim();
+  if (!trimmed || trimmed.length > 32 * 1024 || /[\u0000-\u001f\u007f]/.test(trimmed)) {
+    return null;
+  }
+  let normalized = trimmed.replace(/\//g, "\\");
+  while (normalized.length > 3 && normalized.endsWith("\\")) normalized = normalized.slice(0, -1);
+  return normalized.toLocaleLowerCase("en-US");
 }
 
 function isBuiltInTabTitle(title: string): boolean {

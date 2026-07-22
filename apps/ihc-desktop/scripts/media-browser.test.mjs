@@ -110,6 +110,53 @@ test("media browser wire responses are bounded and normalized", () => {
   assert.throws(() => media.normalizeMediaVolumeList(Array(65).fill(volumes[0])));
 });
 
+test("content browser visuals distinguish common file families without backend metadata", () => {
+  const cases = [
+    ["src", "directory", true, "folder", "DIR"],
+    ["PHOTO.JPEG", "file", true, "image", "JPEG"],
+    ["recording.webm", "file", true, "video", "WEBM"],
+    ["theme.flac", "file", true, "audio", "FLAC"],
+    ["App.TSX", "file", true, "code", "TSX"],
+    ["Dockerfile", "file", true, "code", "DOCKER"],
+    ["README.md", "file", true, "document", "MD"],
+    ["report.csv", "file", true, "data", "CSV"],
+    ["package.json", "file", true, "config", "JSON"],
+    ["vite.config.ts", "file", true, "config", "TS"],
+    [".env", "file", true, "config", "ENV"],
+    ["bundle.tar.gz", "file", true, "archive", "TAR.GZ"],
+    ["bundle.tar.bz2", "file", true, "archive", "TBZ2"],
+    ["ui.woff2", "file", true, "font", "WOFF2"],
+    ["setup.exe", "file", false, "executable", "EXE"],
+    ["deploy.ps1", "file", false, "code", "PS1"],
+    ["LICENSE", "file", true, "generic", "FILE"],
+  ];
+
+  for (const [name, kind, openable, family, extension] of cases) {
+    const visual = media.classifyContentFileVisual({ name, kind, openable });
+    assert.equal(visual.family, family, name);
+    assert.equal(visual.extension, extension, name);
+    assert.equal(visual.restricted, !openable, name);
+    assert.ok(visual.marker.length > 0, name);
+  }
+
+  assert.equal(
+    media.classifyContentFileVisual({ name: "preview", kind: "image", openable: true }).family,
+    "image",
+  );
+  assert.equal(
+    media.classifyContentFileVisual({ name: "preview", kind: "video", openable: true }).extension,
+    "VID",
+  );
+  assert.equal(
+    media.classifyContentFileVisual({ name: "unknown.payload", kind: "file", openable: false }).family,
+    "executable",
+  );
+  assert.equal(
+    media.classifyContentFileVisual({ name: "src.v2", kind: "directory", openable: true }).extension,
+    "DIR",
+  );
+});
+
 test("media selection toggles and stops at the attachment limit", () => {
   let keys = [];
   for (let index = 0; index < media.MAX_MEDIA_SELECTION; index += 1) {
@@ -211,6 +258,10 @@ test("Ctrl+Space drawer is wired to secure media IPC and the active terminal att
   assert.match(drawer, /grant\.focusFileName/);
   assert.match(drawer, /private renderVolumes/);
   assert.match(drawer, /IntersectionObserver/);
+  assert.match(drawer, /classifyContentFileVisual\(entry\)/);
+  assert.match(drawer, /card\.dataset\.fileFamily = visual\.family/);
+  assert.match(drawer, /contentFileFamilyLabel\(visual\.family\)/);
+  assert.match(drawer, /visual\.restricted[\s\S]*opening restricted/);
   assert.match(drawer, /card\.tabIndex = initiallyFocusable \? 0 : -1/);
   assert.match(drawer, /dataset\.action = "parent"/);
   assert.match(drawer, /this\.elements\.stage\.dataset\.mediaDrawerOpen = "true"/);
@@ -239,8 +290,24 @@ test("Ctrl+Space drawer is wired to secure media IPC and the active terminal att
   assert.match(picker, /event\.isTrusted[\s\S]*ihc-media-drawer-toggle/);
   assert.match(styles, /\.workspace-stage\[data-media-drawer-open="true"\][\s\S]*grid-template-rows/);
   assert.match(styles, /\.media-drawer-layer\s*\{[\s\S]*grid-area:\s*2 \/ 1/);
+  const drawerLayerZIndex = Number(
+    styles.match(/\.media-drawer-layer\s*\{[\s\S]*?z-index:\s*(\d+);/)?.[1],
+  );
+  const statusbarZIndex = Number(styles.match(/\.statusbar\s*\{[\s\S]*?z-index:\s*(\d+);/)?.[1]);
+  assert.ok(
+    statusbarZIndex > drawerLayerZIndex,
+    "the remaining-usage status bar must stay above the content browser drawer",
+  );
   assert.match(styles, /\.media-drawer\s*\{[\s\S]*transform:\s*translateY/);
   assert.match(styles, /\.media-drawer-grid\s*\{[\s\S]*grid-template-columns:\s*repeat\(auto-fill/);
+  for (const family of [
+    "folder", "image", "video", "audio", "code", "document", "data", "config", "archive",
+    "font", "executable", "generic",
+  ]) {
+    assert.match(styles, new RegExp(`data-file-family="${family}"`));
+  }
+  assert.match(styles, /data-file-restricted="true"/);
+  assert.match(styles, /\.media-card-file-marker\s*\{/);
   assert.match(styles, /\.content-entry-menu\s*\{[\s\S]*position:\s*fixed/);
   assert.match(styles, /\.content-file-drag-ghost\s*\{[\s\S]*pointer-events:\s*none/);
   const parsedConfig = JSON.parse(config);

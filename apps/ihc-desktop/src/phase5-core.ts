@@ -1,8 +1,15 @@
 import { normalizeWorkspaceState } from "./phase3b-core";
+import { workspaceTerminalClineSessionId } from "./phase4-core";
 import { formatAppNumber, tr } from "./i18n";
 
 export type AgentProvider = "codex" | "grok";
-export type DroppedFileProvider = AgentProvider | "claude" | "opencode";
+export type ResumeProvider = AgentProvider | "cline";
+export type DroppedFileProvider =
+  | AgentProvider
+  | "claude"
+  | "opencode"
+  | "cline"
+  | "cursor";
 
 export type RectangleBounds = {
   left: number;
@@ -39,13 +46,43 @@ export function rectanglesOverlap(first: RectangleBounds, second: RectangleBound
   );
 }
 
+export function clipRectangleAboveOverlay(
+  rectangle: RectangleBounds,
+  overlay: RectangleBounds | null,
+  gap = 1,
+): RectangleBounds | null {
+  const width = rectangle.right - rectangle.left;
+  const height = rectangle.bottom - rectangle.top;
+  if (
+    ![
+      rectangle.left,
+      rectangle.top,
+      rectangle.right,
+      rectangle.bottom,
+      width,
+      height,
+      gap,
+    ].every(Number.isFinite) ||
+    width < 2 ||
+    height < 2 ||
+    gap < 0
+  ) {
+    return null;
+  }
+  if (!overlay || !rectanglesOverlap(rectangle, overlay)) return { ...rectangle };
+
+  const bottom = Math.min(rectangle.bottom, overlay.top - gap);
+  if (bottom - rectangle.top < 2) return null;
+  return { ...rectangle, bottom };
+}
+
 export type ResumeBlockingReason =
   | "legacyResumeBlocked"
   | "dualProviderBinding"
   | "duplicateProviderBinding";
 
 export type ResumeCandidate = {
-  provider: AgentProvider;
+  provider: ResumeProvider;
   conversationId: string;
 };
 
@@ -58,7 +95,7 @@ export type SafeResumePlan = {
   projectId: string;
   terminalId: string;
   action: "shell" | "resume" | "blocked";
-  provider: AgentProvider | null;
+  provider: ResumeProvider | null;
   conversationId: string | null;
   candidates: ResumeCandidate[];
   blockingReasons: ResumeBlockingReason[];
@@ -178,6 +215,179 @@ export type TerminalLaunchPaintDecision = "idle" | "waiting" | "recover";
 const TERMINAL_LAUNCH_ESCAPE_TAIL_LENGTH = 16;
 const TERMINAL_LAUNCH_CONTROL_PATTERN =
   /(?:\x1b\[|\u009b)\?(?:47|1047|1049|2026)h/;
+
+const TERMINAL_CURSOR_FRAME_CSI_FIELD_LIMIT = 64;
+
+export type TerminalCursorFrameParserPhase = "ground" | "escape" | "csi";
+
+export type TerminalCursorFrameState = Readonly<{
+  phase: TerminalCursorFrameParserPhase;
+  parameters: string;
+  intermediates: string;
+  csiOverflow: boolean;
+  waitingForCursorPosition: boolean;
+  endsAtFrameBoundary: boolean;
+  alternateScreenActive: boolean;
+  synchronizedOutputActive: boolean;
+}>;
+
+export const INITIAL_TERMINAL_CURSOR_FRAME_STATE: TerminalCursorFrameState = {
+  phase: "ground",
+  parameters: "",
+  intermediates: "",
+  csiOverflow: false,
+  waitingForCursorPosition: false,
+  endsAtFrameBoundary: false,
+  alternateScreenActive: false,
+  synchronizedOutputActive: false,
+};
+
+/**
+ * Track terminal redraw controls without inspecting printable content.
+ * Crossterm/Codex wraps each draw in DEC synchronized output (2026), while
+ * older TUI paths can still end with ShowCursor followed by CUP. ConPTY may
+ * split either sequence at any byte boundary, so this is a streaming parser
+ * rather than a suffix regular expression.
+ */
+export function scanTerminalCursorFrame(
+  previous: TerminalCursorFrameState,
+  data: string,
+): TerminalCursorFrameState {
+  if (!data) return previous;
+  let phase = previous.phase;
+  let parameters = previous.parameters;
+  let intermediates = previous.intermediates;
+  let csiOverflow = previous.csiOverflow;
+  let waitingForCursorPosition = previous.waitingForCursorPosition;
+  let endsAtFrameBoundary = previous.endsAtFrameBoundary;
+  let alternateScreenActive = previous.alternateScreenActive;
+  let synchronizedOutputActive = previous.synchronizedOutputActive;
+
+  const resetCsi = () => {
+    parameters = "";
+    intermediates = "";
+    csiOverflow = false;
+  };
+  const appendCsiField = (field: "parameters" | "intermediates", character: string) => {
+    const current = field === "parameters" ? parameters : intermediates;
+    if (current.length >= TERMINAL_CURSOR_FRAME_CSI_FIELD_LIMIT) {
+      csiOverflow = true;
+      return;
+    }
+    if (field === "parameters") parameters += character;
+    else intermediates += character;
+  };
+
+  for (const character of data) {
+    // A frame boundary is useful only while it remains the stream tail. Any
+    // following byte belongs to another terminal operation or redraw.
+    endsAtFrameBoundary = false;
+
+    if (character === "\x1b") {
+      phase = "escape";
+      resetCsi();
+      continue;
+    }
+    if (character === "\u009b") {
+      phase = "csi";
+      resetCsi();
+      continue;
+    }
+
+    if (phase === "escape") {
+      if (character === "[") {
+        phase = "csi";
+        resetCsi();
+      } else {
+        phase = "ground";
+      }
+      continue;
+    }
+    if (phase !== "csi") continue;
+
+    const code = character.charCodeAt(0);
+    if (code >= 0x30 && code <= 0x3f && intermediates.length === 0) {
+      appendCsiField("parameters", character);
+      continue;
+    }
+    if (code >= 0x20 && code <= 0x2f) {
+      appendCsiField("intermediates", character);
+      continue;
+    }
+    if (code < 0x40 || code > 0x7e) {
+      phase = "ground";
+      resetCsi();
+      continue;
+    }
+
+    const privateModes =
+      !csiOverflow && parameters.startsWith("?")
+        ? parameters
+            .slice(1)
+            .split(";")
+            .filter(Boolean)
+        : [];
+    const cursorShown =
+      intermediates === "" && character === "h" && privateModes.includes("25");
+    const cursorHidden =
+      intermediates === "" && character === "l" && privateModes.includes("25");
+    const alternateMode = privateModes.some(
+      (mode) => mode === "47" || mode === "1047" || mode === "1049",
+    );
+    const synchronizedMode = privateModes.includes("2026");
+    const synchronizedOutputStarted =
+      intermediates === "" && character === "h" && synchronizedMode;
+    const synchronizedOutputEnded =
+      intermediates === "" && character === "l" && synchronizedMode;
+    const cursorPositionedAfterShow =
+      waitingForCursorPosition &&
+      !csiOverflow &&
+      intermediates === "" &&
+      !parameters.startsWith("?") &&
+      (character === "H" || character === "f");
+
+    if (synchronizedOutputStarted) {
+      synchronizedOutputActive = true;
+      endsAtFrameBoundary = false;
+    }
+    if (intermediates === "" && character === "h" && alternateMode) {
+      alternateScreenActive = true;
+      waitingForCursorPosition = false;
+    }
+    if (intermediates === "" && character === "l" && alternateMode) {
+      alternateScreenActive = false;
+      waitingForCursorPosition = false;
+      endsAtFrameBoundary = !synchronizedOutputActive;
+    }
+    if (cursorShown) {
+      waitingForCursorPosition = true;
+      endsAtFrameBoundary = false;
+    }
+    if (cursorHidden || cursorPositionedAfterShow) {
+      waitingForCursorPosition = false;
+      endsAtFrameBoundary = !synchronizedOutputActive;
+    }
+    if (synchronizedOutputEnded) {
+      synchronizedOutputActive = false;
+      waitingForCursorPosition = false;
+      endsAtFrameBoundary = true;
+    }
+
+    phase = "ground";
+    resetCsi();
+  }
+
+  return {
+    phase,
+    parameters,
+    intermediates,
+    csiOverflow,
+    waitingForCursorPosition,
+    endsAtFrameBoundary,
+    alternateScreenActive,
+    synchronizedOutputActive,
+  };
+}
 
 export function scanTerminalLaunchControl(tail: string, data: string) {
   const combined = tail.slice(-TERMINAL_LAUNCH_ESCAPE_TAIL_LENGTH) + data;
@@ -766,10 +976,17 @@ export function formatProviderResetCountdown(
 }
 
 export function selectClipboardImageSequence(
-  provider: AgentProvider | null | undefined,
+  provider: DroppedFileProvider | null | undefined,
 ): string | null {
-  if (provider === "codex") return "\u0016";
-  if (provider === "grok") return "\u001bv";
+  if (
+    provider === "codex" ||
+    provider === "opencode" ||
+    provider === "cline" ||
+    provider === "cursor"
+  ) {
+    return "\u0016";
+  }
+  if (provider === "grok" || provider === "claude") return "\u001bv";
   return null;
 }
 
@@ -780,6 +997,33 @@ export function selectClipboardImageSequence(
  */
 export function sanitizeUiPickClipboardText(text: string): string {
   return text.replace(/[\u0000-\u001f\u007f]+/g, " ").slice(0, 32_768);
+}
+
+const MAX_OSC52_CLIPBOARD_BYTES = 8 * 1024 * 1024;
+
+/** Decode a bounded OSC 52 clipboard write without accepting queries. */
+export function decodeOsc52ClipboardText(data: string): string | null {
+  const separator = data.indexOf(";");
+  if (separator < 0) return null;
+  if (data.slice(0, separator) !== "c") return null;
+  const encoded = data.slice(separator + 1);
+  if (
+    encoded.length === 0 ||
+    encoded === "?" ||
+    encoded.length > Math.ceil((MAX_OSC52_CLIPBOARD_BYTES * 4) / 3) + 4 ||
+    !/^[A-Za-z0-9+/]*={0,2}$/.test(encoded) ||
+    encoded.length % 4 === 1
+  ) {
+    return null;
+  }
+  try {
+    const binary = atob(encoded);
+    if (binary.length > MAX_OSC52_CLIPBOARD_BYTES) return null;
+    const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes) || null;
+  } catch {
+    return null;
+  }
 }
 
 export const MAX_DROPPED_FILE_REFERENCES = 20;
@@ -863,7 +1107,9 @@ export function formatDroppedFileReference(
     provider === "codex" ||
     provider === "grok" ||
     provider === "claude" ||
-    provider === "opencode"
+    provider === "opencode" ||
+    provider === "cline" ||
+    provider === "cursor"
   ) {
     return `@${quotedPath}`;
   }
@@ -1078,6 +1324,7 @@ export function deriveWorkspaceUnreadSummary(
 function terminalResumeCandidates(terminal: {
   codexThreadId: string | null;
   grokSessionId: string | null;
+  legacyExtensions: Record<string, unknown>;
 }): ResumeCandidate[] {
   const candidates: ResumeCandidate[] = [];
   if (terminal.codexThreadId !== null) {
@@ -1086,10 +1333,14 @@ function terminalResumeCandidates(terminal: {
   if (terminal.grokSessionId !== null) {
     candidates.push({ provider: "grok", conversationId: terminal.grokSessionId });
   }
+  const clineSessionId = workspaceTerminalClineSessionId(terminal);
+  if (clineSessionId !== null) {
+    candidates.push({ provider: "cline", conversationId: clineSessionId });
+  }
   return candidates;
 }
 
-function providerConversationKey(provider: AgentProvider, conversationId: string) {
+function providerConversationKey(provider: ResumeProvider, conversationId: string) {
   return `${provider}:${conversationId.toLowerCase()}`;
 }
 
