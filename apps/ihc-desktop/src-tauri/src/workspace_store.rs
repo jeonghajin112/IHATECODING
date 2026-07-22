@@ -40,10 +40,12 @@ const MAX_EDITOR_PATH_DEPTH: usize = 64;
 const MAX_EDITOR_PATH_SEGMENT_BYTES: usize = 4 * 255;
 const MAX_EXTENSION_DEPTH: usize = 32;
 const MAX_EXTENSION_STRING_BYTES: usize = 64 * 1024;
+const MAX_SAFE_LAYOUT_INTEGER: u64 = 9_007_199_254_740_991;
 const PROJECT_BROWSER_PANES_EXTENSION: &str = "browserPanesV1";
 const PROJECT_EDITOR_PANES_EXTENSION: &str = "editorPanesV1";
 const RETIRED_PROJECT_IMAGE_PANES_EXTENSION: &str = "imagePanesV1";
 const PROJECT_PANE_ORDER_EXTENSION: &str = "paneOrderV1";
+const CLINE_SESSION_ID_EXTENSION: &str = "clineSessionIdV1";
 const BACKUP_COUNT: usize = 3;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -1432,6 +1434,20 @@ fn validate_state(state: &WorkspaceStateV1) -> StorageResult<()> {
                 &terminal.legacy_extensions,
                 &format!("{terminal_prefix}/legacyExtensions"),
             )?;
+            if let Some(value) = terminal.legacy_extensions.get(CLINE_SESSION_ID_EXTENSION) {
+                let Some(session_id) = value.as_str() else {
+                    return Err(StorageError::invalid(
+                        "The Cline session identifier is invalid.",
+                        format!("{terminal_prefix}/legacyExtensions/{CLINE_SESSION_ID_EXTENSION}"),
+                    ));
+                };
+                if !is_valid_cline_session_id(session_id) {
+                    return Err(StorageError::invalid(
+                        "The Cline session identifier is invalid.",
+                        format!("{terminal_prefix}/legacyExtensions/{CLINE_SESSION_ID_EXTENSION}"),
+                    ));
+                }
+            }
         }
         validate_project_browser_panes(
             &project.legacy_extensions,
@@ -2002,22 +2018,50 @@ fn validate_extension_value(value: &Value, depth: usize, pointer: &str) -> Stora
     }
 }
 
+fn is_valid_cline_session_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
 fn active_layout_columns(key: &str) -> Option<usize> {
     let (grid, row) = key.split_once(':')?;
     let (columns, rows) = grid.split_once('x')?;
-    let columns = columns.parse::<usize>().ok()?;
-    let rows = rows.parse::<usize>().ok()?;
-    let row = row.strip_prefix("row-")?.parse::<usize>().ok()?;
-    if (1..=5).contains(&columns) && (1..=4).contains(&rows) && row < rows && row <= 3 {
-        Some(columns)
+    let columns = parse_canonical_layout_integer(columns, false)?;
+    let rows = parse_canonical_layout_integer(rows, false)?;
+    let row = parse_canonical_layout_integer(row.strip_prefix("row-")?, true)?;
+    if (1..=5).contains(&columns) && row < rows {
+        Some(columns as usize)
     } else {
         None
+    }
+}
+
+fn parse_canonical_layout_integer(value: &str, allow_zero: bool) -> Option<u64> {
+    if value.is_empty()
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+        || (value.len() > 1 && value.starts_with('0'))
+    {
+        return None;
+    }
+    let parsed = value.parse::<u64>().ok()?;
+    if parsed > MAX_SAFE_LAYOUT_INTEGER || (!allow_zero && parsed == 0) {
+        None
+    } else {
+        Some(parsed)
     }
 }
 
 fn derive_resume_conflicts(state: &WorkspaceStateV1) -> Vec<ResumeConflict> {
     let mut codex: HashMap<&str, Vec<String>> = HashMap::new();
     let mut grok: HashMap<&str, Vec<String>> = HashMap::new();
+    let mut cline: HashMap<&str, Vec<String>> = HashMap::new();
     for (project_index, project) in state.projects.iter().enumerate() {
         for (terminal_index, terminal) in project.terminals.iter().enumerate() {
             let pointer = format!("/projects/{project_index}/terminals/{terminal_index}");
@@ -2025,12 +2069,20 @@ fn derive_resume_conflicts(state: &WorkspaceStateV1) -> Vec<ResumeConflict> {
                 codex.entry(id).or_default().push(pointer.clone());
             }
             if let Some(id) = terminal.grok_session_id.as_deref() {
-                grok.entry(id).or_default().push(pointer);
+                grok.entry(id).or_default().push(pointer.clone());
+            }
+            if let Some(id) = terminal
+                .legacy_extensions
+                .get(CLINE_SESSION_ID_EXTENSION)
+                .and_then(Value::as_str)
+                .filter(|id| is_valid_cline_session_id(id))
+            {
+                cline.entry(id).or_default().push(pointer);
             }
         }
     }
     let mut conflicts = Vec::new();
-    for (agent, entries) in [("codex", codex), ("grok", grok)] {
+    for (agent, entries) in [("cline", cline), ("codex", codex), ("grok", grok)] {
         for pointers in entries.into_values().filter(|pointers| pointers.len() > 1) {
             conflicts.push(ResumeConflict {
                 agent: agent.to_owned(),
@@ -2654,6 +2706,34 @@ mod tests {
         state
     }
 
+    #[test]
+    fn cline_session_extension_accepts_only_bounded_shell_neutral_ids() {
+        let mut valid = sample_state();
+        valid.projects[0].terminals[0].legacy_extensions.insert(
+            CLINE_SESSION_ID_EXTENSION.to_owned(),
+            Value::String("1784623042844_ugwq9".to_owned()),
+        );
+        normalize_and_validate_state(&mut valid).unwrap();
+
+        for invalid in [
+            Value::String("bad id".to_owned()),
+            Value::String("x'; Write-Host injected".to_owned()),
+            Value::String("x".repeat(129)),
+            Value::from(42),
+        ] {
+            let mut state = sample_state();
+            state.projects[0].terminals[0]
+                .legacy_extensions
+                .insert(CLINE_SESSION_ID_EXTENSION.to_owned(), invalid);
+            let error = normalize_and_validate_state(&mut state).unwrap_err();
+            assert_eq!(error.code, StorageErrorCode::InvalidState);
+            assert_eq!(
+                error.json_pointer.as_deref(),
+                Some("/projects/0/terminals/0/legacyExtensions/clineSessionIdV1")
+            );
+        }
+    }
+
     fn save(store: &WorkspaceStore, expected_revision: u64, state: WorkspaceStateV1) -> u64 {
         store
             .save(SaveWorkspaceRequest {
@@ -2687,6 +2767,55 @@ mod tests {
             Some("2026-07-18T09:30:00Z")
         );
         assert!(snapshot.written_at_utc.as_deref().is_some_and(is_rfc3339));
+    }
+
+    #[test]
+    fn active_layout_keys_accept_deep_rows_and_reject_noncanonical_numbers() {
+        assert_eq!(active_layout_columns("2x1:row-0"), Some(2));
+        assert_eq!(active_layout_columns("5x128:row-127"), Some(5));
+        assert_eq!(
+            active_layout_columns("1x9007199254740991:row-9007199254740990"),
+            Some(1)
+        );
+
+        for key in [
+            "0x1:row-0",
+            "6x1:row-0",
+            "2x0:row-0",
+            "2x4:row-4",
+            "2x04:row-3",
+            "2x4:row-03",
+            "junk2x4:row-3",
+            "2x4:row--1",
+            "2x9007199254740992:row-0",
+        ] {
+            assert_eq!(active_layout_columns(key), None, "{key}");
+        }
+
+        let mut state = sample_state();
+        state.projects[0]
+            .pane_width_ratios
+            .insert("5x128:row-127".to_owned(), vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+        state.projects[0]
+            .pane_width_ratios
+            .insert("2x04:row-3".to_owned(), vec![7.0, 3.0]);
+        normalize_and_validate_state(&mut state).unwrap();
+        assert_eq!(
+            state.projects[0].pane_width_ratios["5x128:row-127"],
+            vec![1.0 / 15.0, 2.0 / 15.0, 3.0 / 15.0, 4.0 / 15.0, 5.0 / 15.0]
+        );
+        assert_eq!(
+            state.projects[0].pane_width_ratios["2x04:row-3"],
+            vec![7.0, 3.0]
+        );
+
+        state.projects[0]
+            .pane_width_ratios
+            .insert("5x128:row-127".to_owned(), vec![1.0; 4]);
+        assert_eq!(
+            normalize_and_validate_state(&mut state).unwrap_err().code,
+            StorageErrorCode::InvalidState
+        );
     }
 
     #[test]
@@ -3604,14 +3733,19 @@ mod tests {
     #[test]
     fn model_bounds_urls_extensions_and_resume_conflicts() {
         let mut state = sample_state();
+        state.projects[0].terminals[0].legacy_extensions.insert(
+            CLINE_SESSION_ID_EXTENSION.to_owned(),
+            Value::String("1784623042844_shared".to_owned()),
+        );
         let duplicate = state.projects[0].terminals[0].clone();
         let mut second = duplicate.clone();
         second.id = "terminal-2".to_owned();
         state.projects[0].terminals.push(second);
         normalize_and_validate_state(&mut state).unwrap();
         let conflicts = derive_resume_conflicts(&state);
-        assert_eq!(conflicts.len(), 1);
-        assert_eq!(conflicts[0].agent, "codex");
+        assert_eq!(conflicts.len(), 2);
+        assert_eq!(conflicts[0].agent, "cline");
+        assert_eq!(conflicts[1].agent, "codex");
 
         state.tabs.push(WorkspaceTabV1 {
             id: "unsafe-browser".to_owned(),

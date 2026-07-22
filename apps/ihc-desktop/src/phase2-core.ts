@@ -5,6 +5,18 @@ export type GridLayout = Readonly<{
   rows: number;
 }>;
 
+export type LayoutPlacement = Readonly<{
+  index: number;
+  row: number;
+  column: number;
+  rowSpan: number;
+}>;
+
+export type LayoutPlan = GridLayout &
+  Readonly<{
+    placements: readonly LayoutPlacement[];
+  }>;
+
 export type ClipboardTypeSource = Readonly<{
   types: Iterable<string>;
 }>;
@@ -46,6 +58,33 @@ export function layoutFor(count: number): GridLayout {
   if (count <= 15) return { columns: 5, rows: 3 };
   if (count === 16) return { columns: 4, rows: 4 };
   return { columns: 5, rows: Math.ceil(count / 5) };
+}
+
+export function layoutPlanFor(count: number): LayoutPlan {
+  const paneCount = Number.isFinite(count) ? Math.max(0, Math.trunc(count)) : 0;
+  const layout = layoutFor(paneCount);
+  const placements: LayoutPlacement[] = Array.from(
+    { length: paneCount },
+    (_, index) => ({
+      index,
+      row: Math.floor(index / layout.columns),
+      column: index % layout.columns,
+      rowSpan: 1,
+    }),
+  );
+
+  if (paneCount > 0 && layout.rows > 1) {
+    const finalRowStart = (layout.rows - 1) * layout.columns;
+    const finalRowCount = paneCount - finalRowStart;
+
+    for (let column = finalRowCount; column < layout.columns; column += 1) {
+      const aboveIndex = finalRowStart - layout.columns + column;
+      const above = placements[aboveIndex];
+      if (above) placements[aboveIndex] = { ...above, rowSpan: 2 };
+    }
+  }
+
+  return { ...layout, placements };
 }
 
 export function clampPaneCount(value: number): number {

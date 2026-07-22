@@ -59,6 +59,32 @@ pub(crate) enum PhoneNotificationKind {
     Test,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum PhoneNotificationAgent {
+    Powershell,
+    Codex,
+    Grok,
+    Claude,
+    Opencode,
+    Cline,
+    Cursor,
+}
+
+impl PhoneNotificationAgent {
+    fn display_name(self) -> &'static str {
+        match self {
+            Self::Powershell => "PowerShell",
+            Self::Codex => "Codex",
+            Self::Grok => "Grok",
+            Self::Claude => "Claude Code",
+            Self::Opencode => "OpenCode",
+            Self::Cline => "Cline",
+            Self::Cursor => "Cursor",
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct SendPhoneNotificationRequest {
@@ -66,6 +92,9 @@ pub(crate) struct SendPhoneNotificationRequest {
     pub(crate) event_id: String,
     pub(crate) project_name: String,
     pub(crate) terminal_name: String,
+    pub(crate) agent: PhoneNotificationAgent,
+    #[serde(default)]
+    pub(crate) model_name: Option<String>,
     pub(crate) language: Option<String>,
 }
 
@@ -241,6 +270,11 @@ impl PhoneNotificationService {
         validate_event_id(&request.event_id)?;
         let project_name = normalize_display_name(&request.project_name, "project")?;
         let terminal_name = normalize_display_name(&request.terminal_name, "CLI")?;
+        let model_name = request
+            .model_name
+            .as_deref()
+            .map(|value| normalize_display_name(value, "model"))
+            .transpose()?;
         let settings = self
             .settings
             .lock()
@@ -257,6 +291,8 @@ impl PhoneNotificationService {
             request.kind,
             &project_name,
             &terminal_name,
+            request.agent,
+            model_name.as_deref(),
             request.language.as_deref(),
         )?;
         if request.kind != PhoneNotificationKind::Test && !self.reserve_event(&request.event_id)? {
@@ -660,28 +696,69 @@ fn notification_payload(
     kind: PhoneNotificationKind,
     project_name: &str,
     terminal_name: &str,
+    agent: PhoneNotificationAgent,
+    model_name: Option<&str>,
     language: Option<&str>,
 ) -> Result<Vec<u8>, String> {
     let korean = language.is_some_and(|value| value.eq_ignore_ascii_case("ko"));
-    let (icon, status) = match (kind, korean) {
-        (PhoneNotificationKind::Success, false) => ("✅", "completed"),
-        (PhoneNotificationKind::Error, false) => ("⚠️", "error"),
-        (PhoneNotificationKind::SafetyCheck, false) => ("🛡️", "waiting for a safety check"),
-        (PhoneNotificationKind::Test, false) => ("🔔", "Discord notification test"),
-        (PhoneNotificationKind::Success, true) => ("✅", "작업 완료"),
-        (PhoneNotificationKind::Error, true) => ("⚠️", "오류 발생"),
-        (PhoneNotificationKind::SafetyCheck, true) => ("🛡️", "안전 검사 대기"),
-        (PhoneNotificationKind::Test, true) => ("🔔", "Discord 알림 테스트"),
+    let (icon, status, color) = match (kind, korean) {
+        (PhoneNotificationKind::Success, false) => ("✅", "completed", 0x57_f2_87_u32),
+        (PhoneNotificationKind::Error, false) => ("⚠️", "error", 0xed_42_45_u32),
+        (PhoneNotificationKind::SafetyCheck, false) => {
+            ("🛡️", "waiting for a safety check", 0xfe_e7_5c_u32)
+        }
+        (PhoneNotificationKind::Test, false) => ("🔔", "Discord notification test", 0x99_aa_b5_u32),
+        (PhoneNotificationKind::Success, true) => ("✅", "작업 완료", 0x57_f2_87_u32),
+        (PhoneNotificationKind::Error, true) => ("⚠️", "오류 발생", 0xed_42_45_u32),
+        (PhoneNotificationKind::SafetyCheck, true) => ("🛡️", "안전 검사 대기", 0xfe_e7_5c_u32),
+        (PhoneNotificationKind::Test, true) => ("🔔", "Discord 알림 테스트", 0x99_aa_b5_u32),
     };
+    let agent_name = agent.display_name();
     let content = format!(
-        "{icon} [{}] {} {status}",
+        "{icon} [{} · {}] {} {status}",
         escape_discord_markdown(project_name),
+        escape_discord_markdown(agent_name),
         escape_discord_markdown(terminal_name),
     );
+    let (project_label, agent_label, terminal_label, model_label) = if korean {
+        ("프로젝트", "에이전트", "CLI 창", "모델")
+    } else {
+        ("Project", "Agent", "CLI pane", "Model")
+    };
+    let mut fields = vec![
+        serde_json::json!({
+            "name": project_label,
+            "value": escape_discord_markdown(project_name),
+            "inline": true,
+        }),
+        serde_json::json!({
+            "name": agent_label,
+            "value": escape_discord_markdown(agent_name),
+            "inline": true,
+        }),
+        serde_json::json!({
+            "name": terminal_label,
+            "value": escape_discord_markdown(terminal_name),
+            "inline": true,
+        }),
+    ];
+    if let Some(model_name) = model_name {
+        fields.push(serde_json::json!({
+            "name": model_label,
+            "value": escape_discord_markdown(model_name),
+            "inline": true,
+        }));
+    }
     serde_json::to_vec(&serde_json::json!({
         "content": content,
         "username": "IHATECODING",
         "allowed_mentions": { "parse": [] },
+        "embeds": [{
+            "title": format!("{icon} {status}"),
+            "color": color,
+            "fields": fields,
+            "footer": { "text": "IHATECODING" },
+        }],
     }))
     .map_err(|_| "Could not encode the Discord notification.".to_owned())
 }
@@ -1002,6 +1079,8 @@ mod tests {
             event_id: event_id.to_owned(),
             project_name: "IHATECODING".to_owned(),
             terminal_name: "MAIN".to_owned(),
+            agent: PhoneNotificationAgent::Cline,
+            model_name: None,
             language: Some("en".to_owned()),
         }
     }
@@ -1075,6 +1154,8 @@ mod tests {
             PhoneNotificationKind::Success,
             "프로젝트 [A] @everyone",
             "CLI `백엔드`",
+            PhoneNotificationAgent::Cline,
+            Some("Kimi K3 `beta`"),
             Some("ko"),
         )
         .unwrap();
@@ -1084,10 +1165,19 @@ mod tests {
         let content = json["content"].as_str().unwrap();
         assert!(content.contains("프로젝트"));
         assert!(content.contains("백엔드"));
+        assert!(content.contains("Cline"));
         assert!(content.contains("\\@everyone"));
         assert!(content.contains("\\`백엔드\\`"));
         assert!(!content.contains("event"));
         assert!(!content.contains("C:\\"));
+        let fields = json["embeds"][0]["fields"].as_array().unwrap();
+        assert_eq!(fields.len(), 4);
+        assert_eq!(fields[0]["name"], "프로젝트");
+        assert_eq!(fields[1]["name"], "에이전트");
+        assert_eq!(fields[1]["value"], "Cline");
+        assert_eq!(fields[2]["name"], "CLI 창");
+        assert_eq!(fields[3]["name"], "모델");
+        assert_eq!(fields[3]["value"], "Kimi K3 \\`beta\\`");
     }
 
     #[test]
@@ -1096,6 +1186,8 @@ mod tests {
             PhoneNotificationKind::Success,
             "IHATECODING",
             "MAIN",
+            PhoneNotificationAgent::Codex,
+            None,
             Some("en"),
         )
         .unwrap();
@@ -1103,6 +1195,8 @@ mod tests {
             PhoneNotificationKind::Success,
             "IHATECODING",
             "MAIN",
+            PhoneNotificationAgent::Codex,
+            None,
             Some("ko"),
         )
         .unwrap();
@@ -1116,6 +1210,8 @@ mod tests {
             PhoneNotificationKind::SafetyCheck,
             "IHATECODING",
             "MAIN",
+            PhoneNotificationAgent::Codex,
+            None,
             Some("en"),
         )
         .unwrap();
@@ -1123,6 +1219,8 @@ mod tests {
             PhoneNotificationKind::SafetyCheck,
             "IHATECODING",
             "MAIN",
+            PhoneNotificationAgent::Codex,
+            None,
             Some("ko"),
         )
         .unwrap();
@@ -1212,6 +1310,8 @@ mod tests {
                     event_id: "turn:1".to_owned(),
                     project_name: "IHATECODING".to_owned(),
                     terminal_name: "MAIN".to_owned(),
+                    agent: PhoneNotificationAgent::Powershell,
+                    model_name: None,
                     language: Some("en".to_owned()),
                 })
                 .unwrap()

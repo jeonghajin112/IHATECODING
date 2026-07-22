@@ -184,6 +184,57 @@ test("canonical v1 load preserves unknown fields, order, layout, and clone isola
   assert.deepEqual(core.normalizeWorkspaceState(state), state);
 });
 
+test("pane ratio layout keys support arbitrary safe row counts and preserve unknown keys", () => {
+  assert.deepEqual(core.parsePaneRatioLayoutKey("2x1:row-0"), {
+    columns: 2,
+    rows: 1,
+    row: 0,
+  });
+  assert.deepEqual(core.parsePaneRatioLayoutKey("5x128:row-127"), {
+    columns: 5,
+    rows: 128,
+    row: 127,
+  });
+  assert.deepEqual(
+    core.parsePaneRatioLayoutKey("1x9007199254740991:row-9007199254740990"),
+    { columns: 1, rows: 9_007_199_254_740_991, row: 9_007_199_254_740_990 },
+  );
+
+  for (const key of [
+    "0x1:row-0",
+    "6x1:row-0",
+    "2x0:row-0",
+    "2x4:row-4",
+    "2x04:row-3",
+    "2x4:row-03",
+    "junk2x4:row-3",
+    "2x4:row--1",
+    "2x9007199254740992:row-0",
+  ]) {
+    assert.equal(core.parsePaneRatioLayoutKey(key), null, key);
+  }
+
+  const normalized = core.normalizeWorkspaceState(
+    workspace({
+      projects: [
+        project("project-a", {
+          paneWidthRatios: {
+            "5x128:row-127": [1, 2, 3, 4, 5],
+            "2x0:row-0": [7, 3],
+          },
+        }),
+      ],
+    }),
+  );
+  assert.deepEqual(
+    normalized.projects[0].paneWidthRatios["5x128:row-127"].map((value) =>
+      Number(value.toFixed(6))
+    ),
+    [0.066667, 0.133333, 0.2, 0.266667, 0.333333],
+  );
+  assert.deepEqual(normalized.projects[0].paneWidthRatios["2x0:row-0"], [7, 3]);
+});
+
 test("terminal launch profiles survive canonical normalization and cloning", () => {
   const source = workspace({
     projects: [
@@ -553,6 +604,13 @@ test("alerts and pane layout mutations preserve unknown data and do not mutate t
     "2026-07-18T02:00:00Z",
   );
   assert.deepEqual(resized.projects[0].paneWidthRatios["2x1:row-0"], [0.25, 0.75]);
+  const deepRow = core.setProjectPaneWidthRatios(
+    resized,
+    "project-a",
+    "2x128:row-127",
+    [3, 1],
+  );
+  assert.deepEqual(deepRow.projects[0].paneWidthRatios["2x128:row-127"], [0.75, 0.25]);
   assert.deepEqual(
     resized.projects[0].paneWidthRatios["legacy:grid-key"],
     original.projects[0].paneWidthRatios["legacy:grid-key"],

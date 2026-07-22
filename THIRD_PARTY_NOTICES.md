@@ -35,6 +35,16 @@ respective owners.
 - Changes: simplified an equivalent luminance mask and renamed the clip-path ID;
   the visible vector geometry and colors are unchanged.
 
+## Cline icon
+
+- Source: `apps/cline-hub/src/webview/public/cline-logo-filled.svg` from
+  [cline/cline](https://github.com/cline/cline/blob/a3cd39da14cf8318b3778237e3ba82e7dfdc2ff2/apps/cline-hub/src/webview/public/cline-logo-filled.svg)
+- Copyright: Cline Bot Inc.
+- License: [Apache License 2.0](https://github.com/cline/cline/blob/a3cd39da14cf8318b3778237e3ba82e7dfdc2ff2/LICENSE)
+- Local file: `apps/ihc-desktop/src/assets/provider-icons/cline.svg`
+- Changes: removed editor metadata and set the fill to IHATECODING's monochrome
+  light foreground; the vector geometry is unchanged.
+
 ## Cursor icon
 
 - Source: `brand-logo-8.svg` from the official

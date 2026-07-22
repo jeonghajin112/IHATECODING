@@ -15,8 +15,10 @@ const providerIconOutputDirectory = new URL(
   import.meta.url,
 );
 const providerIconNames = [
+  "android-emulator.svg",
   "browser.svg",
   "claude-code.svg",
+  "cline.svg",
   "codex.svg",
   "cursor.svg",
   "grok.svg",

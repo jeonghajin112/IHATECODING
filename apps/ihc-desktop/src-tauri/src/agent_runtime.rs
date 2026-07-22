@@ -1,3 +1,7 @@
+use crate::cline_session;
+use crate::provider_lifecycle::{
+    self, ProfileAgentProvider, ProfileLifecycleEvent, ProfileLifecycleRecord,
+};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -24,6 +28,7 @@ const MAX_CONTEXT_LOOKBACK_BYTES: u64 = 8 * 1024 * 1024;
 const CONTEXT_SCAN_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_LINE_BYTES: usize = 1024 * 1024;
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(180);
+const FINAL_PROFILE_DRAIN_GRACE: Duration = Duration::from_millis(20);
 const GROK_DISCOVERY_SETTLE: Duration = Duration::from_millis(500);
 const GROK_DISCOVERY_PROBE_TTL: Duration = Duration::from_secs(30);
 const GROK_DISCOVERY_TIME_GRACE_MS: u64 = 2_000;
@@ -48,6 +53,8 @@ pub(crate) enum TerminalLaunchProfile {
     Grok,
     Claude,
     Opencode,
+    Cline,
+    Cursor,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -77,6 +84,8 @@ pub(crate) struct TerminalLaunchRequest {
     pub(crate) terminal_key: Option<StableTerminalKey>,
     pub(crate) resume: Option<AgentResumeBinding>,
     pub(crate) launch_profile: Option<TerminalLaunchProfile>,
+    #[serde(default)]
+    pub(crate) cline_session_id: Option<String>,
     #[serde(default = "default_use_embedded_browser_tools")]
     pub(crate) use_embedded_browser_tools: bool,
 }
@@ -124,6 +133,8 @@ pub(crate) struct TerminalLaunchPlan {
     arguments: Vec<String>,
     terminal_key: Option<StableTerminalKey>,
     binding: Option<ValidatedAgentBinding>,
+    launch_profile: TerminalLaunchProfile,
+    cline_session_id: Option<String>,
     use_embedded_browser_tools: bool,
 }
 
@@ -133,6 +144,7 @@ impl TerminalLaunchPlan {
             terminal_key,
             resume,
             launch_profile,
+            cline_session_id,
             use_embedded_browser_tools,
         } = request;
         if let Some(key) = &terminal_key {
@@ -144,7 +156,25 @@ impl TerminalLaunchPlan {
                 "A stable terminal key is required to resume an agent conversation.".to_owned(),
             );
         }
+        let cline_session_id = cline_session_id
+            .as_deref()
+            .map(cline_session::validate_session_id)
+            .transpose()?;
+        if cline_session_id.is_some() {
+            if terminal_key.is_none() {
+                return Err(
+                    "A stable terminal key is required to resume a Cline session.".to_owned(),
+                );
+            }
+            if binding.is_some() {
+                return Err("Cline and Codex/Grok resume bindings cannot be combined.".to_owned());
+            }
+            if launch_profile != Some(TerminalLaunchProfile::Cline) {
+                return Err("A Cline session can only be resumed by a Cline terminal.".to_owned());
+            }
+        }
 
+        let launch_profile = launch_profile.unwrap_or_default();
         let mut arguments = vec!["-NoLogo".to_owned(), "-NoExit".to_owned()];
         if let Some(binding) = &binding {
             arguments.push("-EncodedCommand".to_owned());
@@ -153,8 +183,9 @@ impl TerminalLaunchPlan {
                 use_embedded_browser_tools,
             )));
         } else if let Some(script) = launch_script(
-            launch_profile.unwrap_or_default(),
+            launch_profile,
             use_embedded_browser_tools,
+            cline_session_id.as_deref(),
         ) {
             arguments.push("-EncodedCommand".to_owned());
             arguments.push(encode_powershell(script));
@@ -163,6 +194,8 @@ impl TerminalLaunchPlan {
             arguments,
             terminal_key,
             binding,
+            launch_profile,
+            cline_session_id,
             use_embedded_browser_tools,
         })
     }
@@ -180,11 +213,38 @@ impl TerminalLaunchPlan {
             .then_some(self.terminal_key.as_ref())
             .flatten()
     }
+
+    pub(crate) fn profile_lifecycle(
+        &self,
+    ) -> Option<(&StableTerminalKey, ProfileAgentProvider, Option<&str>)> {
+        if self.binding.is_some() {
+            return None;
+        }
+        let provider = match self.launch_profile {
+            TerminalLaunchProfile::Claude => ProfileAgentProvider::Claude,
+            TerminalLaunchProfile::Opencode => ProfileAgentProvider::Opencode,
+            TerminalLaunchProfile::Cline => ProfileAgentProvider::Cline,
+            TerminalLaunchProfile::Cursor => ProfileAgentProvider::Cursor,
+            TerminalLaunchProfile::Powershell
+            | TerminalLaunchProfile::Codex
+            | TerminalLaunchProfile::Grok => return None,
+        };
+        self.terminal_key.as_ref().map(|key| {
+            (
+                key,
+                provider,
+                (provider == ProfileAgentProvider::Cline)
+                    .then_some(self.cline_session_id.as_deref())
+                    .flatten(),
+            )
+        })
+    }
 }
 
 fn launch_script(
     profile: TerminalLaunchProfile,
     use_embedded_browser_tools: bool,
+    cline_session_id: Option<&str>,
 ) -> Option<String> {
     let bootstrap = use_embedded_browser_tools
         .then(browser_tools_powershell_bootstrap)
@@ -198,10 +258,21 @@ fn launch_script(
             "Start-Sleep -Milliseconds 100; if (Get-Command 'grok' -ErrorAction SilentlyContinue) { & 'grok' } else { Write-Error '[IHATECODING] Grok CLI was not found. Install the grok command and try again.' }"
         }
         TerminalLaunchProfile::Claude => {
-            "Start-Sleep -Milliseconds 100; if (Get-Command 'claude' -ErrorAction SilentlyContinue) { & 'claude' } else { Write-Error '[IHATECODING] Claude Code CLI was not found. Install the claude command and try again.' }"
+            "Start-Sleep -Milliseconds 100; if (Get-Command 'claude' -ErrorAction SilentlyContinue) { $ihcClaudeArgs=@(); if ($env:IHATECODING_CLAUDE_SETTINGS) { $ihcClaudeArgs += @('--settings', $env:IHATECODING_CLAUDE_SETTINGS) }; & 'claude' @ihcClaudeArgs } else { Write-Error '[IHATECODING] Claude Code CLI was not found. Install the claude command and try again.' }"
         }
         TerminalLaunchProfile::Opencode => {
             "Start-Sleep -Milliseconds 100; if (Get-Command 'opencode' -ErrorAction SilentlyContinue) { & 'opencode' } else { Write-Error '[IHATECODING] OpenCode CLI was not found. Install the opencode command and try again.' }"
+        }
+        TerminalLaunchProfile::Cline => {
+            return Some(format!(
+                "{bootstrap}Start-Sleep -Milliseconds 100; if (Get-Command 'cline' -ErrorAction SilentlyContinue) {{ $ihcClineArgs=@('--tui'); if ($env:IHATECODING_CLINE_HOOKS_DIR) {{ $ihcClineArgs += @('--hooks-dir', $env:IHATECODING_CLINE_HOOKS_DIR) }}{}; $ihcPreviousWcwidth=$env:OPENTUI_FORCE_WCWIDTH; $env:OPENTUI_FORCE_WCWIDTH='1'; [Console]::Write(([char]27).ToString() + '[?7l'); try {{ & 'cline' @ihcClineArgs }} finally {{ [Console]::Write(([char]27).ToString() + '[?7h'); if ($null -eq $ihcPreviousWcwidth) {{ Remove-Item Env:OPENTUI_FORCE_WCWIDTH -ErrorAction SilentlyContinue }} else {{ $env:OPENTUI_FORCE_WCWIDTH=$ihcPreviousWcwidth }} }} }} else {{ Write-Error '[IHATECODING] Cline CLI was not found. Install it with npm install -g cline and try again.' }}",
+                cline_session_id
+                    .map(|session_id| format!("; $ihcClineArgs += @('--id', '{session_id}')"))
+                    .unwrap_or_default()
+            ));
+        }
+        TerminalLaunchProfile::Cursor => {
+            "Start-Sleep -Milliseconds 100; $ihcCursorAgent = Get-Command 'cursor-agent' -CommandType Application,ExternalScript -ErrorAction SilentlyContinue | Select-Object -First 1; if ($ihcCursorAgent) { & $ihcCursorAgent.Source } else { Write-Error '[IHATECODING] Cursor Agent CLI was not found. Install the official cursor-agent command and try again.' }"
         }
     };
     Some(format!("{bootstrap}{command}"))
@@ -302,6 +373,23 @@ pub(crate) enum AgentEvent {
         window_tokens: u64,
         remaining_percent: u8,
     },
+    ProviderTurnStarted {
+        runtime_session_id: String,
+        terminal_key: StableTerminalKey,
+        provider: ProfileAgentProvider,
+        provider_session_id: Option<String>,
+        turn_id: Option<String>,
+        observed_at_unix_ms: u64,
+    },
+    ProviderTurnFinished {
+        runtime_session_id: String,
+        terminal_key: StableTerminalKey,
+        provider: ProfileAgentProvider,
+        provider_session_id: Option<String>,
+        turn_id: Option<String>,
+        observed_at_unix_ms: u64,
+        succeeded: bool,
+    },
 }
 
 impl AgentEvent {
@@ -328,11 +416,35 @@ impl AgentEvent {
                 conversation_id,
                 ..
             } => (runtime_session_id, terminal_key, provider, conversation_id),
+            Self::ProviderTurnStarted { .. } | Self::ProviderTurnFinished { .. } => return false,
         };
         runtime_session_id == &bound.runtime_session_id
             && terminal_key == &bound.terminal_key
             && provider == &bound.binding.provider
             && Uuid::parse_str(conversation_id).is_ok_and(|id| id == bound.binding.conversation_id)
+    }
+
+    fn matches_profile_agent(&self, bound: &BoundProfileAgent) -> bool {
+        let (runtime_session_id, terminal_key, provider) = match self {
+            Self::ProviderTurnStarted {
+                runtime_session_id,
+                terminal_key,
+                provider,
+                ..
+            }
+            | Self::ProviderTurnFinished {
+                runtime_session_id,
+                terminal_key,
+                provider,
+                ..
+            } => (runtime_session_id, terminal_key, provider),
+            Self::TurnStarted { .. } | Self::TurnFinished { .. } | Self::ContextUpdated { .. } => {
+                return false;
+            }
+        };
+        runtime_session_id == &bound.runtime_session_id
+            && terminal_key == &bound.terminal_key
+            && provider == &bound.provider
     }
 }
 
@@ -353,6 +465,366 @@ struct BoundAgent {
     runtime_session_id: String,
     terminal_key: StableTerminalKey,
     binding: ValidatedAgentBinding,
+}
+
+#[derive(Clone, Debug)]
+struct BoundProfileAgent {
+    runtime_session_id: String,
+    terminal_key: StableTerminalKey,
+    provider: ProfileAgentProvider,
+    route: PathBuf,
+    cline_session_id: Option<String>,
+}
+
+impl BoundProfileAgent {
+    fn lifecycle_event(&self, record: ProfileLifecycleRecord) -> AgentEvent {
+        match record.event {
+            ProfileLifecycleEvent::Started => AgentEvent::ProviderTurnStarted {
+                runtime_session_id: self.runtime_session_id.clone(),
+                terminal_key: self.terminal_key.clone(),
+                provider: self.provider,
+                provider_session_id: record.provider_session_id,
+                turn_id: record.turn_id,
+                observed_at_unix_ms: record.observed_at_unix_ms,
+            },
+            ProfileLifecycleEvent::Finished => AgentEvent::ProviderTurnFinished {
+                runtime_session_id: self.runtime_session_id.clone(),
+                terminal_key: self.terminal_key.clone(),
+                provider: self.provider,
+                provider_session_id: record.provider_session_id,
+                turn_id: record.turn_id,
+                observed_at_unix_ms: record.observed_at_unix_ms,
+                succeeded: record.succeeded.unwrap_or(false),
+            },
+        }
+    }
+}
+
+#[derive(Default)]
+struct ProfileWatchState {
+    offset: u64,
+    active_turns: HashSet<String>,
+    completed_hook_turns: VecDeque<String>,
+    cline: Option<ClineProfileWatchState>,
+    pending_cline_hook_active: bool,
+    pending_cline_hook_completion_at: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClineAttachMode {
+    Resume,
+    Fresh,
+}
+
+struct ClineProfileWatchState {
+    session_id: String,
+    mode: ClineAttachMode,
+    stamp: Option<cline_session::ClineMessagesStamp>,
+    initialized: bool,
+    latest: Option<cline_session::ClineTurnSnapshot>,
+    started_prompts: VecDeque<String>,
+    completed_prompts: VecDeque<String>,
+    anonymous_hook_active: bool,
+    suppress_snapshot_completion_through: Option<u64>,
+}
+
+impl ClineProfileWatchState {
+    fn new(session_id: String, mode: ClineAttachMode) -> Self {
+        Self {
+            session_id,
+            mode,
+            stamp: None,
+            initialized: false,
+            latest: None,
+            started_prompts: VecDeque::new(),
+            completed_prompts: VecDeque::new(),
+            anonymous_hook_active: false,
+            suppress_snapshot_completion_through: None,
+        }
+    }
+
+    fn refresh(&mut self) {
+        let read =
+            cline_session::read_turn_snapshot_if_changed(&self.session_id, self.stamp.as_ref());
+        let Ok(cline_session::ClineTurnSnapshotRead::Changed { stamp, snapshot }) = read else {
+            return;
+        };
+        self.stamp = Some(stamp);
+        self.accept_snapshot(snapshot);
+    }
+
+    fn accept_snapshot(&mut self, snapshot: Option<cline_session::ClineTurnSnapshot>) {
+        self.latest = snapshot;
+        if self.initialized {
+            return;
+        }
+        if self.mode == ClineAttachMode::Resume && self.latest.is_none() {
+            // A resumed Cline process may briefly rewrite the messages file as
+            // an empty document. Do not consume the resume baseline until the
+            // first real turn snapshot is visible, or its historical final
+            // response would be mistaken for a fresh completion.
+            return;
+        }
+        self.initialized = true;
+        if self.mode == ClineAttachMode::Resume
+            && let Some(snapshot) = &self.latest
+            && snapshot.response.is_some()
+        {
+            push_recent_key(&mut self.started_prompts, snapshot.prompt.key.clone());
+            push_recent_key(&mut self.completed_prompts, snapshot.prompt.key.clone());
+        }
+    }
+}
+
+impl ProfileWatchState {
+    fn for_binding(bound: &BoundProfileAgent) -> Self {
+        let mut state = Self::default();
+        if let Some(session_id) = &bound.cline_session_id {
+            state.cline = Some(ClineProfileWatchState::new(
+                session_id.clone(),
+                ClineAttachMode::Resume,
+            ));
+        }
+        state
+    }
+
+    fn bind_cline_session(&mut self, session_id: String, mode: ClineAttachMode) {
+        if self
+            .cline
+            .as_ref()
+            .is_some_and(|state| state.session_id == session_id)
+        {
+            return;
+        }
+        let mut cline = ClineProfileWatchState::new(session_id, mode);
+        cline.anonymous_hook_active = std::mem::take(&mut self.pending_cline_hook_active);
+        cline.suppress_snapshot_completion_through = self.pending_cline_hook_completion_at.take();
+        self.cline = Some(cline);
+    }
+
+    fn poll(&mut self, bound: &BoundProfileAgent) -> Vec<AgentEvent> {
+        if let Some(cline) = &mut self.cline {
+            cline.refresh();
+        }
+        let records =
+            provider_lifecycle::read_records(&bound.route, &mut self.offset).unwrap_or_default();
+        let mut events = Vec::new();
+        for record in records {
+            if record.provider != bound.provider {
+                continue;
+            }
+            if bound.provider == ProfileAgentProvider::Cline {
+                self.poll_cline_hook(bound, record, &mut events);
+                continue;
+            }
+            let key = profile_turn_key(&record);
+            match record.event {
+                ProfileLifecycleEvent::Started => {
+                    if self.active_turns.insert(key) {
+                        events.push(bound.lifecycle_event(record));
+                    }
+                }
+                ProfileLifecycleEvent::Finished => {
+                    if self.active_turns.remove(&key) {
+                        events.push(bound.lifecycle_event(record));
+                    }
+                }
+            }
+        }
+        if bound.provider == ProfileAgentProvider::Cline {
+            self.poll_cline_snapshot(bound, &mut events);
+        }
+        events
+    }
+
+    fn poll_cline_hook(
+        &mut self,
+        bound: &BoundProfileAgent,
+        record: ProfileLifecycleRecord,
+        events: &mut Vec<AgentEvent>,
+    ) {
+        let snapshot = self.cline.as_ref().and_then(|state| state.latest.clone());
+        if let Some(snapshot) = snapshot {
+            let key = snapshot.prompt.key.clone();
+            let cline = self.cline.as_mut().expect("Cline state disappeared");
+            match record.event {
+                ProfileLifecycleEvent::Started => {
+                    if !cline.completed_prompts.contains(&key)
+                        && !cline.started_prompts.contains(&key)
+                    {
+                        push_recent_key(&mut cline.started_prompts, key.clone());
+                        events.push(cline_profile_event(
+                            bound,
+                            &cline.session_id,
+                            &key,
+                            ProfileLifecycleEvent::Started,
+                            nonzero_time(snapshot.prompt.observed_at_unix_ms),
+                            None,
+                        ));
+                    }
+                }
+                ProfileLifecycleEvent::Finished => {
+                    if !cline.completed_prompts.contains(&key) {
+                        if !cline.started_prompts.contains(&key) {
+                            push_recent_key(&mut cline.started_prompts, key.clone());
+                            events.push(cline_profile_event(
+                                bound,
+                                &cline.session_id,
+                                &key,
+                                ProfileLifecycleEvent::Started,
+                                nonzero_time(snapshot.prompt.observed_at_unix_ms),
+                                None,
+                            ));
+                        }
+                        push_recent_key(&mut cline.completed_prompts, key.clone());
+                        events.push(cline_profile_event(
+                            bound,
+                            &cline.session_id,
+                            &key,
+                            ProfileLifecycleEvent::Finished,
+                            record.observed_at_unix_ms,
+                            Some(record.succeeded.unwrap_or(false)),
+                        ));
+                    }
+                }
+            }
+            return;
+        }
+
+        let key = profile_turn_key(&record);
+        match record.event {
+            ProfileLifecycleEvent::Started => {
+                remove_recent_key(&mut self.completed_hook_turns, &key);
+                if self.active_turns.insert(key) {
+                    if let Some(cline) = &mut self.cline {
+                        cline.anonymous_hook_active = true;
+                    } else {
+                        self.pending_cline_hook_active = true;
+                    }
+                    events.push(bound.lifecycle_event(record));
+                }
+            }
+            ProfileLifecycleEvent::Finished => {
+                let was_active = self.active_turns.remove(&key);
+                if was_active || !self.completed_hook_turns.contains(&key) {
+                    push_recent_key(&mut self.completed_hook_turns, key);
+                    if let Some(cline) = &mut self.cline {
+                        cline.anonymous_hook_active = false;
+                        cline.suppress_snapshot_completion_through =
+                            Some(record.observed_at_unix_ms);
+                    } else {
+                        self.pending_cline_hook_active = false;
+                        self.pending_cline_hook_completion_at = Some(record.observed_at_unix_ms);
+                    }
+                    events.push(bound.lifecycle_event(record));
+                }
+            }
+        }
+    }
+
+    fn poll_cline_snapshot(&mut self, bound: &BoundProfileAgent, events: &mut Vec<AgentEvent>) {
+        let Some(cline) = &mut self.cline else {
+            return;
+        };
+        let Some(snapshot) = cline.latest.clone() else {
+            return;
+        };
+        let key = snapshot.prompt.key.clone();
+
+        if let Some(finished_at) = cline.suppress_snapshot_completion_through {
+            let is_newer_prompt = finished_at != 0
+                && snapshot.prompt.observed_at_unix_ms != 0
+                && snapshot.prompt.observed_at_unix_ms > finished_at;
+            if is_newer_prompt {
+                cline.suppress_snapshot_completion_through = None;
+            } else {
+                push_recent_key(&mut cline.started_prompts, key.clone());
+                push_recent_key(&mut cline.completed_prompts, key);
+                if snapshot.response.is_some() {
+                    cline.suppress_snapshot_completion_through = None;
+                }
+                return;
+            }
+        }
+        if !cline.started_prompts.contains(&key) && !cline.completed_prompts.contains(&key) {
+            push_recent_key(&mut cline.started_prompts, key.clone());
+            if !cline.anonymous_hook_active {
+                events.push(cline_profile_event(
+                    bound,
+                    &cline.session_id,
+                    &key,
+                    ProfileLifecycleEvent::Started,
+                    nonzero_time(snapshot.prompt.observed_at_unix_ms),
+                    None,
+                ));
+            }
+            cline.anonymous_hook_active = false;
+        }
+        let Some(response) = snapshot.response else {
+            return;
+        };
+        if !cline.completed_prompts.contains(&key) {
+            push_recent_key(&mut cline.completed_prompts, key.clone());
+            events.push(cline_profile_event(
+                bound,
+                &cline.session_id,
+                &key,
+                ProfileLifecycleEvent::Finished,
+                nonzero_time(response.observed_at_unix_ms),
+                Some(true),
+            ));
+        }
+    }
+}
+
+fn cline_profile_event(
+    bound: &BoundProfileAgent,
+    session_id: &str,
+    turn_id: &str,
+    event: ProfileLifecycleEvent,
+    observed_at_unix_ms: u64,
+    succeeded: Option<bool>,
+) -> AgentEvent {
+    bound.lifecycle_event(ProfileLifecycleRecord {
+        provider: ProfileAgentProvider::Cline,
+        event,
+        provider_session_id: Some(session_id.to_owned()),
+        turn_id: Some(turn_id.to_owned()),
+        observed_at_unix_ms,
+        succeeded,
+    })
+}
+
+fn nonzero_time(value: u64) -> u64 {
+    if value != 0 {
+        value
+    } else {
+        system_time_millis(SystemTime::now())
+    }
+}
+
+fn push_recent_key(keys: &mut VecDeque<String>, key: String) {
+    remove_recent_key(keys, &key);
+    keys.push_back(key);
+    while keys.len() > MAX_TRACKED_TURNS {
+        keys.pop_front();
+    }
+}
+
+fn remove_recent_key(keys: &mut VecDeque<String>, key: &str) {
+    if let Some(index) = keys.iter().position(|candidate| candidate == key) {
+        keys.remove(index);
+    }
+}
+
+fn profile_turn_key(record: &ProfileLifecycleRecord) -> String {
+    if let Some(session_id) = &record.provider_session_id {
+        return format!("session:{session_id}");
+    }
+    if let Some(turn_id) = &record.turn_id {
+        return format!("turn:{turn_id}");
+    }
+    "pane".to_owned()
 }
 
 impl BoundAgent {
@@ -423,6 +895,7 @@ impl BoundAgent {
 struct AgentRuntimeState {
     shutting_down: bool,
     bindings: HashMap<String, BoundAgent>,
+    profile_bindings: HashMap<String, BoundProfileAgent>,
     conversation_owners: HashMap<OwnershipKey, String>,
     terminal_owners: HashMap<StableTerminalKey, String>,
     grok_discovery_probes: HashMap<String, GrokDiscoveryProbe>,
@@ -467,6 +940,8 @@ impl AgentRuntimeConfig {
 struct AgentRuntimeInner {
     state: Mutex<AgentRuntimeState>,
     watchers: Mutex<HashMap<String, BoundWatchState>>,
+    profile_watchers: Mutex<HashMap<String, ProfileWatchState>>,
+    profile_poll_gate: Mutex<()>,
     config: AgentRuntimeConfig,
     monitor_enabled: bool,
     monitor_stop: AtomicBool,
@@ -491,6 +966,8 @@ impl AgentRuntime {
             inner: Arc::new(AgentRuntimeInner {
                 state: Mutex::new(AgentRuntimeState::default()),
                 watchers: Mutex::new(HashMap::new()),
+                profile_watchers: Mutex::new(HashMap::new()),
+                profile_poll_gate: Mutex::new(()),
                 config,
                 monitor_enabled,
                 monitor_stop: AtomicBool::new(false),
@@ -898,7 +1375,10 @@ impl AgentRuntime {
                 return Err(error);
             }
         }
-        self.ensure_monitor()?;
+        if let Err(error) = self.ensure_monitor() {
+            self.unbind(runtime_session_id);
+            return Err(error);
+        }
         self.wake_monitor();
         for observation in initial_observations {
             emit_event(
@@ -935,28 +1415,177 @@ impl AgentRuntime {
         })
     }
 
+    pub(crate) fn claim_profile_for_start(
+        &self,
+        runtime_session_id: &str,
+        terminal_key: &StableTerminalKey,
+        provider: ProfileAgentProvider,
+        route: &Path,
+        cline_session_id: Option<&str>,
+    ) -> Result<AgentBindingLease, String> {
+        terminal_key.validate()?;
+        validate_runtime_session_id(runtime_session_id)?;
+        if provider_lifecycle::route_path(runtime_session_id)? != route {
+            return Err(
+                "The provider lifecycle route does not match its terminal session.".to_owned(),
+            );
+        }
+        let cline_session_id = cline_session_id
+            .map(cline_session::validate_session_id)
+            .transpose()?;
+        if cline_session_id.is_some() && provider != ProfileAgentProvider::Cline {
+            return Err("Only a Cline profile can own a Cline session.".to_owned());
+        }
+        let bound = BoundProfileAgent {
+            runtime_session_id: runtime_session_id.to_owned(),
+            terminal_key: terminal_key.clone(),
+            provider,
+            route: route.to_path_buf(),
+            cline_session_id,
+        };
+        {
+            let mut state = agent_lock(&self.inner.state)?;
+            if state.shutting_down {
+                return Err("The agent runtime is shutting down.".to_owned());
+            }
+            if state.bindings.contains_key(runtime_session_id) {
+                return Err(
+                    "The terminal session is already bound to a Codex or Grok conversation."
+                        .to_owned(),
+                );
+            }
+            if let Some(existing) = state.profile_bindings.get(runtime_session_id) {
+                if existing.terminal_key == bound.terminal_key
+                    && existing.provider == bound.provider
+                    && existing.route == bound.route
+                    && existing.cline_session_id == bound.cline_session_id
+                {
+                    return Ok(AgentBindingLease {
+                        runtime: self.clone(),
+                        runtime_session_id: runtime_session_id.to_owned(),
+                        armed: true,
+                    });
+                }
+                return Err(
+                    "The terminal session already owns a different provider lifecycle.".to_owned(),
+                );
+            }
+            if state
+                .terminal_owners
+                .get(terminal_key)
+                .is_some_and(|owner| owner != runtime_session_id)
+            {
+                return Err(
+                    "The stable terminal is already bound to another runtime session.".to_owned(),
+                );
+            }
+            state
+                .terminal_owners
+                .insert(terminal_key.clone(), runtime_session_id.to_owned());
+            state
+                .profile_bindings
+                .insert(runtime_session_id.to_owned(), bound.clone());
+        }
+        if let Err(error) = agent_lock(&self.inner.profile_watchers).map(|mut watchers| {
+            watchers.insert(
+                runtime_session_id.to_owned(),
+                ProfileWatchState::for_binding(&bound),
+            );
+        }) {
+            self.unbind(runtime_session_id);
+            return Err(error);
+        }
+        if let Err(error) = self.ensure_monitor() {
+            self.unbind(runtime_session_id);
+            return Err(error);
+        }
+        self.wake_monitor();
+        Ok(AgentBindingLease {
+            runtime: self.clone(),
+            runtime_session_id: runtime_session_id.to_owned(),
+            armed: true,
+        })
+    }
+
+    /// Attach the durable messages-file fallback after the frontend discovers
+    /// the session created by a fresh Cline TUI. Resumed sessions are already
+    /// attached during terminal launch and this method is idempotent for them.
+    pub(crate) fn bind_cline_profile_session(
+        &self,
+        runtime_session_id: &str,
+        session_id: &str,
+    ) -> Result<(), String> {
+        validate_runtime_session_id(runtime_session_id)?;
+        let session_id = cline_session::validate_session_id(session_id)?;
+        let mode = {
+            let mut state = agent_lock(&self.inner.state)?;
+            let bound = state
+                .profile_bindings
+                .get_mut(runtime_session_id)
+                .ok_or_else(|| "The terminal has no provider lifecycle binding.".to_owned())?;
+            if bound.provider != ProfileAgentProvider::Cline {
+                return Err("The terminal is not a Cline profile.".to_owned());
+            }
+            if bound.cline_session_id.as_deref() == Some(session_id.as_str()) {
+                return Ok(());
+            }
+            if bound.cline_session_id.is_some() {
+                return Err("The terminal is already bound to another Cline session.".to_owned());
+            }
+            bound.cline_session_id = Some(session_id.clone());
+            ClineAttachMode::Fresh
+        };
+        agent_lock(&self.inner.profile_watchers)?
+            .entry(runtime_session_id.to_owned())
+            .or_default()
+            .bind_cline_session(session_id, mode);
+        self.wake_monitor();
+        Ok(())
+    }
+
     pub(crate) fn unbind(&self, runtime_session_id: &str) -> Option<AgentBindingSnapshot> {
+        // Keep the monitor from advancing a profile route's offset and then
+        // losing the corresponding event when this binding is removed. The
+        // provider has normally exited before this path, but one short second
+        // pass also catches a hook process that is finishing concurrently.
+        let profile_poll_guard = match self.inner.profile_poll_gate.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        self.drain_profile_events(runtime_session_id);
+        if self.has_profile_binding(runtime_session_id) {
+            thread::sleep(FINAL_PROFILE_DRAIN_GRACE);
+            self.drain_profile_events(runtime_session_id);
+        }
         let removed = {
             let mut state = match self.inner.state.lock() {
                 Ok(state) => state,
                 Err(poisoned) => poisoned.into_inner(),
             };
             state.grok_discovery_probes.remove(runtime_session_id);
-            let removed = state.bindings.remove(runtime_session_id)?;
-            let ownership_key = removed.binding.ownership_key();
-            if state
-                .conversation_owners
-                .get(&ownership_key)
-                .is_some_and(|owner| owner == runtime_session_id)
-            {
-                state.conversation_owners.remove(&ownership_key);
+            let removed = state.bindings.remove(runtime_session_id);
+            let profile = state.profile_bindings.remove(runtime_session_id);
+            if let Some(removed) = &removed {
+                let ownership_key = removed.binding.ownership_key();
+                if state
+                    .conversation_owners
+                    .get(&ownership_key)
+                    .is_some_and(|owner| owner == runtime_session_id)
+                {
+                    state.conversation_owners.remove(&ownership_key);
+                }
             }
-            if state
-                .terminal_owners
-                .get(&removed.terminal_key)
-                .is_some_and(|owner| owner == runtime_session_id)
+            let terminal_key = removed
+                .as_ref()
+                .map(|binding| &binding.terminal_key)
+                .or_else(|| profile.as_ref().map(|binding| &binding.terminal_key));
+            if let Some(terminal_key) = terminal_key
+                && state
+                    .terminal_owners
+                    .get(terminal_key)
+                    .is_some_and(|owner| owner == runtime_session_id)
             {
-                state.terminal_owners.remove(&removed.terminal_key);
+                state.terminal_owners.remove(terminal_key);
             }
             removed
         };
@@ -968,26 +1597,83 @@ impl AgentRuntime {
                 poisoned.into_inner().remove(runtime_session_id);
             }
         }
+        match self.inner.profile_watchers.lock() {
+            Ok(mut watchers) => {
+                watchers.remove(runtime_session_id);
+            }
+            Err(poisoned) => {
+                poisoned.into_inner().remove(runtime_session_id);
+            }
+        }
+        provider_lifecycle::remove_route(runtime_session_id);
+        drop(profile_poll_guard);
         self.wake_monitor();
-        Some(removed.snapshot())
+        removed.map(|binding| binding.snapshot())
+    }
+
+    fn has_profile_binding(&self, runtime_session_id: &str) -> bool {
+        match self.inner.state.lock() {
+            Ok(state) => state.profile_bindings.contains_key(runtime_session_id),
+            Err(poisoned) => poisoned
+                .into_inner()
+                .profile_bindings
+                .contains_key(runtime_session_id),
+        }
+    }
+
+    fn drain_profile_events(&self, runtime_session_id: &str) {
+        let bound = match self.inner.state.lock() {
+            Ok(state) => state.profile_bindings.get(runtime_session_id).cloned(),
+            Err(poisoned) => poisoned
+                .into_inner()
+                .profile_bindings
+                .get(runtime_session_id)
+                .cloned(),
+        };
+        let Some(bound) = bound else {
+            return;
+        };
+        let events = {
+            let mut watchers = match self.inner.profile_watchers.lock() {
+                Ok(watchers) => watchers,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            watchers
+                .entry(runtime_session_id.to_owned())
+                .or_default()
+                .poll(&bound)
+        };
+        for event in events {
+            emit_event(&self.inner, event);
+        }
     }
 
     pub(crate) fn shutdown(&self) {
-        {
+        let profile_routes = {
             let mut state = match self.inner.state.lock() {
                 Ok(state) => state,
                 Err(poisoned) => poisoned.into_inner(),
             };
+            let profile_routes = state.profile_bindings.keys().cloned().collect::<Vec<_>>();
             state.shutting_down = true;
             state.bindings.clear();
+            state.profile_bindings.clear();
             state.conversation_owners.clear();
             state.terminal_owners.clear();
             state.grok_discovery_probes.clear();
             state.subscribers.clear();
-        }
+            profile_routes
+        };
         match self.inner.watchers.lock() {
             Ok(mut watchers) => watchers.clear(),
             Err(poisoned) => poisoned.into_inner().clear(),
+        }
+        match self.inner.profile_watchers.lock() {
+            Ok(mut watchers) => watchers.clear(),
+            Err(poisoned) => poisoned.into_inner().clear(),
+        }
+        for runtime_session_id in profile_routes {
+            provider_lifecycle::remove_route(&runtime_session_id);
         }
         self.inner.monitor_stop.store(true, Ordering::Release);
         self.wake_monitor();
@@ -1095,15 +1781,15 @@ fn monitor_loop(
 }
 
 fn poll_inner(inner: &Arc<AgentRuntimeInner>) {
-    let bindings = {
+    let (bindings, profile_bindings) = {
         let state = match inner.state.lock() {
             Ok(state) => state,
             Err(poisoned) => poisoned.into_inner(),
         };
-        if state.shutting_down || state.bindings.is_empty() {
+        if state.shutting_down || (state.bindings.is_empty() && state.profile_bindings.is_empty()) {
             return;
         }
-        state.bindings.clone()
+        (state.bindings.clone(), state.profile_bindings.clone())
     };
 
     let mut events = Vec::new();
@@ -1131,9 +1817,30 @@ fn poll_inner(inner: &Arc<AgentRuntimeInner>) {
         }
     }
 
+    let profile_poll_guard = match inner.profile_poll_gate.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let mut profile_events = Vec::new();
+    {
+        let mut watchers = match inner.profile_watchers.lock() {
+            Ok(watchers) => watchers,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        watchers.retain(|session_id, _| profile_bindings.contains_key(session_id));
+        for (session_id, bound) in &profile_bindings {
+            let watcher = watchers.entry(session_id.clone()).or_default();
+            profile_events.extend(watcher.poll(bound));
+        }
+    }
+
     for event in events {
         emit_event(inner, event);
     }
+    for event in profile_events {
+        emit_event(inner, event);
+    }
+    drop(profile_poll_guard);
 }
 
 fn emit_event(inner: &AgentRuntimeInner, event: AgentEvent) {
@@ -1141,7 +1848,7 @@ fn emit_event(inner: &AgentRuntimeInner, event: AgentEvent) {
         Ok(state) => state,
         Err(poisoned) => poisoned.into_inner(),
     };
-    let current = match &event {
+    let is_current = match &event {
         AgentEvent::TurnStarted {
             runtime_session_id, ..
         }
@@ -1150,9 +1857,21 @@ fn emit_event(inner: &AgentRuntimeInner, event: AgentEvent) {
         }
         | AgentEvent::ContextUpdated {
             runtime_session_id, ..
-        } => state.bindings.get(runtime_session_id),
+        } => state
+            .bindings
+            .get(runtime_session_id)
+            .is_some_and(|bound| event.matches_bound_agent(bound)),
+        AgentEvent::ProviderTurnStarted {
+            runtime_session_id, ..
+        }
+        | AgentEvent::ProviderTurnFinished {
+            runtime_session_id, ..
+        } => state
+            .profile_bindings
+            .get(runtime_session_id)
+            .is_some_and(|bound| event.matches_profile_agent(bound)),
     };
-    if !current.is_some_and(|bound| event.matches_bound_agent(bound)) {
+    if !is_current {
         return;
     }
     state
@@ -2779,6 +3498,7 @@ mod tests {
             terminal_key,
             resume,
             launch_profile,
+            cline_session_id: None,
             use_embedded_browser_tools: true,
         }
     }
@@ -2916,6 +3636,52 @@ mod tests {
         assert!(opencode_script.contains("& 'opencode'"));
         assert!(!opencode_script.contains("if (Get-Command 'claude'"));
 
+        let cline = TerminalLaunchPlan::from_request(launch_request(
+            Some(key("cline")),
+            None,
+            Some(TerminalLaunchProfile::Cline),
+        ))
+        .unwrap();
+        let cline_script = decode_plan(&cline);
+        assert!(cline_script.contains("Get-Command 'cline'"));
+        assert!(cline_script.contains("$ihcClineArgs=@('--tui')"));
+        assert!(cline_script.contains("--hooks-dir"));
+        assert!(cline_script.contains("& 'cline' @ihcClineArgs"));
+        assert!(cline_script.contains("$env:OPENTUI_FORCE_WCWIDTH='1'"));
+        assert!(cline_script.contains("([char]27).ToString() + '[?7l'"));
+        assert!(cline_script.contains("([char]27).ToString() + '[?7h'"));
+        assert!(cline_script.contains("finally"));
+        assert!(cline_script.contains("Remove-Item Env:OPENTUI_FORCE_WCWIDTH"));
+        assert!(!cline_script.contains("$ihcClineArgs += @('--id'"));
+        assert!(cline_script.contains("npm install -g cline"));
+        assert!(!cline_script.contains("if (Get-Command 'opencode'"));
+
+        let cursor = TerminalLaunchPlan::from_request(launch_request(
+            Some(key("cursor")),
+            None,
+            Some(TerminalLaunchProfile::Cursor),
+        ))
+        .unwrap();
+        let cursor_script = decode_plan(&cursor);
+        assert!(cursor_script.contains("Get-Command 'cursor-agent'"));
+        assert!(cursor_script.contains("& $ihcCursorAgent.Source"));
+        assert!(cursor_script.contains("Cursor Agent CLI was not found"));
+        assert!(!cursor_script.contains("Get-Command 'agent'"));
+        assert!(!cursor_script.contains("Get-Command 'cursor'"));
+
+        let mut cline_resume_request = launch_request(
+            Some(key("cline-resume")),
+            None,
+            Some(TerminalLaunchProfile::Cline),
+        );
+        cline_resume_request.cline_session_id = Some("1784623042844_ugwq9".to_owned());
+        let cline_resumed = TerminalLaunchPlan::from_request(cline_resume_request).unwrap();
+        assert!(
+            decode_plan(&cline_resumed)
+                .contains("$ihcClineArgs += @('--id', '1784623042844_ugwq9')")
+        );
+        assert!(decode_plan(&cline_resumed).contains("OPENTUI_FORCE_WCWIDTH"));
+
         let conversation_id = Uuid::new_v4();
         let resumed = TerminalLaunchPlan::from_request(launch_request(
             Some(key("resume-wins")),
@@ -2937,6 +3703,327 @@ mod tests {
         let grok_resumed_script = decode_plan(&grok_resumed);
         assert!(grok_resumed_script.contains(&format!("grok --resume '{grok_conversation_id}'")));
         assert!(!grok_resumed_script.contains("if (Get-Command 'opencode'"));
+    }
+
+    #[test]
+    fn cline_resume_identifier_and_profile_combinations_fail_closed() {
+        let oversized = "x".repeat(129);
+        for invalid_id in ["", "bad id", "x'; Write-Host injected", oversized.as_str()] {
+            let mut request = launch_request(
+                Some(key("cline-invalid")),
+                None,
+                Some(TerminalLaunchProfile::Cline),
+            );
+            request.cline_session_id = Some(invalid_id.to_owned());
+            assert!(TerminalLaunchPlan::from_request(request).is_err());
+        }
+
+        let mut wrong_profile = launch_request(
+            Some(key("wrong-profile")),
+            None,
+            Some(TerminalLaunchProfile::Powershell),
+        );
+        wrong_profile.cline_session_id = Some("legacy.session-1".to_owned());
+        assert!(TerminalLaunchPlan::from_request(wrong_profile).is_err());
+
+        let mut missing_key = launch_request(None, None, Some(TerminalLaunchProfile::Cline));
+        missing_key.cline_session_id = Some("legacy.session-1".to_owned());
+        assert!(TerminalLaunchPlan::from_request(missing_key).is_err());
+
+        let mut dual_resume = launch_request(
+            Some(key("dual")),
+            Some(resume(AgentProvider::Codex, Uuid::new_v4())),
+            Some(TerminalLaunchProfile::Cline),
+        );
+        dual_resume.cline_session_id = Some("legacy.session-1".to_owned());
+        assert!(TerminalLaunchPlan::from_request(dual_resume).is_err());
+    }
+
+    fn cline_snapshot(
+        prompt_key: &str,
+        prompt_time: u64,
+        response: Option<(&str, u64)>,
+    ) -> cline_session::ClineTurnSnapshot {
+        cline_session::ClineTurnSnapshot {
+            prompt: cline_session::ClineMessageSnapshot {
+                key: prompt_key.to_owned(),
+                observed_at_unix_ms: prompt_time,
+                text: "prompt".to_owned(),
+            },
+            response: response.map(|(key, observed_at_unix_ms)| {
+                cline_session::ClineMessageSnapshot {
+                    key: key.to_owned(),
+                    observed_at_unix_ms,
+                    text: "complete".to_owned(),
+                }
+            }),
+        }
+    }
+
+    fn cline_profile_bound() -> BoundProfileAgent {
+        BoundProfileAgent {
+            runtime_session_id: "0123456789abcdef0123456789abcdef".to_owned(),
+            terminal_key: key("cline-fallback"),
+            provider: ProfileAgentProvider::Cline,
+            route: PathBuf::from("unused-cline-route.jsonl"),
+            cline_session_id: Some("cline-session".to_owned()),
+        }
+    }
+
+    fn cline_profile_watcher(mode: ClineAttachMode) -> ProfileWatchState {
+        ProfileWatchState {
+            cline: Some(ClineProfileWatchState::new(
+                "cline-session".to_owned(),
+                mode,
+            )),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn cline_fallback_suppresses_past_resume_but_finishes_an_attached_active_turn() {
+        let bound = cline_profile_bound();
+        let mut resumed = cline_profile_watcher(ClineAttachMode::Resume);
+        resumed.cline.as_mut().unwrap().accept_snapshot(None);
+        assert!(!resumed.cline.as_ref().unwrap().initialized);
+        resumed
+            .cline
+            .as_mut()
+            .unwrap()
+            .accept_snapshot(Some(cline_snapshot("past", 10, Some(("past-final", 11)))));
+        let mut events = Vec::new();
+        resumed.poll_cline_snapshot(&bound, &mut events);
+        assert!(events.is_empty(), "past completed resume must stay silent");
+
+        let mut active = cline_profile_watcher(ClineAttachMode::Resume);
+        active
+            .cline
+            .as_mut()
+            .unwrap()
+            .accept_snapshot(Some(cline_snapshot("active", 20, None)));
+        active.poll_cline_snapshot(&bound, &mut events);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], AgentEvent::ProviderTurnStarted { .. }));
+        events.clear();
+        active
+            .cline
+            .as_mut()
+            .unwrap()
+            .accept_snapshot(Some(cline_snapshot(
+                "active",
+                20,
+                Some(("active-final", 21)),
+            )));
+        active.poll_cline_snapshot(&bound, &mut events);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0],
+            AgentEvent::ProviderTurnFinished {
+                succeeded: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn cline_fallback_delivers_fast_and_sequential_turns_exactly_once() {
+        let bound = cline_profile_bound();
+        let mut watcher = cline_profile_watcher(ClineAttachMode::Fresh);
+        watcher
+            .cline
+            .as_mut()
+            .unwrap()
+            .accept_snapshot(Some(cline_snapshot("first", 30, Some(("final-1", 31)))));
+        let mut events = Vec::new();
+        watcher.poll_cline_snapshot(&bound, &mut events);
+        assert_eq!(events.len(), 2, "fast completion emits start and finish");
+        events.clear();
+        watcher.poll_cline_snapshot(&bound, &mut events);
+        assert!(events.is_empty());
+
+        watcher
+            .cline
+            .as_mut()
+            .unwrap()
+            .accept_snapshot(Some(cline_snapshot("second", 40, None)));
+        watcher.poll_cline_snapshot(&bound, &mut events);
+        assert_eq!(events.len(), 1);
+        events.clear();
+        watcher
+            .cline
+            .as_mut()
+            .unwrap()
+            .accept_snapshot(Some(cline_snapshot("second", 40, Some(("final-2", 41)))));
+        watcher.poll_cline_snapshot(&bound, &mut events);
+        assert_eq!(events.len(), 1);
+        events.clear();
+        watcher.poll_cline_snapshot(&bound, &mut events);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn cline_hook_and_messages_completion_are_deduplicated() {
+        let bound = cline_profile_bound();
+        let snapshot = cline_snapshot("same-turn", 50, Some(("same-final", 51)));
+        let mut watcher = cline_profile_watcher(ClineAttachMode::Fresh);
+        watcher
+            .cline
+            .as_mut()
+            .unwrap()
+            .accept_snapshot(Some(snapshot));
+        let mut events = Vec::new();
+        watcher.poll_cline_hook(
+            &bound,
+            ProfileLifecycleRecord {
+                provider: ProfileAgentProvider::Cline,
+                event: ProfileLifecycleEvent::Finished,
+                provider_session_id: Some("cline-session".to_owned()),
+                turn_id: None,
+                observed_at_unix_ms: 51,
+                succeeded: Some(true),
+            },
+            &mut events,
+        );
+        assert_eq!(events.len(), 2);
+        watcher.poll_cline_snapshot(&bound, &mut events);
+        assert_eq!(events.len(), 2, "fallback must not duplicate the hook");
+    }
+
+    #[test]
+    fn cline_hook_before_fresh_session_discovery_is_deduplicated() {
+        let mut bound = cline_profile_bound();
+        bound.cline_session_id = None;
+        let mut watcher = ProfileWatchState::default();
+        let mut events = Vec::new();
+        watcher.poll_cline_hook(
+            &bound,
+            ProfileLifecycleRecord {
+                provider: ProfileAgentProvider::Cline,
+                event: ProfileLifecycleEvent::Finished,
+                provider_session_id: None,
+                turn_id: Some("early-hook".to_owned()),
+                observed_at_unix_ms: 80,
+                succeeded: Some(true),
+            },
+            &mut events,
+        );
+        assert_eq!(events.len(), 1);
+        watcher.bind_cline_session("cline-session".to_owned(), ClineAttachMode::Fresh);
+        watcher
+            .cline
+            .as_mut()
+            .unwrap()
+            .accept_snapshot(Some(cline_snapshot("early-turn", 79, Some(("final", 80)))));
+        watcher.poll_cline_snapshot(&bound, &mut events);
+        assert_eq!(
+            events.len(),
+            1,
+            "discovered fallback must not repeat the hook"
+        );
+    }
+
+    #[test]
+    fn late_anonymous_hook_does_not_suppress_a_newer_prompt() {
+        let bound = cline_profile_bound();
+        let mut watcher = cline_profile_watcher(ClineAttachMode::Fresh);
+        watcher
+            .cline
+            .as_mut()
+            .unwrap()
+            .suppress_snapshot_completion_through = Some(60);
+        watcher
+            .cline
+            .as_mut()
+            .unwrap()
+            .accept_snapshot(Some(cline_snapshot("newer", 70, None)));
+        let mut events = Vec::new();
+        watcher.poll_cline_snapshot(&bound, &mut events);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], AgentEvent::ProviderTurnStarted { .. }));
+    }
+
+    #[test]
+    fn profile_lifecycle_events_are_correlated_and_drained_before_unbind() {
+        let directory = TempDir::new().unwrap();
+        let runtime = test_runtime(&directory);
+        let sink = Arc::new(RecordingSink::default());
+        runtime.subscribe_sink(sink.clone()).unwrap();
+        let runtime_session_id = Uuid::new_v4().simple().to_string();
+        let terminal_key = key("cline-lifecycle");
+        let route = provider_lifecycle::route_path(&runtime_session_id).unwrap();
+        provider_lifecycle::remove_route(&runtime_session_id);
+        runtime
+            .claim_profile_for_start(
+                &runtime_session_id,
+                &terminal_key,
+                ProfileAgentProvider::Cline,
+                &route,
+                None,
+            )
+            .unwrap()
+            .commit();
+
+        let records = [
+            ProfileLifecycleRecord {
+                provider: ProfileAgentProvider::Cline,
+                event: ProfileLifecycleEvent::Started,
+                provider_session_id: Some("task-a".to_owned()),
+                turn_id: Some("prompt-a".to_owned()),
+                observed_at_unix_ms: 10,
+                succeeded: None,
+            },
+            // A route cannot impersonate another pane profile.
+            ProfileLifecycleRecord {
+                provider: ProfileAgentProvider::Claude,
+                event: ProfileLifecycleEvent::Finished,
+                provider_session_id: Some("task-a".to_owned()),
+                turn_id: None,
+                observed_at_unix_ms: 11,
+                succeeded: Some(true),
+            },
+            ProfileLifecycleRecord {
+                provider: ProfileAgentProvider::Cline,
+                event: ProfileLifecycleEvent::Finished,
+                provider_session_id: Some("task-a".to_owned()),
+                turn_id: Some("different-provider-turn-id".to_owned()),
+                observed_at_unix_ms: 12,
+                succeeded: Some(true),
+            },
+        ];
+        let mut bytes = Vec::new();
+        for record in records {
+            serde_json::to_writer(&mut bytes, &record).unwrap();
+            bytes.push(b'\n');
+        }
+        fs::write(&route, bytes).unwrap();
+        // Do not give the periodic monitor a chance to observe the file. The
+        // terminal teardown path itself must deliver the last complete turn.
+        runtime.unbind(&runtime_session_id);
+
+        let events = sink.events.lock().unwrap().clone();
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            &events[0],
+            AgentEvent::ProviderTurnStarted {
+                runtime_session_id: event_session,
+                terminal_key: event_key,
+                provider: ProfileAgentProvider::Cline,
+                provider_session_id: Some(provider_session_id),
+                ..
+            } if event_session == &runtime_session_id
+                && event_key == &terminal_key
+                && provider_session_id == "task-a"
+        ));
+        assert!(matches!(
+            &events[1],
+            AgentEvent::ProviderTurnFinished {
+                runtime_session_id: event_session,
+                provider: ProfileAgentProvider::Cline,
+                succeeded: true,
+                ..
+            } if event_session == &runtime_session_id
+        ));
+        assert!(!route.exists());
     }
 
     #[test]
@@ -2993,6 +4080,14 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<TerminalLaunchProfile>(r#""opencode""#).unwrap(),
             TerminalLaunchProfile::Opencode
+        );
+        assert_eq!(
+            serde_json::from_str::<TerminalLaunchProfile>(r#""cline""#).unwrap(),
+            TerminalLaunchProfile::Cline
+        );
+        assert_eq!(
+            serde_json::from_str::<TerminalLaunchProfile>(r#""cursor""#).unwrap(),
+            TerminalLaunchProfile::Cursor
         );
         assert!(serde_json::from_str::<TerminalLaunchProfile>(r#""custom-command""#).is_err());
         assert_eq!(

@@ -25,6 +25,7 @@ const core = await import(moduleUrl);
 
 const CODEX_ID = "11111111-1111-4111-8111-111111111111";
 const GROK_ID = "22222222-2222-4222-8222-222222222222";
+const CLINE_ID = "1784623042844_ugwq9";
 
 function terminal(id, overrides = {}) {
   return {
@@ -102,12 +103,18 @@ function event(overrides = {}) {
   };
 }
 
-test("resume plans distinguish plain shells and unique Codex/Grok bindings", () => {
+test("resume plans distinguish plain shells and unique Codex/Grok/Cline bindings", () => {
   const state = workspace([
     project("project-a", [
       terminal("shell"),
       terminal("codex", { codexThreadId: CODEX_ID }),
       terminal("grok", { grokSessionId: GROK_ID }),
+      terminal("cline", {
+        legacyExtensions: {
+          launchProfileV1: "cline",
+          clineSessionIdV1: CLINE_ID,
+        },
+      }),
     ]),
   ]);
   const plans = core.deriveSafeResumePlans(state);
@@ -131,6 +138,12 @@ test("resume plans distinguish plain shells and unique Codex/Grok bindings", () 
         action: "resume",
         provider: "grok",
         conversationId: GROK_ID,
+      },
+      {
+        terminalId: "cline",
+        action: "resume",
+        provider: "cline",
+        conversationId: CLINE_ID,
       },
     ],
   );
@@ -157,6 +170,29 @@ test("provider IDs are owned globally and case-insensitive duplicates block ever
       { projectId: "project-a", terminalId: "pane-a" },
       { projectId: "project-b", terminalId: "pane-b" },
     ]);
+  }
+});
+
+test("duplicate Cline session ownership is blocked before either pane can relaunch", () => {
+  const clineTerminal = (id, sessionId) =>
+    terminal(id, {
+      legacyExtensions: {
+        launchProfileV1: "cline",
+        clineSessionIdV1: sessionId,
+      },
+    });
+  const plans = core.deriveSafeResumePlans(
+    workspace([
+      project("project-a", [clineTerminal("pane-a", CLINE_ID)]),
+      project("project-b", [clineTerminal("pane-b", CLINE_ID.toUpperCase())]),
+    ]),
+  );
+  assert.equal(plans.length, 2);
+  for (const plan of plans) {
+    assert.equal(plan.action, "blocked");
+    assert.equal(plan.provider, "cline");
+    assert.deepEqual(plan.blockingReasons, ["duplicateProviderBinding"]);
+    assert.equal(plan.duplicateOwners.length, 2);
   }
 });
 
@@ -482,6 +518,44 @@ test("rectangle overlap rejects degenerate, inverted, and non-finite bounds", ()
   }
 });
 
+test("native browser clipping keeps the browser visible above a footer overlay", () => {
+  const browser = { left: 320, top: 80, right: 1_600, bottom: 900 };
+  const overlay = { left: 180, top: 700, right: 480, bottom: 890 };
+
+  assert.deepEqual(core.clipRectangleAboveOverlay(browser, overlay), {
+    left: 320,
+    top: 80,
+    right: 1_600,
+    bottom: 699,
+  });
+  assert.deepEqual(
+    core.clipRectangleAboveOverlay(browser, {
+      left: 20,
+      top: 700,
+      right: 300,
+      bottom: 890,
+    }),
+    browser,
+  );
+});
+
+test("native browser clipping fails closed when no usable area remains", () => {
+  const browser = { left: 320, top: 80, right: 1_600, bottom: 900 };
+  assert.equal(
+    core.clipRectangleAboveOverlay(browser, {
+      left: 300,
+      top: 80,
+      right: 500,
+      bottom: 200,
+    }),
+    null,
+  );
+  assert.equal(
+    core.clipRectangleAboveOverlay({ ...browser, right: 321 }, null),
+    null,
+  );
+});
+
 test("usage normalization computes remaining percentages and clamps provider drift", () => {
   const raw = {
     codex: {
@@ -799,6 +873,10 @@ test("provider account lists reject duplicate, mismatched, and unbounded profile
 test("clipboard image routing is provider-specific and inert for a plain shell", () => {
   assert.equal(core.selectClipboardImageSequence("codex"), "\x16");
   assert.equal(core.selectClipboardImageSequence("grok"), "\x1bv");
+  assert.equal(core.selectClipboardImageSequence("claude"), "\x1bv");
+  assert.equal(core.selectClipboardImageSequence("opencode"), "\x16");
+  assert.equal(core.selectClipboardImageSequence("cline"), "\x16");
+  assert.equal(core.selectClipboardImageSequence("cursor"), "\x16");
   assert.equal(core.selectClipboardImageSequence(null), null);
   assert.equal(core.selectClipboardImageSequence(undefined), null);
 });
@@ -811,6 +889,17 @@ test("UI Pick clipboard references cannot carry terminal control input", () => {
   );
   assert.equal(core.sanitizeUiPickClipboardText("ordinary text"), "ordinary text");
   assert.equal(core.sanitizeUiPickClipboardText("a".repeat(40_000)).length, 32_768);
+});
+
+test("OSC 52 clipboard selections decode safely for Cline copy interception", () => {
+  const text = "선택한 Cline 답변\nsecond line";
+  const encoded = Buffer.from(text, "utf8").toString("base64");
+  assert.equal(core.decodeOsc52ClipboardText(`c;${encoded}`), text);
+  assert.equal(core.decodeOsc52ClipboardText("c;?"), null);
+  assert.equal(core.decodeOsc52ClipboardText(`other;${encoded}`), null);
+  assert.equal(core.decodeOsc52ClipboardText("missing-separator"), null);
+  assert.equal(core.decodeOsc52ClipboardText("c;not base64"), null);
+  assert.equal(core.decodeOsc52ClipboardText("c;//8="), null);
 });
 
 test("native file drops keep safe unique Windows paths within the per-drop limit", () => {
@@ -841,6 +930,8 @@ test("dropped files use real Codex image paste and agent file references", () =>
   assert.equal(core.formatDroppedFileReference("grok", image), `@"${image}"`);
   assert.equal(core.formatDroppedFileReference("claude", source), `@"${source}"`);
   assert.equal(core.formatDroppedFileReference("opencode", source), `@"${source}"`);
+  assert.equal(core.formatDroppedFileReference("cline", source), `@"${source}"`);
+  assert.equal(core.formatDroppedFileReference("cursor", source), `@"${source}"`);
   assert.equal(core.formatDroppedFileReference(null, source), `'${source}'`);
   assert.equal(
     core.formatDroppedFileReference(null, String.raw`C:\media\$($env:USER).png`),
@@ -1308,6 +1399,104 @@ test("terminal launch controls are detected across native output batch boundarie
   assert.equal(core.scanTerminalLaunchControl("", "\u009b?47h").detected, true);
   assert.equal(core.scanTerminalLaunchControl("", "text ?1049h").detected, false);
   assert.ok(second.tail.length <= 16);
+});
+
+test("legacy cursor frames end only after ShowCursor is followed by the final CUP", () => {
+  const initial = core.INITIAL_TERMINAL_CURSOR_FRAME_STATE;
+  const complete = core.scanTerminalCursorFrame(
+    initial,
+    "footer\x1b[0 q\x1b[?25h\x1b[24;9H",
+  );
+  assert.equal(complete.waitingForCursorPosition, false);
+  assert.equal(complete.endsAtFrameBoundary, true);
+
+  const first = core.scanTerminalCursorFrame(initial, "footer\x1b[?25");
+  assert.equal(first.endsAtFrameBoundary, false);
+  const second = core.scanTerminalCursorFrame(first, "h\x1b[12;5");
+  assert.equal(second.waitingForCursorPosition, true);
+  assert.equal(second.endsAtFrameBoundary, false);
+  const third = core.scanTerminalCursorFrame(second, "H");
+  assert.equal(third.waitingForCursorPosition, false);
+  assert.equal(third.endsAtFrameBoundary, true);
+});
+
+test("terminal cursor frame scanning handles C1 CSI, hide, and incomplete tails", () => {
+  const initial = core.INITIAL_TERMINAL_CURSOR_FRAME_STATE;
+  assert.equal(
+    core.scanTerminalCursorFrame(initial, "diff\u009b?25h\u009b8;3H").endsAtFrameBoundary,
+    true,
+  );
+  assert.equal(
+    core.scanTerminalCursorFrame(initial, "diff\x1b[?25l").endsAtFrameBoundary,
+    true,
+  );
+  assert.equal(
+    core.scanTerminalCursorFrame(initial, "diff\x1b[6 q").endsAtFrameBoundary,
+    false,
+  );
+
+  const complete = core.scanTerminalCursorFrame(initial, "\x1b[?25h\x1b[9;2H");
+  const trailing = core.scanTerminalCursorFrame(complete, "next frame diff");
+  assert.equal(trailing.endsAtFrameBoundary, false);
+  assert.equal(trailing.waitingForCursorPosition, false);
+});
+
+test("DEC synchronized output remains open through CUP and closes only at mode reset", () => {
+  const initial = core.INITIAL_TERMINAL_CURSOR_FRAME_STATE;
+  const open = core.scanTerminalCursorFrame(
+    initial,
+    "\x1b[?2026hdiff\x1b[0 q\x1b[?25h\x1b[31;117H",
+  );
+  assert.equal(open.synchronizedOutputActive, true);
+  assert.equal(open.waitingForCursorPosition, false);
+  assert.equal(open.endsAtFrameBoundary, false);
+
+  const complete = core.scanTerminalCursorFrame(open, "\x1b[?2026l");
+  assert.equal(complete.synchronizedOutputActive, false);
+  assert.equal(complete.endsAtFrameBoundary, true);
+
+  const compoundOpen = core.scanTerminalCursorFrame(initial, "\u009b?25;2026h");
+  assert.equal(compoundOpen.synchronizedOutputActive, true);
+  assert.equal(compoundOpen.waitingForCursorPosition, true);
+  const compoundClosed = core.scanTerminalCursorFrame(compoundOpen, "\u009b?25;2026l");
+  assert.equal(compoundClosed.synchronizedOutputActive, false);
+  assert.equal(compoundClosed.waitingForCursorPosition, false);
+  assert.equal(compoundClosed.endsAtFrameBoundary, true);
+});
+
+test("alternate-screen switches are not mistaken for synchronized frame completion", () => {
+  const initial = core.INITIAL_TERMINAL_CURSOR_FRAME_STATE;
+  const entered = core.scanTerminalCursorFrame(initial, "\x1b[?1049h");
+  assert.equal(entered.alternateScreenActive, true);
+  assert.equal(entered.synchronizedOutputActive, false);
+  assert.equal(entered.endsAtFrameBoundary, false);
+
+  const insideSync = core.scanTerminalCursorFrame(
+    initial,
+    "\x1b[?2026h\x1b[?1049h\x1b[?1049l",
+  );
+  assert.equal(insideSync.alternateScreenActive, false);
+  assert.equal(insideSync.synchronizedOutputActive, true);
+  assert.equal(insideSync.endsAtFrameBoundary, false);
+
+  const exited = core.scanTerminalCursorFrame(entered, "\x1b[?1049l");
+  assert.equal(exited.alternateScreenActive, false);
+  assert.equal(exited.endsAtFrameBoundary, true);
+});
+
+test("DEC synchronized cursor frames survive every three-way byte boundary", () => {
+  const frame = "\x1b[?2026hdiff\x1b[0 q\x1b[?25h\x1b[31;117H\x1b[?2026l";
+  for (let first = 0; first <= frame.length; first += 1) {
+    for (let second = first; second <= frame.length; second += 1) {
+      let state = core.INITIAL_TERMINAL_CURSOR_FRAME_STATE;
+      state = core.scanTerminalCursorFrame(state, frame.slice(0, first));
+      state = core.scanTerminalCursorFrame(state, frame.slice(first, second));
+      state = core.scanTerminalCursorFrame(state, frame.slice(second));
+      assert.equal(state.waitingForCursorPosition, false, `${first}:${second}`);
+      assert.equal(state.synchronizedOutputActive, false, `${first}:${second}`);
+      assert.equal(state.endsAtFrameBoundary, true, `${first}:${second}`);
+    }
+  }
 });
 
 test("Codex safety buffering is recognized only from the complete visible prompt", () => {

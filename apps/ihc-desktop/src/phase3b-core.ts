@@ -217,7 +217,7 @@ const STORAGE_ERROR_CODES = new Set<StorageErrorCode>([
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
-const PANE_RATIO_KEY_PATTERN = /^([1-5])x([1-4]):row-([0-3])$/;
+const PANE_RATIO_KEY_PATTERN = /^([1-5])x([1-9]\d*):row-(0|[1-9]\d*)$/;
 const RFC3339_PATTERN =
   /^(\d{4})-(\d{2})-(\d{2})[Tt](\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:[Zz]|([+-])(\d{2}):(\d{2}))$/;
 
@@ -231,6 +231,25 @@ export class WorkspaceValidationError extends Error {
     super(message);
     this.name = "WorkspaceValidationError";
   }
+}
+
+export type PaneRatioLayoutKey = Readonly<{
+  columns: number;
+  rows: number;
+  row: number;
+}>;
+
+/** Parse a canonical active layout key without imposing a fixed row limit. */
+export function parsePaneRatioLayoutKey(key: string): PaneRatioLayoutKey | null {
+  const match = PANE_RATIO_KEY_PATTERN.exec(key);
+  if (!match) return null;
+  const columns = Number(match[1]);
+  const rows = Number(match[2]);
+  const row = Number(match[3]);
+  if (!Number.isSafeInteger(rows) || !Number.isSafeInteger(row) || row >= rows) {
+    return null;
+  }
+  return { columns, rows, row };
 }
 
 export function normalizeWorkspaceLoadResponse(value: unknown): WorkspaceLoadResult {
@@ -986,12 +1005,9 @@ function normalizeApplicableRatioEntry(
   value: unknown,
   pointer: string,
 ): number[] | null {
-  const match = PANE_RATIO_KEY_PATTERN.exec(key);
-  if (!match) return null;
-  const columns = Number(match[1]);
-  const rows = Number(match[2]);
-  const row = Number(match[3]);
-  if (row >= rows) return null;
+  const layout = parsePaneRatioLayoutKey(key);
+  if (!layout) return null;
+  const { columns } = layout;
   if (!Array.isArray(value) || value.length !== columns) {
     fail("An applicable pane ratio vector has the wrong length.", pointer);
   }

@@ -800,14 +800,32 @@ test("project and terminal helpers create, append, rename, remove, and name dete
     "2026-07-17T01:02:05Z",
     "opencode",
   );
+  const clinePane = core.createWorkspaceTerminal(
+    "pane-cline",
+    "Cline 1",
+    "C:/Work/Gamma",
+    "2026-07-17T01:02:06Z",
+    "cline",
+  );
+  const cursorPane = core.createWorkspaceTerminal(
+    "pane-cursor",
+    "Cursor 1",
+    "C:/Work/Gamma",
+    "2026-07-17T01:02:07Z",
+    "cursor",
+  );
   assert.equal(codexPane.legacyExtensions.launchProfileV1, "codex");
   assert.equal(grokPane.legacyExtensions.launchProfileV1, "grok");
   assert.equal(claudePane.legacyExtensions.launchProfileV1, "claude");
   assert.equal(openCodePane.legacyExtensions.launchProfileV1, "opencode");
+  assert.equal(clinePane.legacyExtensions.launchProfileV1, "cline");
+  assert.equal(cursorPane.legacyExtensions.launchProfileV1, "cursor");
   assert.equal(core.workspaceTerminalLaunchProfile(codexPane), "codex");
   assert.equal(core.workspaceTerminalLaunchProfile(grokPane), "grok");
   assert.equal(core.workspaceTerminalLaunchProfile(claudePane), "claude");
   assert.equal(core.workspaceTerminalLaunchProfile(openCodePane), "opencode");
+  assert.equal(core.workspaceTerminalLaunchProfile(clinePane), "cline");
+  assert.equal(core.workspaceTerminalLaunchProfile(cursorPane), "cursor");
   assert.equal(
     core.workspaceTerminalLaunchProfile({
       ...createdPane,
@@ -821,6 +839,8 @@ test("project and terminal helpers create, append, rename, remove, and name dete
   state = core.appendProjectPane(state, "project-new", grokPane);
   state = core.appendProjectPane(state, "project-new", claudePane);
   state = core.appendProjectPane(state, "project-new", openCodePane);
+  state = core.appendProjectPane(state, "project-new", clinePane);
+  state = core.appendProjectPane(state, "project-new", cursorPane);
   state = core.appendProjectPane(state, "project-new", pane("pane-worker-2", {
     name: "PowerShell 1",
     startDirectory: "C:\\Work\\Gamma",
@@ -830,6 +850,8 @@ test("project and terminal helpers create, append, rename, remove, and name dete
   assert.equal(core.nextWorkspacePaneName(state.projects.at(-1), "grok"), "Grok 2");
   assert.equal(core.nextWorkspacePaneName(state.projects.at(-1), "claude"), "Claude Code 2");
   assert.equal(core.nextWorkspacePaneName(state.projects.at(-1), "opencode"), "OpenCode 2");
+  assert.equal(core.nextWorkspacePaneName(state.projects.at(-1), "cline"), "Cline 2");
+  assert.equal(core.nextWorkspacePaneName(state.projects.at(-1), "cursor"), "Cursor 2");
   state = core.renameProjectPane(state, "project-new", "pane-new", "  Coordinator  ");
   assert.equal(state.projects.at(-1).terminals[0].name, "Coordinator");
   state = core.removeProjectPane(state, "project-new", "pane-new");
@@ -838,6 +860,8 @@ test("project and terminal helpers create, append, rename, remove, and name dete
     "pane-grok",
     "pane-claude",
     "pane-opencode",
+    "pane-cline",
+    "pane-cursor",
     "pane-worker-2",
   ]);
 
@@ -1203,6 +1227,70 @@ test("discovered agent conversations are exclusive, durable-shaped terminal muta
   assert.equal(grok.projects[0].terminals[0].grokSessionId, GROK_ID.toLowerCase());
 });
 
+test("Cline sessions persist as opaque provider IDs and stale targets clear by compare-and-set", () => {
+  const sessionId = "1784623042844_ugwq9";
+  const source = workspace({
+    projects: [
+      project("project-a", ["pane-a", "pane-b"], {
+        terminals: [
+          pane("pane-a", {
+            legacyExtensions: {
+              launchProfileV1: "cline",
+              resumeBlocked: true,
+              keep: { future: true },
+            },
+          }),
+          pane("pane-b", {
+            legacyExtensions: { launchProfileV1: "cline" },
+          }),
+        ],
+      }),
+    ],
+  });
+  const before = structuredClone(source);
+  const next = core.setTerminalClineSessionId(
+    source,
+    "project-a",
+    "pane-a",
+    sessionId,
+    "2026-07-21T09:00:00Z",
+  );
+  const terminal = next.projects[0].terminals[0];
+  assert.equal(core.workspaceTerminalClineSessionId(terminal), sessionId);
+  assert.equal(terminal.legacyExtensions.resumeBlocked, undefined);
+  assert.deepEqual(terminal.legacyExtensions.keep, { future: true });
+  assert.equal(next.projects[0].lastModifiedAtUtc, "2026-07-21T09:00:00Z");
+  assert.equal(core.terminalClineSessionChanged(before.projects[0].terminals[0], terminal), true);
+  assert.deepEqual(source, before);
+
+  assert.throws(
+    () => core.setTerminalClineSessionId(next, "project-a", "pane-b", sessionId),
+    /already owned/,
+  );
+  const cleared = core.clearTerminalClineSessionId(
+    next,
+    "project-a",
+    "pane-a",
+    sessionId,
+    "2026-07-21T09:01:00Z",
+  );
+  assert.equal(core.workspaceTerminalClineSessionId(cleared.projects[0].terminals[0]), null);
+  assert.deepEqual(cleared.projects[0].terminals[0].legacyExtensions.keep, { future: true });
+  assert.equal(cleared.projects[0].lastModifiedAtUtc, "2026-07-21T09:01:00Z");
+  assert.throws(
+    () => core.clearTerminalClineSessionId(next, "project-a", "pane-a", "different-id"),
+    /changed/,
+  );
+  for (const invalid of ["", "bad id", "x'; Write-Host bad", "x".repeat(129)]) {
+    assert.equal(core.isValidClineSessionId(invalid), false);
+    assert.throws(
+      () => core.setTerminalClineSessionId(source, "project-a", "pane-a", invalid),
+      /invalid/,
+    );
+  }
+
+});
+
 test("account switching blocks selected-provider auto resume without losing conversation ids", () => {
   const source = workspace({
     projects: [
@@ -1503,6 +1591,21 @@ test("project resize requires real adjacent siblings and preserves unrelated fie
   );
   assert.deepEqual(result.state.futureRoot, source.futureRoot);
   assert.deepEqual(result.state.projects[0].futureProject, source.projects[0].futureProject);
+  const deepRow = core.resizeProjectPaneBoundaryHorizontal(source, "project-a", {
+    layoutKey: "3x128:row-127",
+    rowPaneIds: ["pane-a", "pane-b", "pane-c"],
+    leftPaneId: "pane-b",
+    rightPaneId: "pane-c",
+    totalWidthPx: 900,
+    deltaX: 30,
+    minPaneWidthPx: 180,
+  });
+  assert.deepEqual(
+    deepRow.state.projects[0].paneWidthRatios["3x128:row-127"].map((value) =>
+      Number(value.toFixed(6))
+    ),
+    [0.333333, 0.366667, 0.3],
+  );
   assert.throws(
     () => core.resizeProjectPaneBoundaryHorizontal(source, "project-a", {
       layoutKey: "3x1:row-0",
@@ -1565,4 +1668,25 @@ test("invalid geometry, IDs, ratio keys, and stale insertion targets fail closed
     }),
     /does not match/,
   );
+  for (const layoutKey of [
+    "2x0:row-0",
+    "2x4:row-4",
+    "2x04:row-3",
+    "2x4:row-03",
+    "junk2x4:row-3",
+    "2x9007199254740992:row-0",
+  ]) {
+    assert.throws(
+      () => core.resizeProjectPaneBoundaryHorizontal(workspace(), "project-a", {
+        layoutKey,
+        rowPaneIds: ["pane-a", "pane-b"],
+        leftPaneId: "pane-a",
+        rightPaneId: "pane-b",
+        totalWidthPx: 900,
+        deltaX: 10,
+      }),
+      /does not match/,
+      layoutKey,
+    );
+  }
 });

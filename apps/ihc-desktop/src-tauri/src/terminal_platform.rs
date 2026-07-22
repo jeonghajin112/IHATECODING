@@ -106,6 +106,10 @@ pub(crate) fn detect_terminal_agent(root_process_id: u32) -> Option<AgentProvide
     detect_terminal_agent_platform(root_process_id)
 }
 
+pub(crate) fn terminal_process_tree_ids(root_process_id: u32) -> HashSet<u32> {
+    process_tree_ids(root_process_id, &process_snapshot_platform())
+}
+
 fn classify_agent_process_name(process_name: &str) -> Option<AgentProvider> {
     let file_name = process_name
         .rsplit(['\\', '/'])
@@ -243,6 +247,36 @@ fn detect_agent_in_processes(
         current_level = next_level;
     }
     None
+}
+
+fn process_tree_ids(root_process_id: u32, processes: &[ProcessRecord]) -> HashSet<u32> {
+    let mut children = HashMap::<u32, Vec<u32>>::new();
+    for process in processes {
+        children
+            .entry(process.parent_process_id)
+            .or_default()
+            .push(process.process_id);
+    }
+    let mut current_level = vec![root_process_id];
+    let mut visited = HashSet::from([root_process_id]);
+    for _ in 0..MAX_PROCESS_TREE_DEPTH {
+        if current_level.is_empty() {
+            break;
+        }
+        let mut next_level = Vec::new();
+        for parent_process_id in current_level {
+            let Some(entries) = children.get(&parent_process_id) else {
+                continue;
+            };
+            for process_id in entries {
+                if visited.insert(*process_id) {
+                    next_level.push(*process_id);
+                }
+            }
+        }
+        current_level = next_level;
+    }
+    visited
 }
 
 #[cfg(windows)]
@@ -511,6 +545,11 @@ fn write_clipboard_text_platform(
 
 #[cfg(windows)]
 fn detect_terminal_agent_platform(root_process_id: u32) -> Option<AgentProvider> {
+    detect_agent_in_processes(root_process_id, &process_snapshot_platform())
+}
+
+#[cfg(windows)]
+fn process_snapshot_platform() -> Vec<ProcessRecord> {
     use windows_sys::Win32::{
         Foundation::{CloseHandle, INVALID_HANDLE_VALUE},
         System::Diagnostics::ToolHelp::{
@@ -532,7 +571,7 @@ fn detect_terminal_agent_platform(root_process_id: u32) -> Option<AgentProvider>
     // SAFETY: The flags request a read-only system process snapshot.
     let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
     if snapshot == INVALID_HANDLE_VALUE {
-        return None;
+        return Vec::new();
     }
     let _guard = SnapshotGuard(snapshot);
     let mut entry = PROCESSENTRY32W {
@@ -541,7 +580,7 @@ fn detect_terminal_agent_platform(root_process_id: u32) -> Option<AgentProvider>
     };
     // SAFETY: entry has the required size and snapshot remains valid for the enumeration.
     if unsafe { Process32FirstW(snapshot, &mut entry) } == 0 {
-        return None;
+        return Vec::new();
     }
     let mut processes = Vec::new();
     loop {
@@ -564,12 +603,17 @@ fn detect_terminal_agent_platform(root_process_id: u32) -> Option<AgentProvider>
             break;
         }
     }
-    detect_agent_in_processes(root_process_id, &processes)
+    processes
 }
 
 #[cfg(not(windows))]
 fn detect_terminal_agent_platform(_root_process_id: u32) -> Option<AgentProvider> {
     None
+}
+
+#[cfg(not(windows))]
+fn process_snapshot_platform() -> Vec<ProcessRecord> {
+    Vec::new()
 }
 
 #[cfg(test)]
@@ -631,6 +675,8 @@ mod tests {
             Some(AgentProvider::Codex)
         );
         assert_eq!(detect_agent_in_processes(50, &processes), None);
+        assert_eq!(process_tree_ids(1, &processes), HashSet::from([1, 2, 3, 4]));
+        assert_eq!(process_tree_ids(98, &processes), HashSet::from([98, 99]));
     }
 
     #[test]

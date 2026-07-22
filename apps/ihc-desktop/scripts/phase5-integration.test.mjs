@@ -52,11 +52,11 @@ test("terminal IME handling uses committed input without composition interceptio
 
   assert.match(
     handlers,
-    /terminal\.onData\(\(data\) => \{[\s\S]*?this\.noteEditableUserInput\(data\);\s*this\.resumeAutoFollowForUserIntent\(\);[\s\S]*?this\.queueInput\(\{ kind: "text", data \}\)/,
+    /terminal\.onData\(\(data\) => \{[\s\S]*?this\.forwardTerminalTextInput\(data\)/,
   );
   assert.match(
     handlers,
-    /terminal\.onBinary\(\(data\) => \{[\s\S]*?this\.resumeAutoFollowForUserIntent\(\);[\s\S]*?this\.queueInput\(\{ kind: "binary", data: bytes \}\)/,
+    /terminal\.onBinary\(\(data\) => \{[\s\S]*?this\.prepareTerminalForUserIntent\(\);[\s\S]*?this\.queueInput\(\{ kind: "binary", data: bytes \}\)/,
   );
   assert.doesNotMatch(handlers, /["']beforeinput["']/);
   assert.doesNotMatch(
@@ -74,10 +74,8 @@ test("terminal IME handling uses committed input without composition interceptio
   );
   assert.doesNotMatch(main, /this\.terminal\.options\.cursorStyle\s*=/);
   assert.doesNotMatch(main, /this\.terminal\.options\.cursorBlink\s*=/);
-  assert.match(
-    main,
-    /private resumeAutoFollowForUserIntent\(\)[\s\S]*?if \(!this\.isAtBottom\(\)\) this\.terminal\.scrollToBottom\(\)/,
-  );
+  assert.match(main, /scrollOnUserInput:\s*false/);
+  assert.doesNotMatch(main, /scrollToBottom|resumeAutoFollowForUserIntent|scheduleSettledFollow/);
   assert.match(
     main,
     /const inputReady = clipboardRead\.then[\s\S]*window\.setTimeout\(\(\) => \{[\s\S]*const commit = this\.reserveInputSlot\(\)/,
@@ -97,8 +95,7 @@ test("terminal clicks use guarded mode-aware cursor movement", async () => {
 
   assert.match(mouseUp, /event\.button !== 0 \|\| !this\.selectionGestureActive/);
   assert.match(mouseUp, /this\.selectionGestureActive = false/);
-  assert.match(mouseUp, /this\.invalidatePendingFollow\(\)/);
-  assert.match(mouseUp, /this\.isAtBottom\(\)/);
+  assert.doesNotMatch(mouseUp, /scrollToBottom|invalidatePendingFollow/);
   assert.doesNotMatch(main, /new MouseEvent|altKey:\s*true/);
   assert.doesNotMatch(main, /replayingCursorMoveMouseUp|selectionGestureOrigin/);
   assert.match(main, /altClickMovesCursor:\s*false/);
@@ -242,7 +239,7 @@ test("live CLI input owns Ctrl+A and selected-range Backspace safely", async () 
   );
 });
 
-test("terminal answer selections expose reliable copy without resuming output follow", async () => {
+test("terminal answer selections expose reliable copy without forced output follow", async () => {
   const [main, styles] = await Promise.all([
     source("src/main.ts"),
     source("src/styles.css"),
@@ -267,17 +264,18 @@ test("terminal answer selections expose reliable copy without resuming output fo
   assert.match(main, /title = tr\("Copy selected response", "선택한 답변 복사"\)/);
   assert.match(
     handlers,
-    /terminal\.onSelectionChange\(\(\) => \{[\s\S]*?copyButton\.hidden = !hasSelection;[\s\S]*?if \(hasSelection\) this\.pauseAutoFollow\(\)/,
+    /terminal\.onSelectionChange\(\(\) => \{[\s\S]*?copyButton\.hidden = !hasSelection/,
   );
-  assert.doesNotMatch(handlers, /onSelectionChange[\s\S]{0,180}resumeAutoFollow/);
+  assert.match(
+    handlers,
+    /registerOscHandler\(52,[\s\S]*?launchProfile !== "cline"[\s\S]*?decodeOsc52ClipboardText\(data\)[\s\S]*?selectionCopyGuard\.captureLiveSelection\(selection\)/,
+  );
+  assert.doesNotMatch(handlers, /onSelectionChange[\s\S]{0,180}(clearSelection|scrollToBottom)/);
   assert.match(
     handlers,
     /attachCustomKeyEventHandler[\s\S]*?consumeSelectionCopyShortcut\(event\)[\s\S]*?consumeManualTerminalInterruptShortcut\(event\)[\s\S]*?event\.isComposing/,
   );
-  assert.match(
-    handlers,
-    /"keydown",\s*\(event\) => \{\s*if \(this\.consumeSelectionCopyShortcut\(event\)\) return;/,
-  );
+  assert.match(main, /window\.addEventListener\("keydown", this\.onWindowTerminalKeyDown, true\)/);
   assert.match(
     handlers,
     /private consumeSelectionCopyShortcut\(event: KeyboardEvent, immediate = false\)[\s\S]*?liveTerminalSelection\(\)[\s\S]*?selectionCopyGuard\.selectionForShortcut[\s\S]*?event\.preventDefault\(\)[\s\S]*?stopImmediatePropagation\(\)[\s\S]*?this\.copySelection\(selection\)/,
@@ -314,11 +312,15 @@ test("terminal answer selections expose reliable copy without resuming output fo
   assert.doesNotMatch(interrupt, /copySelection\(/);
   assert.match(
     handlers,
-    /terminal\.onData\(\(data\) => \{[\s\S]*?selectionCopyGuard\.selectionForTerminalInput\([\s\S]*?if \(selectedCopy !== null\) \{[\s\S]*?copySelection\(selectedCopy\);[\s\S]*?return;[\s\S]*?isTerminalModifierOnlyInput\(data\)[\s\S]*?queueInput\(\{ kind: "text", data \}\);[\s\S]*?return;[\s\S]*?this\.forwardTerminalTextInput\(data\)/,
+    /terminal\.onData\(\(data\) => \{[\s\S]*?selectionCopyGuard\.selectionForTerminalInput\([\s\S]*?if \(selectedCopy !== null\) \{[\s\S]*?discardPendingSelectionModifierInputs\(\);[\s\S]*?copySelection\(selectedCopy\);[\s\S]*?return;[\s\S]*?isTerminalModifierOnlyInput\(data\)[\s\S]*?holdOrForwardTerminalModifierInput\(\{ kind: "text", data \}\);[\s\S]*?return;[\s\S]*?flushPendingSelectionModifierInputs\(\);[\s\S]*?this\.forwardTerminalTextInput\(data\)/,
   );
   assert.match(
     handlers,
-    /terminal\.onBinary\(\(data\) => \{[\s\S]*?selectionCopyGuard\.selectionForTerminalInput\([\s\S]*?if \(selectedCopy !== null\) \{[\s\S]*?copySelection\(selectedCopy\);[\s\S]*?return;[\s\S]*?isTerminalModifierOnlyInput\(data\)[\s\S]*?queueInput\(\{ kind: "binary", data: binaryStringToRawBytes\(data\) \}\);[\s\S]*?return;/,
+    /terminal\.onBinary\(\(data\) => \{[\s\S]*?selectionCopyGuard\.selectionForTerminalInput\([\s\S]*?if \(selectedCopy !== null\) \{[\s\S]*?discardPendingSelectionModifierInputs\(\);[\s\S]*?copySelection\(selectedCopy\);[\s\S]*?return;[\s\S]*?isTerminalModifierOnlyInput\(data\)[\s\S]*?holdOrForwardTerminalModifierInput\(\{[\s\S]*?kind: "binary"[\s\S]*?binaryStringToRawBytes\(data\)[\s\S]*?\}\);[\s\S]*?return;[\s\S]*?flushPendingSelectionModifierInputs\(\);/,
+  );
+  assert.match(
+    handlers,
+    /private holdOrForwardTerminalModifierInput\(input: TerminalInput\)[\s\S]*?selectionCopyGuard\.hasCopySelection\(this\.liveTerminalSelection\(\)\)[\s\S]*?pendingSelectionModifierInputs\.push\(input\)[\s\S]*?flushPendingSelectionModifierInputs\(\)[\s\S]*?queueInput\(input\)/,
   );
   assert.match(
     handlers,
@@ -334,7 +336,7 @@ test("terminal answer selections expose reliable copy without resuming output fo
   );
   assert.match(
     handlers,
-    /private forwardTerminalTextInput\(data: string\) \{\s*this\.selectionCopyGuard\.invalidate\(\);\s*this\.armInteractiveLaunchPaintProbeForSubmittedInput\(data\);\s*this\.noteEditableUserInput\(data\);\s*this\.resumeAutoFollowForUserIntent\(\);\s*this\.queueInput\(\{ kind: "text", data \}\);\s*this\.scheduleAgentDiscovery\(data\.includes\("\\r"\) \|\| data\.includes\("\\n"\)\);/,
+    /private forwardTerminalTextInput\(data: string\) \{\s*this\.selectionCopyGuard\.invalidate\(\);\s*this\.armInteractiveLaunchPaintProbeForSubmittedInput\(data\);\s*this\.noteEditableUserInput\(data\);\s*this\.prepareTerminalForUserIntent\(\);\s*this\.queueInput\(\{ kind: "text", data \}\);\s*this\.scheduleAgentDiscovery\(data\.includes\("\\r"\) \|\| data\.includes\("\\n"\)\);/,
   );
   assert.match(copy, /await invoke\("write_clipboard_text", \{ text \}\)/);
   assert.match(copy, /catch \(nativeError\)/);
@@ -342,8 +344,7 @@ test("terminal answer selections expose reliable copy without resuming output fo
   assert.match(copy, /navigator\.clipboard\.writeText\(text\)/);
   assert.match(copy, /if \(clipboardEventSucceeded\) return true/);
   assert.doesNotMatch(copy, /if \(this\.copySelectionThroughClipboardEvent\(text\)\) return true/);
-  assert.match(copy, /this\.pauseAutoFollow\(\)/);
-  assert.doesNotMatch(copy, /clearSelection|resumeAutoFollow/);
+  assert.doesNotMatch(copy, /clearSelection|prepareTerminalForUserIntent|scrollToBottom/);
   assert.match(copy, /document\.execCommand\("copy"\)/);
   assert.match(copy, /clipboardData\.setData\("text\/plain", text\)/);
   assert.match(
@@ -353,12 +354,16 @@ test("terminal answer selections expose reliable copy without resuming output fo
   assert.match(styles, /\.terminal-copy\[hidden\]\s*\{\s*display:\s*none/);
 });
 
-test("terminal output coalesces adjacent TUI repaint fragments before xterm renders", async () => {
+test("terminal output preserves synchronized redraws without delaying the active pane", async () => {
   const main = await source("src/main.ts");
   const acceptStart = main.indexOf("private acceptOutput(batch: OutputBatch)");
   const acceptEnd = main.indexOf("private async sendCumulativeAck", acceptStart);
   const rendering = main.slice(acceptStart, acceptEnd);
+  const resumeStart = main.indexOf("private resumePinnedXtermRenderer");
+  const resumeEnd = main.indexOf("private noteEditableKeyboardEvent", resumeStart);
+  const resume = main.slice(resumeStart, resumeEnd);
   assert.ok(acceptStart >= 0 && acceptEnd > acceptStart);
+  assert.ok(resumeStart >= 0 && resumeEnd > resumeStart);
   assert.match(
     rendering,
     /if \(ready\.length > 0\)[\s\S]*?pendingRenderBatches\.push\(\.\.\.ready\)[\s\S]*?scheduleRenderDrain\(\)/,
@@ -379,20 +384,32 @@ test("terminal output coalesces adjacent TUI repaint fragments before xterm rend
     rendering,
     /OUTPUT_RENDER_MAX_BYTES[\s\S]*?pendingRenderBatches\.splice/,
   );
+  assert.doesNotMatch(
+    main,
+    /takeStablePendingRenderBatches|waitForPendingRenderOutput|shouldCollectCompleteCodexCursorFrame|CODEX_CURSOR_FRAME_MAX_HOLD_MS|CODEX_CURSOR_FRAME_MAX_BYTES/,
+  );
   assert.match(rendering, /batches\.map\(\(batch\) => batch\.data\)\.join\(""\)/);
+  assert.match(
+    rendering,
+    /scanTerminalCursorFrame\([\s\S]*?synchronizedFrameOpen = cursorFrameStateAfterWrite\.synchronizedOutputActive[\s\S]*?incompleteCursorFrame =[\s\S]*?waitingForCursorPosition/,
+  );
   assert.match(
     rendering,
     /directPaint = this\.shouldDirectPaintOutput\(\)[\s\S]*?immediateWrite = directPaint \|\| launchSensitiveWrite[\s\S]*?if \(immediateWrite\) this\.primePinnedXtermImmediateWrite\(\)[\s\S]*?terminal\.write\(data/,
   );
   assert.match(
     rendering,
-    /shouldForceDirectTerminalRefresh\([\s\S]*?FOREGROUND_FORCED_REFRESH_INTERVAL_MS[\s\S]*?forceForegroundRefresh \|\|[\s\S]*?launchSensitiveWrite && observedLaunchCheckpoint[\s\S]*?resumePinnedXtermRenderer\(true\)/,
+    /!incompleteCursorFrame[\s\S]*?shouldForceDirectTerminalRefresh\([\s\S]*?FOREGROUND_FORCED_REFRESH_INTERVAL_MS[\s\S]*?!incompleteCursorFrame[\s\S]*?forceForegroundRefresh \|\|[\s\S]*?launchSensitiveWrite && observedLaunchCheckpoint[\s\S]*?resumePinnedXtermRenderer\(true\)/,
   );
   assert.match(
     rendering,
-    /terminal\.write\(data,[\s\S]*?terminalRenderVersion = expectedRenderVersion/,
+    /renderedCursorFrameState = cursorFrameStateAfterWrite;[\s\S]*?terminal\.write\(data,[\s\S]*?terminalRenderVersion = expectedRenderVersion/,
   );
   assert.match(main, /OUTPUT_RENDER_MAX_BYTES = 64 \* 1024/);
+  assert.match(
+    resume,
+    /_handleIntersectionChange\([\s\S]*?renderedCursorFrameState\.synchronizedOutputActive[\s\S]*?terminal\.modes\.synchronizedOutputMode[\s\S]*?return;[\s\S]*?core\.refresh/,
+  );
   assert.match(
     rendering,
     /batches\.map\(\(batch\) => batch\.data\)\.join\(""\)[\s\S]*?observeRawLaunchControl\(data\)[\s\S]*?launchSensitiveWrite = this\.launchPaintWatchdog\.shouldBypassRenderTimers[\s\S]*?observeInteractiveLaunchOutput\(false, expectedRenderVersion\)[\s\S]*?terminal\.write\(data/,
@@ -407,10 +424,7 @@ test("terminal output coalesces adjacent TUI repaint fragments before xterm rend
     rendering,
     /for \(const batch of batches\)[\s\S]*?ackPolicy\.noteRendered\(batch\.sequence\)/,
   );
-  assert.match(
-    rendering,
-    /shouldFollow[\s\S]*?writeEpoch === this\.interactionEpoch[\s\S]*?this\.canAutoFollow\(\)[\s\S]*?!this\.isAtBottom\(\)[\s\S]*?scrollToBottom\(\)/,
-  );
+  assert.doesNotMatch(rendering, /shouldFollow|interactionEpoch|scrollToBottom/);
   assert.match(
     rendering,
     /this\.pendingExit && this\.outputSequencer\.isFinalReady[\s\S]*?this\.scheduleExitBarrier\(\)/,
@@ -420,10 +434,7 @@ test("terminal output coalesces adjacent TUI repaint fragments before xterm rend
     main,
     /scheduleExitBarrier\(\)[\s\S]*?this\.renderQueue = this\.renderQueue[\s\S]*?nextAnimationFrame\(\)/,
   );
-  assert.match(
-    main,
-    /scheduleSettledFollow\([\s\S]*?this\.canAutoFollow\(\)[\s\S]*?!this\.isAtBottom\(\)[\s\S]*?scrollToBottom\(\)/,
-  );
+  assert.doesNotMatch(main, /scheduleSettledFollow|scrollToBottom/);
 });
 
 test("interactive CLI launch recovers a missed xterm paint without polling normal output", async () => {
@@ -545,10 +556,10 @@ test("pane maximize is a reversible workspace view and leaves sibling sessions a
   );
   assert.match(layout, /for \(const pane of this\.allPanes\(\)\)[\s\S]*?inactivePaneBin\.append\(pane\.element\)/);
   assert.match(layout, /visibleIds\.has\(pane\.id\)\) continue/);
-  assert.match(layout, /previousRows\[rowIndex\] \?\? document\.createElement\("div"\)/);
+  assert.match(layout, /previousRows\[groupIndex\] \?\? document\.createElement\("div"\)/);
   assert.match(
     layout,
-    /if \(!rowElement\.isConnected\) this\.rowsHost\.append\(rowElement\)[\s\S]*?current !== pane\.element[\s\S]*?rowElement\.insertBefore\(pane\.element, current\)/,
+    /const current = parent\.children\[childIndex\] \?\? null[\s\S]*?current !== pane\.element[\s\S]*?parent\.insertBefore\(pane\.element, current\)[\s\S]*?if \(!rowElement\.isConnected\) this\.rowsHost\.append\(rowElement\)/,
   );
   assert.match(layout, /terminalsNeedingResume\.add\(pane\)/);
   assert.match(
@@ -775,6 +786,54 @@ test("agent lifecycle drives project activity and durable completion", async () 
   assert.doesNotMatch(main, /prompt[^\n]*(working|busy)|OutputQuiet[^\n]*SetAgent/i);
 });
 
+test("profile agent lifecycle keeps concurrent sessions active and alerts on every outcome", async () => {
+  const main = await source("src/main.ts");
+  const controllerStart = main.indexOf("class AgentEventController");
+  const controllerEnd = main.indexOf("async function stopBackendSession", controllerStart);
+  assert.ok(controllerStart >= 0 && controllerEnd > controllerStart);
+  const agentController = main.slice(controllerStart, controllerEnd);
+  const deliveryStart = agentController.indexOf("private deliverProfileLifecycle(");
+  const deliveryEnd = agentController.indexOf("private onContextUpdated", deliveryStart);
+  assert.ok(deliveryStart >= 0 && deliveryEnd > deliveryStart);
+  const profileDelivery = agentController.slice(deliveryStart, deliveryEnd);
+
+  assert.match(
+    agentController,
+    /event === "providerTurnStarted" \|\| event === "providerTurnFinished"[\s\S]*?onProfileLifecycle\(event, data\)/,
+  );
+  assert.match(
+    agentController,
+    /providerSessionId = normalizeProfileLifecycleIdentifier[\s\S]*?turnId = normalizeProfileLifecycleIdentifier[\s\S]*?typeof data\.succeeded !== "boolean"/,
+  );
+  assert.match(
+    agentController,
+    /profileAgentLifecycleIdentity\([\s\S]*?profileAgentLifecycleScopeKey\([\s\S]*?profileAgentLifecycleCorrelationKey\(\s*lifecycleScopeKey,\s*lifecycleIdentity/,
+  );
+  assert.match(
+    main,
+    /function profileAgentLifecycleIdentity\([\s\S]*?providerSessionId !== null[\s\S]*?\["session", providerSessionId\][\s\S]*?turnId !== null[\s\S]*?\["turn", turnId\][\s\S]*?\["pane"\]/,
+  );
+  assert.match(
+    profileDelivery,
+    /activeProfileIdentitiesByScope\.get\(lifecycleScopeKey\)[\s\S]*?workingAfterEvent[\s\S]*?activeIdentities\.has\(lifecycleIdentity\)[\s\S]*?setProfileAgentTurnWorking\([\s\S]*?workingAfterEvent/,
+  );
+  assert.match(
+    profileDelivery,
+    /providerTurnStarted[\s\S]*?markProfileIdentityActive\(lifecycleScopeKey, lifecycleIdentity\)[\s\S]*?markProfileIdentityFinished\(lifecycleScopeKey, lifecycleIdentity\)/,
+  );
+  assert.match(agentController, /MAX_ACTIVE_PROFILE_LIFECYCLE_SCOPES/);
+  assert.match(agentController, /MAX_ACTIVE_PROFILE_IDENTITIES_PER_SCOPE/);
+  assert.match(
+    profileDelivery,
+    /sendBackground\([\s\S]*?succeeded \? "success" : "error"[\s\S]*?noteProfileAgentOutcome\([\s\S]*?succeeded,[\s\S]*?phoneNotificationQueued[\s\S]*?queueProfileAgentCompletion\(/,
+  );
+  assert.doesNotMatch(profileDelivery, /if \(!succeeded\) return/);
+  assert.match(
+    main,
+    /notifyPhoneErrorOnce\("terminalExit", exit\.sessionId\)[\s\S]*?source === "terminalExit"[\s\S]*?recentProfileFailure\?\.runtimeSessionId === runtimeSessionId[\s\S]*?PROFILE_FAILURE_EXIT_SUPPRESSION_MS/,
+  );
+});
+
 test("agent context telemetry is correlated to its pane and rendered in the header", async () => {
   const [main, backend, styles] = await Promise.all([
     source("src/main.ts"),
@@ -836,12 +895,16 @@ test("usage, unread badges, and the single native clipboard snapshot are wired",
   assert.match(clipboard, /snapshot\.kind === "empty"/);
   assert.match(
     clipboard,
-    /snapshot\.text\.startsWith\("\[IHATECODING UI PICK\]"\)[\s\S]*?detectClipboardAgent\(\)[\s\S]*?sanitizeUiPickClipboardText\(snapshot\.text\)/,
+    /snapshot\.text\.startsWith\("\[IHATECODING UI PICK\]"\)[\s\S]*?detectClipboardProvider\(\)[\s\S]*?sanitizeUiPickClipboardText\(snapshot\.text\)/,
   );
   assert.doesNotMatch(clipboard, /navigator\.clipboard\.readText/);
   assert.doesNotMatch(main, /clipboard_contains_image/);
   assert.match(main, /invoke<AgentProvider \| null>\("detect_terminal_agent"/);
   assert.match(main, /selectClipboardImageSequence\(provider\)/);
+  assert.match(
+    clipboard,
+    /private async detectClipboardProvider\(\): Promise<DroppedFileProvider \| null>[\s\S]*?this\.launchProfile === "claude"[\s\S]*?this\.launchProfile === "opencode"[\s\S]*?this\.launchProfile === "cline"[\s\S]*?this\.launchProfile === "cursor"/,
+  );
   assert.match(platform, /CF_DIBV5/);
   assert.match(platform, /CF_UNICODE_TEXT_FORMAT/);
   assert.match(platform, /MAX_CLIPBOARD_TEXT_BYTES/);
@@ -937,13 +1000,14 @@ test("usage, unread badges, and the single native clipboard snapshot are wired",
 });
 
 test("provider usage opens a compact account-aware popover above the status bar", async () => {
-  const [html, main, styles, backend, providerUsage, workspaceController] = await Promise.all([
+  const [html, main, styles, backend, providerUsage, workspaceController, openAiStatus] = await Promise.all([
     source("index.html"),
     source("src/main.ts"),
     source("src/styles.css"),
     source("src-tauri/src/lib.rs"),
     source("src-tauri/src/provider_usage.rs"),
     source("src/phase4-controller.ts"),
+    source("src-tauri/src/openai_status.rs"),
   ]);
 
   assert.match(
@@ -980,6 +1044,19 @@ test("provider usage opens a compact account-aware popover above the status bar"
     );
   }
   assert.match(html, /id="statusbar-order-status"[\s\S]*aria-live="polite"/);
+  assert.match(
+    html,
+    /id="openai-status-summary"[\s\S]*data-tone="unknown"[\s\S]*id="openai-status-summary-label"/,
+  );
+  assert.match(
+    main,
+    /summary\.hidden = !waiting && !shouldShowOpenAiStatusSummary\(view\.status\)/,
+  );
+  assert.match(styles, /\.openai-service-state\[hidden\][\s\S]*display: none/);
+  assert.match(
+    html,
+    /id="openai-status-detail"[\s\S]*aria-live="polite"[\s\S]*id="openai-status-services"[\s\S]*id="openai-status-incidents"[\s\S]*id="refresh-openai-status"/,
+  );
 
   const popoverStart = html.indexOf('id="provider-usage-popover"');
   const popoverEnd = html.indexOf("</footer>", popoverStart);
@@ -1039,6 +1116,12 @@ test("provider usage opens a compact account-aware popover above the status bar"
     usageController,
     /renderUnsupportedLimit\(this\.limits\.claudeCode\.weekly, "Claude Code"\)[\s\S]*renderUnsupportedLimit\(this\.limits\.openCode\.weekly, "OpenCode"\)/,
   );
+  assert.match(
+    usageController,
+    /normalizeOpenAiStatusSnapshot\([\s\S]*invoke<unknown>\("read_openai_status", \{ forceRefresh \}\)/,
+  );
+  assert.match(usageController, /openAiStatusTimer[\s\S]*60_000/);
+  assert.match(usageController, /ageMs <= 10 \* 60_000/);
   assert.match(
     usageController,
     /this\.detail\.closeButton\.addEventListener\("click", \(\) => this\.requestCloseDetail\(true\)/,
@@ -1148,14 +1231,11 @@ test("provider usage opens a compact account-aware popover above the status bar"
   const browserPane = main.slice(browserPaneStart, browserPaneEnd);
   assert.match(
     browserPane,
-    /overlapsNativeOverlay\(bounds: RectangleBounds\)[\s\S]*rectanglesOverlap\(this\.viewport\.getBoundingClientRect\(\), bounds\)/,
+    /setNativeOverlayOcclusion\(bounds: RectangleBounds \| null\)[\s\S]*this\.nativeOverlayOcclusion = next;[\s\S]*this\.scheduleFit\(0\)/,
   );
-  const overlapStart = browserPane.indexOf("overlapsNativeOverlay(");
-  const overlapEnd = browserPane.indexOf("scheduleFit(", overlapStart);
-  assert.ok(overlapStart >= 0 && overlapEnd > overlapStart);
-  assert.doesNotMatch(
-    browserPane.slice(overlapStart, overlapEnd),
-    /\.hide\(|\.close\(|\.dispose\(/,
+  assert.match(
+    browserPane,
+    /const bounds = clipRectangleAboveOverlay\([\s\S]*this\.viewport\.getBoundingClientRect\(\),[\s\S]*this\.nativeOverlayOcclusion[\s\S]*new LogicalSize\(Math\.round\(width\), Math\.floor\(height\)\)/,
   );
 
   const workspaceStart = main.indexOf("class TerminalWorkspace");
@@ -1176,7 +1256,7 @@ test("provider usage opens a compact account-aware popover above the status bar"
   );
   assert.match(
     workspace,
-    /const globallySuspended = this\.browserSuspensionReasons\.size > 0;[\s\S]*const overlapsProviderUsage = this\.providerUsageOverlayBounds[\s\S]*pane\.overlapsNativeOverlay\(this\.providerUsageOverlayBounds\)[\s\S]*pane\.setInteractionSuspended\(globallySuspended \|\| overlapsProviderUsage\)/,
+    /const globallySuspended = this\.browserSuspensionReasons\.size > 0;[\s\S]*pane\.setNativeOverlayOcclusion\([\s\S]*globallySuspended \? null : this\.providerUsageOverlayBounds[\s\S]*pane\.setInteractionSuspended\(globallySuspended\)/,
   );
   assert.match(
     workspace,
@@ -1253,6 +1333,7 @@ test("provider usage opens a compact account-aware popover above the status bar"
     "cancel_provider_account_login",
     "switch_provider_account",
     "restart_application",
+    "read_openai_status",
   ]) {
     assert.match(handler[1], new RegExp(`\\b${command}\\b`));
   }
@@ -1267,6 +1348,14 @@ test("provider usage opens a compact account-aware popover above the status bar"
   assert.match(providerUsage, /fn read_bounded_auth<T: DeserializeOwned>/);
   assert.match(providerUsage, /bytes\.fill\(0\)/);
   assert.match(providerUsage, /environment_api_key_account/);
+  assert.match(
+    backend,
+    /async fn read_openai_status\([\s\S]*ensure_agent_main_webview\(&webview\)\?[\s\S]*spawn_blocking/,
+  );
+  assert.match(openAiStatus, /wide\("status\.openai\.com"\)/);
+  assert.match(openAiStatus, /wide\("\/api\/v2\/summary\.json"\)/);
+  assert.match(openAiStatus, /WINHTTP_OPTION_REDIRECT_POLICY_NEVER/);
+  assert.match(openAiStatus, /const MAX_RESPONSE_BYTES: usize = 512 \* 1024/);
 });
 
 test("native Explorer drops attach to the hit-tested terminal without submitting", async () => {
@@ -1301,7 +1390,7 @@ test("native Explorer drops attach to the hit-tested terminal without submitting
   assert.doesNotMatch(attach, /data:\s*["'](?:\\r|\\n)["']/);
   assert.match(
     main,
-    /private async detectDroppedFileProvider\(\): Promise<DroppedFileProvider \| null>[\s\S]*?this\.launchProfile === "claude"[\s\S]*?this\.launchProfile === "opencode"[\s\S]*?this\.agentProvider \?\? launchProvider/,
+    /private async detectDroppedFileProvider\(\): Promise<DroppedFileProvider \| null>[\s\S]*?this\.launchProfile === "claude"[\s\S]*?this\.launchProfile === "opencode"[\s\S]*?this\.launchProfile === "cline"[\s\S]*?this\.launchProfile === "cursor"[\s\S]*?this\.agentProvider \?\? launchProvider/,
   );
   assert.match(
     styles,
@@ -1335,7 +1424,7 @@ test("Discord phone notifications keep webhooks private and bind display names e
   assert.match(html, /data-i18n-en="2\. Under Integrations → Webhooks[\s\S]*data-i18n-ko="2\. 연동 → 웹후크에서 웹후크를 만들고 URL 복사/);
   assert.match(
     html,
-    /data-i18n-en="Only the project name, CLI name[\s\S]*data-i18n-ko="프로젝트명, CLI 이름, 완료\/오류\/안전 검사 상태만 전송합니다[\s\S]*경로, PID, 프롬프트, 답변과 원문 오류는 보내지 않습니다/,
+    /data-i18n-en="Only the project, agent, CLI pane, available model name[\s\S]*data-i18n-ko="프로젝트명, 에이전트, CLI 창, 확인 가능한 모델명[\s\S]*경로, PID, 프롬프트, 답변과 원문 오류는 보내지 않습니다/,
   );
   assert.doesNotMatch(html, /비공개 토픽|phone-notification-topic/);
   assert.match(styles, /\.settings-button\s*\{[\s\S]*grid-template-columns/);
@@ -1357,6 +1446,8 @@ test("Discord phone notifications keep webhooks private and bind display names e
   assert.match(backgroundSend, /while \(!this\.disposed\)[\s\S]*deliveryQueue\.shift\(\)[\s\S]*await this\.deliverWithRetry\(delivery\)/);
   assert.match(backgroundSend, /projectName:\s*delivery\.labels\.projectName/);
   assert.match(backgroundSend, /terminalName:\s*delivery\.labels\.terminalName/);
+  assert.match(backgroundSend, /agent:\s*delivery\.labels\.agent/);
+  assert.match(backgroundSend, /modelName:\s*delivery\.labels\.modelName/);
   assert.match(backgroundSend, /language:\s*getAppLanguage\(\)/);
   assert.match(backgroundSend, /PHONE_NOTIFICATION_RETRY_DELAYS_MS\[attempt\]/);
   assert.match(main, /PHONE_NOTIFICATION_RETRY_DELAYS_MS = \[1_500, 4_000\]/);
@@ -1365,7 +1456,15 @@ test("Discord phone notifications keep webhooks private and bind display names e
 
   assert.match(
     main,
-    /phoneNotificationLabels\([\s\S]*?projectNames\.get\(projectId\)[\s\S]*?panes\.get\(paneRuntimeId\(projectId, terminalId\)\)[\s\S]*?terminalName: pane\.title/,
+    /phoneNotificationLabels\([\s\S]*?provider: WorkspaceTerminalLaunchProfile \| null = null[\s\S]*?modelName: string \| null = null[\s\S]*?projectNames\.get\(projectId\)[\s\S]*?panes\.get\(paneRuntimeId\(projectId, terminalId\)\)[\s\S]*?terminalName: pane\.title[\s\S]*?agent: pane\.phoneNotificationAgentProfile\(provider\)[\s\S]*?modelName/,
+  );
+  assert.match(
+    main,
+    /phoneNotificationAgentProfile\([\s\S]*?provider \?\? this\.agentProvider \?\? this\.launchProfile/,
+  );
+  assert.match(
+    main,
+    /phoneNotificationLabels\(\s*this\.projectId,\s*this\.terminalId,\s*"codex",\s*\)/,
   );
 
   const agentController = main.slice(
@@ -1374,12 +1473,12 @@ test("Discord phone notifications keep webhooks private and bind display names e
   );
   assert.match(
     agentController,
-    /if \(event === "turnFinished"\)[\s\S]*phoneTurnKey = agentTurnPhoneNotificationEventId\([\s\S]*conversationId,[\s\S]*turnId,[\s\S]*notificationObservedAtUnixMs \?\? observedAtUnixMs[\s\S]*phoneNotifiedFinishedTurns\.has[\s\S]*phoneNotificationLabels\(projectId, terminalId\)[\s\S]*sendBackground\([\s\S]*succeeded \? "success" : "error"[\s\S]*phoneTurnKey/,
+    /if \(event === "turnFinished"\)[\s\S]*phoneTurnKey = agentTurnPhoneNotificationEventId\([\s\S]*conversationId,[\s\S]*turnId,[\s\S]*notificationObservedAtUnixMs \?\? observedAtUnixMs[\s\S]*phoneNotifiedFinishedTurns\.has[\s\S]*phoneNotificationLabels\(\s*projectId,\s*terminalId,\s*provider,\s*\)[\s\S]*sendBackground\([\s\S]*succeeded \? "success" : "error"[\s\S]*phoneTurnKey/,
   );
   assert.match(agentController, /phoneNotifiedFinishedTurns\.size > 512/);
   assert.match(
     agentController,
-    /const labels = this\.workspace\.phoneNotificationLabels\(projectId, terminalId\);[\s\S]*?if \(labels\) \{[\s\S]*?phoneNotifiedFinishedTurns\.add\(phoneTurnKey\)[\s\S]*?sendBackground/,
+    /const labels = this\.workspace\.phoneNotificationLabels\(\s*projectId,\s*terminalId,\s*provider,\s*\);[\s\S]*?if \(labels\) \{[\s\S]*?phoneNotifiedFinishedTurns\.add\(phoneTurnKey\)[\s\S]*?sendBackground/,
   );
   assert.doesNotMatch(
     agentController,
@@ -1391,11 +1490,11 @@ test("Discord phone notifications keep webhooks private and bind display names e
   );
   assert.match(
     main,
-    /private notifyPhoneErrorOnce\(\)[\s\S]*phoneErrorNotifiedEpoch === this\.lifecycleEpoch[\s\S]*phoneNotificationLabels\([\s\S]*this\.projectId[\s\S]*this\.terminalId[\s\S]*createPhoneNotificationEventId\("terminal"\)/,
+    /private notifyPhoneErrorOnce\([\s\S]*phoneErrorNotifiedEpoch === this\.lifecycleEpoch[\s\S]*phoneNotificationLabels\([\s\S]*this\.projectId[\s\S]*this\.terminalId[\s\S]*createPhoneNotificationEventId\("terminal"\)/,
   );
   assert.match(
     main,
-    /exit\.exitCode !== null && exit\.exitCode !== 0[\s\S]*this\.notifyPhoneErrorOnce\(\)[\s\S]*this\.setState\([\s\S]*"exited"/,
+    /exit\.exitCode !== null && exit\.exitCode !== 0[\s\S]*this\.notifyPhoneErrorOnce\("terminalExit", exit\.sessionId\)[\s\S]*this\.setState\([\s\S]*"exited"/,
   );
   assert.match(main, /if \(this\.disposed \|\| this\.phoneErrorNotifiedEpoch === this\.lifecycleEpoch\) return/);
   assert.match(main, /return `\$\{prefix\}:\$\{Date\.now\(\)\}:\$\{phoneNotificationEventSequence\}`/);
@@ -1405,7 +1504,14 @@ test("Discord phone notifications keep webhooks private and bind display names e
   assert.match(backend, /Only official Discord webhook hosts are supported/);
   assert.match(backend, /project_name:\s*String/);
   assert.match(backend, /terminal_name:\s*String/);
+  assert.match(
+    backend,
+    /enum PhoneNotificationAgent \{[\s\S]*Powershell,[\s\S]*Codex,[\s\S]*Grok,[\s\S]*Claude,[\s\S]*Opencode,[\s\S]*Cline,[\s\S]*Cursor/,
+  );
+  assert.match(backend, /agent:\s*PhoneNotificationAgent/);
+  assert.match(backend, /model_name:\s*Option<String>/);
   assert.match(backend, /language:\s*Option<String>/);
+  assert.match(backend, /"embeds": \[\{[\s\S]*"fields": fields/);
   assert.match(backend, /"allowed_mentions": \{ "parse": \[\] \}/);
   assert.doesNotMatch(backend, /WinHttpQueryDataAvailable|WinHttpReadData/);
   assert.doesNotMatch(backend, /request\.(prompt|output|path|conversation|token|error_message)/i);
@@ -1707,7 +1813,7 @@ test("opt-in idle agent sleep preserves the active project and resumes only dura
   );
 });
 
-test("application chrome stays monochrome except for completion, safety, and usage alerts", async () => {
+test("application chrome stays monochrome except for scoped status and content-type accents", async () => {
   const styles = await source("src/styles.css");
   const completionAccentColors = new Set([
     "c7a34e",
@@ -1721,10 +1827,29 @@ test("application chrome stays monochrome except for completion, safety, and usa
     "df873f",
     "e05a5a",
   ]);
+  const contentBrowserAccentColors = new Set([
+    "b09a6a",
+    "9587ac",
+    "aa7d83",
+    "b48c66",
+    "7896aa",
+    "7f9b82",
+    "719a94",
+    "9385a5",
+    "a89568",
+    "8e9e79",
+    "aa7171",
+  ]);
+  assert.match(
+    styles,
+    /:is\(\.media-card, \.content-file-drag-ghost, \.media-card-file-icon\)\[data-file-family="code"\]/,
+    "content-type accents must remain scoped to content browser entries",
+  );
   const colors = [...styles.matchAll(/#([0-9a-f]{3,8})\b/gi)].map((match) => match[1]);
   assert.ok(colors.length > 0);
   for (const color of colors) {
     if (completionAccentColors.has(color.toLowerCase())) continue;
+    if (contentBrowserAccentColors.has(color.toLowerCase())) continue;
     const rgb = color.length === 3 || color.length === 4
       ? [...color.slice(0, 3)].map((channel) => Number.parseInt(channel + channel, 16))
       : [0, 2, 4].map((offset) => Number.parseInt(color.slice(offset, offset + 2), 16));
@@ -1876,9 +2001,97 @@ test("browser UI Pick copies bounded element context without granting remote IPC
   assert.doesNotMatch(capabilities, /ihc-browser/);
   assert.match(main, /listen<BrowserUiPickResult>\(\s*"browser-ui-pick-result"/);
   assert.match(main, /pane\.ownsWebviewLabel\(payload\.label\)/);
-  assert.match(main, /detectClipboardAgent\(\)/);
+  assert.match(main, /detectClipboardProvider\(\)/);
   assert.match(
     main,
     /snapshot\.text\.startsWith\("\[IHATECODING UI PICK\]"\)[\s\S]*sanitizeUiPickClipboardText\(snapshot\.text\)/,
   );
+});
+
+test("every terminal profile keeps xterm and PTY geometry identical", async () => {
+  const main = await source("src/main.ts");
+  assert.match(
+    main,
+    /invoke<StartTerminalResponse>\("start_terminal", \{[\s\S]*?columns: Math\.max\(2, this\.terminal\.cols\)/,
+  );
+  assert.match(
+    main,
+    /this\.latestResize = \{[\s\S]*?columns: Math\.max\(2, this\.terminal\.cols\)/,
+  );
+  assert.doesNotMatch(main, /terminalPtyColumns|launchProfile === "cline"[^\n]*columns/);
+});
+
+test("Android Emulator IPC is main-view scoped and launches only a freshly validated AVD directly", async () => {
+  const [lib, emulator] = await Promise.all([
+    source("src-tauri/src/lib.rs"),
+    source("src-tauri/src/android_emulator.rs"),
+  ]);
+
+  assert.match(lib, /mod android_emulator;/);
+  const handler = lib.match(
+    /\.invoke_handler\(tauri::generate_handler!\[([\s\S]*?)\]\)/,
+  );
+  assert.ok(handler);
+  for (const command of ["get_android_emulator_status", "launch_android_emulator"]) {
+    assert.match(handler[1], new RegExp(`\\b${command}\\b`));
+  }
+
+  const statusStart = emulator.indexOf("async fn get_android_emulator_status");
+  const launchStart = emulator.indexOf("async fn launch_android_emulator");
+  assert.ok(statusStart >= 0 && launchStart > statusStart);
+  const statusCommand = emulator.slice(statusStart, launchStart);
+  const launchCommand = emulator.slice(launchStart);
+  assert.match(
+    statusCommand,
+    /ensure_agent_main_webview\(&webview\)[\s\S]*spawn_blocking/,
+  );
+  assert.match(
+    launchCommand,
+    /ensure_agent_main_webview\(&webview\)[\s\S]*spawn_blocking/,
+  );
+
+  assert.match(emulator, /rename_all\s*=\s*"camelCase"/);
+  assert.match(emulator, /struct AndroidVirtualDevice[\s\S]*name:\s*String[\s\S]*running:\s*bool/);
+  assert.match(
+    emulator,
+    /struct AndroidEmulatorStatus[\s\S]*state:[\s\S]*avds:\s*Vec<AndroidVirtualDevice>/,
+  );
+  assert.match(
+    emulator,
+    /struct AndroidEmulatorLaunchResult[\s\S]*avd_name:\s*String[\s\S]*already_running:\s*bool[\s\S]*process_id:/,
+  );
+
+  assert.match(launchCommand, /query_avds\([\s\S]*validate_fresh_avd_name\(/);
+  assert.match(emulator, /const MAX_AVD_LIST_BYTES:[^\n]*64 \* 1024/);
+  assert.match(emulator, /output\.stdout\.len\(\) > MAX_AVD_LIST_BYTES/);
+  assert.match(emulator, /name\.len\(\) <= MAX_AVD_NAME_BYTES/);
+  assert.match(emulator, /name\.chars\(\)\.any\(char::is_control\)/);
+  assert.match(
+    emulator,
+    /fn validate_fresh_avd_name\([\s\S]*fresh_avds[\s\S]*(?:\.contains\(|\.iter\(\)[\s\S]*(?:any|find)\()/,
+  );
+  assert.match(
+    emulator,
+    /find_emulator_executable\([\s\S]*is_regular_non_reparse_file\(&emulator\)/,
+  );
+  assert.match(
+    emulator,
+    /fn is_regular_non_reparse_file\([\s\S]*symlink_metadata\([\s\S]*is_symlink\(\)[\s\S]*FILE_ATTRIBUTE_REPARSE_POINT/,
+  );
+  const listBuilderStart = emulator.indexOf("fn build_list_command");
+  const launchBuilderStart = emulator.indexOf("fn build_launch_command");
+  const launchBuilderEnd = emulator.indexOf("\nfn ", launchBuilderStart + 4);
+  assert.ok(
+    listBuilderStart >= 0 &&
+      launchBuilderStart > listBuilderStart &&
+      launchBuilderEnd > launchBuilderStart,
+  );
+  const listBuilder = emulator.slice(listBuilderStart, launchBuilderStart);
+  const launchBuilder = emulator.slice(launchBuilderStart, launchBuilderEnd);
+  assert.match(listBuilder, /Command::new\(emulator\)/);
+  assert.match(listBuilder, /\.arg\("-list-avds"\)/);
+  assert.match(launchBuilder, /Command::new\(emulator\)/);
+  assert.match(launchBuilder, /\.arg\("-avd"\)/);
+  assert.match(launchBuilder, /\.arg\((?:name|avd_name)\)/);
+  assert.doesNotMatch(emulator, /cmd(?:\.exe)?|powershell(?:\.exe)?|ComSpec|\/C\b|-Command\b/i);
 });

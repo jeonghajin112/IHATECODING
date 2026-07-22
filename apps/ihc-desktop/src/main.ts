@@ -21,6 +21,7 @@ import {
   StartScheduler,
   binaryStringToRawBytes,
   layoutFor,
+  layoutPlanFor,
   normalizeTerminalEvent,
   prepareTerminalPaste,
   type TerminalEvent,
@@ -37,6 +38,8 @@ import {
   projectBrowserPanes,
   projectEditorPanes,
   projectPaneOrder,
+  isValidClineSessionId,
+  workspaceTerminalClineSessionId,
   workspaceTerminalLaunchProfile,
   type PaneGeometry,
   type WorkspaceBrowserPane,
@@ -50,6 +53,7 @@ import {
 import { SourceEditorPane } from "./source-editor-pane";
 import {
   formatProviderResetCountdown,
+  decodeOsc52ClipboardText,
   formatDroppedFileReference,
   isTerminalCopyShortcut,
   isTerminalCtrlInsertShortcut,
@@ -61,8 +65,9 @@ import {
   providerUsageRemainingTone,
   planEditableTerminalSelectAll,
   planEditableTerminalSelectionDelete,
-  rectanglesOverlap,
+  clipRectangleAboveOverlay,
   scanTerminalLaunchControl,
+  scanTerminalCursorFrame,
   sanitizeUiPickClipboardText,
   selectDroppedFilePaths,
   selectClipboardImageSequence,
@@ -72,6 +77,7 @@ import {
   shouldOwnTerminalCopyFallback,
   TerminalLaunchPaintWatchdog,
   TerminalSelectionCopyGuard,
+  INITIAL_TERMINAL_CURSOR_FRAME_STATE,
   type AgentProvider,
   type DroppedFileProvider,
   type ProviderAccountListResponse,
@@ -79,6 +85,7 @@ import {
   type ProviderUsageResponse,
   type RectangleBounds,
   type SafeResumePlan,
+  type TerminalCursorFrameState,
 } from "./phase5-core";
 import {
   appLocale,
@@ -91,6 +98,15 @@ import {
   tr,
   type AppLanguage,
 } from "./i18n";
+import {
+  normalizeOpenAiStatusSnapshot,
+  openAiIncidentStatusLabel,
+  openAiStatusLabel,
+  openAiStatusTone,
+  shouldShowOpenAiStatusSummary,
+  type OpenAiStatusLevel,
+  type OpenAiStatusSnapshot,
+} from "./openai-status-core";
 import {
   agentTurnStartIdentity,
   getAutoSleepIdleAgents,
@@ -128,6 +144,40 @@ type StartTerminalResponse = {
   processId: number | null;
 };
 
+type AndroidEmulatorState =
+  | "ready"
+  | "emulatorMissing"
+  | "noVirtualDevices";
+
+type AndroidVirtualDevice = {
+  name: string;
+  running: boolean;
+};
+
+type AndroidEmulatorStatus = {
+  state: AndroidEmulatorState;
+  avds: AndroidVirtualDevice[];
+};
+
+type AndroidEmulatorLaunchResult = {
+  avdName: string;
+  alreadyRunning: boolean;
+  processId: number | null;
+};
+
+type AndroidEmulatorCommandError = {
+  code:
+    | "accessDenied"
+    | "workerFailed"
+    | "emulatorMissing"
+    | "avdListFailed"
+    | "noVirtualDevices"
+    | "invalidAvdName"
+    | "launchFailed";
+  message: string;
+  retryable: boolean;
+};
+
 type PaneState =
   | "queued"
   | "starting"
@@ -139,6 +189,11 @@ type PaneState =
 type StatusTone = "normal" | "error";
 
 type AgentTurnState = "unknown" | "working" | "idle";
+
+type ProfileLifecycleProvider = Extract<
+  WorkspaceTerminalLaunchProfile,
+  "claude" | "opencode" | "cline" | "cursor"
+>;
 
 type OutputBatch = Extract<TerminalEvent, { event: "output" }>["data"];
 type TerminalInput =
@@ -212,6 +267,8 @@ type PhoneNotificationSettings = {
 type PhoneNotificationLabels = {
   projectName: string;
   terminalName: string;
+  agent: WorkspaceTerminalLaunchProfile;
+  modelName: string | null;
 };
 
 type PhoneNotificationSettingsUpdate = {
@@ -229,8 +286,20 @@ type PhoneNotificationResult = {
   sent: boolean;
 };
 
-type AgentSettingsProvider = "codex" | "grok" | "claudeCode" | "openCode" | "cursor";
-type AgentSettingsLaunchProfile = "codex" | "grok" | "claude" | "opencode";
+type AgentSettingsProvider =
+  | "codex"
+  | "grok"
+  | "claudeCode"
+  | "openCode"
+  | "cursor"
+  | "cline";
+type AgentSettingsLaunchProfile =
+  | "codex"
+  | "grok"
+  | "claude"
+  | "opencode"
+  | "cline"
+  | "cursor";
 type AgentAuthenticationState =
   | "connected"
   | "credentialsPresent"
@@ -308,7 +377,6 @@ type AgentBrowserPaneDescriptor = {
   webviewLabel: string | null;
 };
 
-const OUTPUT_SETTLED_DELAY_MS = 120;
 const OUTPUT_RENDER_COALESCE_MS = 10;
 const OUTPUT_RENDER_MAX_BYTES = 64 * 1024;
 const FOREGROUND_OUTPUT_BURST_IDLE_MS = 48;
@@ -324,6 +392,7 @@ const ACK_RETRY_DELAYS_MS = [40, 120] as const;
 const COMPLETION_ROUTE_ACK_RETRY_DELAYS_MS = [150, 500, 1_500] as const;
 const AGENT_DISCOVERY_DELAYS_MS = [200, 400, 800, 1_500, 3_000, 6_000] as const;
 const AGENT_DISCOVERY_REARM_MS = 2_000;
+const CLINE_DISCOVERY_WINDOW_MS = 60_000;
 const AGENT_REBIND_PROBE_INTERVAL_MS = 1_000;
 const RESUME_HEALTH_DELAYS_MS = [2_500, 5_000, 7_500, 10_000] as const;
 const RESUME_HEALTH_FINAL_RECHECK_MS = 3_000;
@@ -338,6 +407,9 @@ const AGENT_EVENT_BIND_RETRY_DELAYS_MS = [
   15_000,
 ] as const;
 const PHONE_NOTIFICATION_RETRY_DELAYS_MS = [1_500, 4_000] as const;
+const MAX_ACTIVE_PROFILE_LIFECYCLE_SCOPES = 512;
+const MAX_ACTIVE_PROFILE_IDENTITIES_PER_SCOPE = 64;
+const PROFILE_FAILURE_EXIT_SUPPRESSION_MS = 10_000;
 const CLIPBOARD_READ_TIMEOUT_MS = 3_000;
 const TERMINAL_LAUNCH_PROBE_TTL_MS = 12_000;
 const TERMINAL_PAINT_WATCHDOG_POLL_MS = 120;
@@ -390,9 +462,12 @@ class TerminalPane {
     TERMINAL_SYNCHRONIZED_PAINT_LIMIT_MS,
   );
   private readonly selectionCopyGuard = new TerminalSelectionCopyGuard();
+  private readonly pendingSelectionModifierInputs: TerminalInput[] = [];
   private readonly unboundOutput: OutputBatch[] = [];
   private readonly pendingRenderBatches: OutputBatch[] = [];
   private launchEscapeTail = "";
+  private renderedCursorFrameState: TerminalCursorFrameState =
+    INITIAL_TERMINAL_CURSOR_FRAME_STATE;
   private readonly terminatedSessionIds = new Set<string>();
   private readonly startAbortController = new AbortController();
 
@@ -405,6 +480,10 @@ class TerminalPane {
   private statusTone: StatusTone = "normal";
   private lifecycleEpoch = 0;
   private phoneErrorNotifiedEpoch = -1;
+  private recentProfileFailure: {
+    runtimeSessionId: string;
+    recordedAtUnixMs: number;
+  } | null = null;
   private disposed = false;
   private catalogWritable = false;
   private titleEditCommitRequested = false;
@@ -413,10 +492,8 @@ class TerminalPane {
   private fitTimer = 0;
   private launchProbeExpiryTimer = 0;
   private launchPaintWatchdogTimer = 0;
-  private outputSettledTimer = 0;
   private exitGapTimer = 0;
   private unboundOutputTimer = 0;
-  private userBrowsingScrollback = false;
   private selectionGestureActive = false;
   private cursorClickSnapshot: CursorClickSnapshot | null = null;
   private webLinkActivationVersion = 0;
@@ -427,7 +504,6 @@ class TerminalPane {
   private terminalPaintedVersion = 0;
   private lastForegroundOutputAt = Number.NEGATIVE_INFINITY;
   private lastForcedForegroundPaintAt = Number.NEGATIVE_INFINITY;
-  private interactionEpoch = 0;
   private exitBarrierVersion = 0;
   private pendingExit: {
     sessionId: string;
@@ -445,6 +521,10 @@ class TerminalPane {
   private readonly launchProfile: WorkspaceTerminalLaunchProfile;
   private agentConversationId: string | null;
   private agentConversationBound: boolean;
+  private clineSessionId: string | null;
+  private clineSessionPersistPending = false;
+  private clineDiscoveryNotBeforeUnixMs = Date.now();
+  private clineDiscoveryDeadlineUnixMs = 0;
   private agentTurnState: AgentTurnState = "unknown";
   private agentIdleSinceUnixMs: number | null = null;
   private agentInputAwaitingTurnStart = false;
@@ -487,10 +567,6 @@ class TerminalPane {
     this.selectionCopyGuard.captureLiveSelection(this.liveTerminalSelection());
     this.cursorClickSnapshot = null;
     this.selectionGestureActive = false;
-    this.invalidatePendingFollow();
-    if (!this.terminal.hasSelection() && this.isAtBottom()) {
-      this.userBrowsingScrollback = false;
-    }
     if (snapshot) {
       window.setTimeout(() => {
         if (this.webLinkActivationVersion !== linkActivationVersion) return;
@@ -502,10 +578,10 @@ class TerminalPane {
   private readonly onWindowBlur = () => {
     this.copyShortcutReleasePending = false;
     this.editableShortcutReleasePending = null;
+    this.discardPendingSelectionModifierInputs();
     if (!this.selectionGestureActive) return;
     this.selectionGestureActive = false;
     this.cursorClickSnapshot = null;
-    this.invalidatePendingFollow();
   };
 
   private readonly onWindowFocus = () => {
@@ -562,12 +638,24 @@ class TerminalPane {
     this.title = savedState.name;
     this.startDirectory = savedState.startDirectory;
     this.agentProvider =
-      resumePlan.action === "resume" ? resumePlan.provider : null;
+      resumePlan.action === "resume" &&
+      (resumePlan.provider === "codex" || resumePlan.provider === "grok")
+        ? resumePlan.provider
+        : null;
     this.launchProfile = workspaceTerminalLaunchProfile(savedState);
+    this.clineSessionId =
+      resumePlan.action !== "blocked"
+        ? workspaceTerminalClineSessionId(savedState)
+        : null;
     this.agentConversationId =
-      resumePlan.action === "resume" ? resumePlan.conversationId : null;
-    this.agentConversationBound = resumePlan.action === "resume";
-    if (resumedFromAutoSleep && resumePlan.action === "resume") {
+      resumePlan.action === "resume" &&
+      (resumePlan.provider === "codex" || resumePlan.provider === "grok")
+        ? resumePlan.conversationId
+        : null;
+    this.agentConversationBound =
+      resumePlan.action === "resume" &&
+      (resumePlan.provider === "codex" || resumePlan.provider === "grok");
+    if (resumedFromAutoSleep && this.agentConversationBound) {
       // Auto-sleep is entered only from an explicitly idle, settled turn. Seed
       // that durable state after recreation because providers do not always
       // replay an idle lifecycle edge when a conversation is resumed.
@@ -722,6 +810,7 @@ class TerminalPane {
       lineHeight: 1.08,
       letterSpacing: 0,
       scrollback: 10_000,
+      scrollOnUserInput: false,
       smoothScrollDuration: 0,
       rightClickSelectsWord: false,
       linkHandler: {
@@ -870,8 +959,27 @@ class TerminalPane {
     return this.completionPending;
   }
 
+  phoneNotificationAgentProfile(
+    provider: WorkspaceTerminalLaunchProfile | null = null,
+  ): WorkspaceTerminalLaunchProfile {
+    return provider ?? this.agentProvider ?? this.launchProfile;
+  }
+
   ownsRuntimeSession(sessionId: string) {
     return this.sessionId === sessionId;
+  }
+
+  noteProfileAgentOutcome(
+    runtimeSessionId: string,
+    succeeded: boolean,
+    phoneNotificationQueued: boolean,
+  ) {
+    if (!this.ownsRuntimeSession(runtimeSessionId)) return false;
+    this.recentProfileFailure =
+      !succeeded && phoneNotificationQueued
+        ? { runtimeSessionId, recordedAtUnixMs: Date.now() }
+        : null;
+    return true;
   }
 
   matchesAgentConversation(provider: AgentProvider, conversationId: string) {
@@ -1050,6 +1158,8 @@ class TerminalPane {
 
   private async start() {
     const epoch = ++this.lifecycleEpoch;
+    this.recentProfileFailure = null;
+    this.renderedCursorFrameState = INITIAL_TERMINAL_CURSOR_FRAME_STATE;
     window.clearTimeout(this.safetyBufferingDismissTimer);
     this.safetyBufferingDismissTimer = 0;
     this.safetyBufferingScreenVisible = false;
@@ -1059,6 +1169,7 @@ class TerminalPane {
     this.setState("queued", tr("Waiting to start", "시작 대기 중"));
 
     try {
+      await this.prepareClineResumeTarget(epoch);
       await this.scheduler.run(async (signal) => {
         if (signal?.aborted || this.disposed || epoch !== this.lifecycleEpoch) {
           throw new CancelledStart();
@@ -1098,6 +1209,7 @@ class TerminalPane {
         };
 
         this.runtimeStartedAtUnixMs = Date.now();
+        this.clineDiscoveryNotBeforeUnixMs = this.runtimeStartedAtUnixMs;
         const result = await invoke<StartTerminalResponse>("start_terminal", {
           cwd: this.startDirectory,
           columns: Math.max(2, this.terminal.cols),
@@ -1108,10 +1220,13 @@ class TerminalPane {
               terminalId: this.terminalId,
             },
             launchProfile: this.launchProfile,
+            clineSessionId:
+              this.launchProfile === "cline" ? this.clineSessionId : null,
             useEmbeddedBrowserTools: getUseEmbeddedBrowserTools(),
             resume:
               this.resumePlan.action === "resume" &&
-              this.resumePlan.provider &&
+              (this.resumePlan.provider === "codex" ||
+                this.resumePlan.provider === "grok") &&
               this.resumePlan.conversationId
                 ? {
                     provider: this.resumePlan.provider,
@@ -1132,6 +1247,7 @@ class TerminalPane {
         if (this.paneState !== "running") {
           this.setState("running", "");
         }
+        if (this.launchProfile === "cline") this.scheduleAgentDiscovery(true);
         this.scheduleFit(0);
       }, this.startAbortController.signal, () =>
         this.workspace.startPriority(this.projectId),
@@ -1170,7 +1286,7 @@ class TerminalPane {
     if (!commit || paths.length === 0) return 0;
 
     this.workspace.acknowledgePaneCompletion(this.id);
-    this.resumeAutoFollowForUserIntent();
+    this.prepareTerminalForUserIntent();
     this.terminal.focus();
     const provider = await this.detectDroppedFileProvider();
     if (this.disposed) {
@@ -1378,7 +1494,6 @@ class TerminalPane {
     window.clearTimeout(this.launchProbeExpiryTimer);
     window.clearTimeout(this.launchPaintWatchdogTimer);
     this.launchPaintWatchdog.clear();
-    window.clearTimeout(this.outputSettledTimer);
     window.clearTimeout(this.exitGapTimer);
     window.clearTimeout(this.unboundOutputTimer);
     window.clearTimeout(this.completionBarrierTimer);
@@ -1412,6 +1527,7 @@ class TerminalPane {
     this.unboundOutput.length = 0;
     this.unboundOutputBytes = 0;
     this.pendingRenderBatches.length = 0;
+    this.discardPendingSelectionModifierInputs();
     this.selectionCopyGuard.invalidate();
     this.terminal.dispose();
     return stopBarrier;
@@ -1422,6 +1538,19 @@ class TerminalPane {
   }
 
   private installTerminalInputHandlers() {
+    this.terminalDisposables.push(
+      this.terminal.parser.registerOscHandler(52, (data) => {
+        if (this.launchProfile !== "cline") return false;
+        const selection = decodeOsc52ClipboardText(data);
+        if (selection === null) return false;
+        // Cline/OpenTUI owns alternate-screen mouse selection and publishes it
+        // through OSC 52 instead of xterm's DOM selection. Retain the same text
+        // so a habitual Ctrl+C is consumed as copy rather than sent as ETX,
+        // which would otherwise clear/redraw the conversation.
+        this.selectionCopyGuard.captureLiveSelection(selection);
+        return true;
+      }),
+    );
     this.terminal.attachCustomKeyEventHandler((event) => {
       if (event.type === "keyup") {
         if (
@@ -1473,12 +1602,6 @@ class TerminalPane {
         if (!event.repeat) void this.pasteClipboard();
         return consume();
       }
-      if (
-        event.shiftKey &&
-        (key === "pageup" || key === "pagedown" || key === "home" || key === "end")
-      ) {
-        if (key === "pageup" || key === "home") this.pauseAutoFollow();
-      }
       return true;
     });
 
@@ -1504,6 +1627,7 @@ class TerminalPane {
           this.liveTerminalSelection(),
         );
         if (selectedCopy !== null) {
+          this.discardPendingSelectionModifierInputs();
           void this.copySelection(selectedCopy);
           return;
         }
@@ -1511,9 +1635,10 @@ class TerminalPane {
         // C record. Relay that protocol state without treating it as editing:
         // clearing the selection here would turn the next Ctrl+C into ETX.
         if (isTerminalModifierOnlyInput(data)) {
-          this.queueInput({ kind: "text", data });
+          this.holdOrForwardTerminalModifierInput({ kind: "text", data });
           return;
         }
+        this.flushPendingSelectionModifierInputs();
         this.forwardTerminalTextInput(data);
       }),
       this.terminal.onBinary((data) => {
@@ -1522,26 +1647,22 @@ class TerminalPane {
           this.liveTerminalSelection(),
         );
         if (selectedCopy !== null) {
+          this.discardPendingSelectionModifierInputs();
           void this.copySelection(selectedCopy);
           return;
         }
         if (isTerminalModifierOnlyInput(data)) {
-          this.queueInput({ kind: "binary", data: binaryStringToRawBytes(data) });
+          this.holdOrForwardTerminalModifierInput({
+            kind: "binary",
+            data: binaryStringToRawBytes(data),
+          });
           return;
         }
-        this.resumeAutoFollowForUserIntent();
+        this.flushPendingSelectionModifierInputs();
+        this.prepareTerminalForUserIntent();
         const bytes = binaryStringToRawBytes(data);
         this.queueInput({ kind: "binary", data: bytes });
         this.scheduleAgentDiscovery(false);
-      }),
-      this.terminal.onScroll(() => {
-        const browsing = !this.isAtBottom();
-        if (browsing !== this.userBrowsingScrollback) {
-          this.userBrowsingScrollback = browsing;
-          this.invalidatePendingFollow();
-        } else if (browsing) {
-          window.clearTimeout(this.outputSettledTimer);
-        }
       }),
       this.terminal.onSelectionChange(() => {
         const selection = this.liveTerminalSelection();
@@ -1550,19 +1671,7 @@ class TerminalPane {
           this.selectionCopyGuard.captureLiveSelection(selection);
         }
         this.copyButton.hidden = !hasSelection;
-        if (hasSelection) this.pauseAutoFollow();
       }),
-    );
-
-    this.viewport.addEventListener(
-      "keydown",
-      (event) => {
-        if (this.consumeSelectionCopyShortcut(event)) return;
-        if (isTerminalInputIntentKey(event, this.terminal.hasSelection())) {
-          this.resumeAutoFollowForUserIntent();
-        }
-      },
-      true,
     );
 
     this.viewport.addEventListener(
@@ -1577,24 +1686,14 @@ class TerminalPane {
         }
         event.preventDefault();
         event.stopImmediatePropagation();
-        this.pauseAutoFollow();
       },
       true,
-    );
-
-    this.viewport.addEventListener(
-      "wheel",
-      (event) => {
-        if (event.deltaY < 0) this.pauseAutoFollow();
-      },
-      { passive: true },
     );
     this.viewport.addEventListener("mousedown", (event) => {
       if (event.button === 0) {
         this.selectionCopyGuard.beginPointerGesture();
         this.cursorClickSnapshot = this.captureCursorClick(event);
         this.selectionGestureActive = true;
-        this.invalidatePendingFollow();
       }
     });
     this.viewport.addEventListener("contextmenu", (event) => {
@@ -1625,6 +1724,7 @@ class TerminalPane {
       liveSelection,
     );
     if (selection === null) return false;
+    this.discardPendingSelectionModifierInputs();
     this.copyShortcutReleasePending = true;
     event.preventDefault();
     if (immediate) event.stopImmediatePropagation();
@@ -1632,6 +1732,34 @@ class TerminalPane {
     if (!event.repeat) void this.copySelection(selection);
     if (!liveSelection) this.selectionCopyGuard.invalidate();
     return true;
+  }
+
+  matchesProfileLifecycleProvider(provider: ProfileLifecycleProvider) {
+    return this.launchProfile === provider;
+  }
+
+  private holdOrForwardTerminalModifierInput(input: TerminalInput) {
+    if (this.selectionCopyGuard.hasCopySelection(this.liveTerminalSelection())) {
+      // Win32/Kitty keyboard modes can emit the Control key before the encoded
+      // Ctrl+C record. Hold that protocol state so a full-screen TUI cannot
+      // redraw or clear itself before IHATECODING consumes the copy command.
+      // For a different shortcut, replay the buffered state immediately before
+      // forwarding its actual key record.
+      this.pendingSelectionModifierInputs.push(input);
+      return;
+    }
+    this.flushPendingSelectionModifierInputs();
+    this.queueInput(input);
+  }
+
+  private flushPendingSelectionModifierInputs() {
+    if (this.pendingSelectionModifierInputs.length === 0) return;
+    const pending = this.pendingSelectionModifierInputs.splice(0);
+    for (const input of pending) this.queueInput(input);
+  }
+
+  private discardPendingSelectionModifierInputs() {
+    this.pendingSelectionModifierInputs.length = 0;
   }
 
   private ownsTerminalKeyboardEvent(event: KeyboardEvent) {
@@ -1711,7 +1839,7 @@ class TerminalPane {
     this.selectionCopyGuard.invalidate();
     this.armInteractiveLaunchPaintProbeForSubmittedInput(data);
     this.noteEditableUserInput(data);
-    this.resumeAutoFollowForUserIntent();
+    this.prepareTerminalForUserIntent();
     this.queueInput({ kind: "text", data });
     this.scheduleAgentDiscovery(data.includes("\r") || data.includes("\n"));
   }
@@ -1823,7 +1951,10 @@ class TerminalPane {
     this.fitTerminal();
     this.queueCurrentSize();
     const core = this.pinnedXtermCore();
-    if (this.terminal.modes.synchronizedOutputMode) {
+    if (
+      this.terminal.modes.synchronizedOutputMode &&
+      !this.renderedCursorFrameState.synchronizedOutputActive
+    ) {
       try {
         // Release only the pinned renderer flag. Feeding a synthetic escape
         // through xterm.writeSync can replay already-parsed queued chunks.
@@ -1903,7 +2034,13 @@ class TerminalPane {
     } catch {
       // A public refresh below is still useful when the renderer is not paused.
     }
-    if (!forceRefresh) return;
+    if (
+      !forceRefresh ||
+      this.renderedCursorFrameState.synchronizedOutputActive ||
+      this.terminal.modes.synchronizedOutputMode
+    ) {
+      return;
+    }
     try {
       if (core?.refresh) core.refresh(0, Math.max(0, this.terminal.rows - 1), true);
       else this.terminal.refresh(0, Math.max(0, this.terminal.rows - 1));
@@ -2114,7 +2251,6 @@ class TerminalPane {
         range.endColumn - range.startColumn,
       );
       this.selectionCopyGuard.captureLiveSelection(this.liveTerminalSelection());
-      this.pauseAutoFollow();
       return true;
     }
 
@@ -2175,10 +2311,9 @@ class TerminalPane {
         range.endColumn - range.startColumn,
       );
       this.selectionCopyGuard.captureLiveSelection(this.liveTerminalSelection());
-      this.pauseAutoFollow();
       return true;
     }
-    this.resumeAutoFollowForUserIntent();
+    this.prepareTerminalForUserIntent();
     this.queueInput({ kind: "text", data: encodedDeletion });
     this.scheduleAgentDiscovery(false);
     return true;
@@ -2381,7 +2516,7 @@ class TerminalPane {
     // with output or another user action.
     const encodedMovement = captured.join("");
     if (!encodedMovement) return;
-    this.resumeAutoFollowForUserIntent();
+    this.prepareTerminalForUserIntent();
     this.queueInput({ kind: "text", data: encodedMovement });
     this.scheduleAgentDiscovery(false);
   }
@@ -2394,6 +2529,7 @@ class TerminalPane {
         if (this.terminatedSessionIds.has(message.data.sessionId)) return;
         if (!this.bindSession(message.data.sessionId)) return;
         this.setState("running", "");
+        if (this.launchProfile === "cline") this.scheduleAgentDiscovery(true);
         this.scheduleFit(0);
         break;
 
@@ -2615,6 +2751,7 @@ class TerminalPane {
       const labels = this.workspace.phoneNotificationLabels(
         this.projectId,
         this.terminalId,
+        "codex",
       );
       if (labels) {
         this.workspace.setFooterStatus(
@@ -2656,11 +2793,11 @@ class TerminalPane {
   private async drainPendingRenderBatches() {
     let rendering: OutputBatch[] = [];
     try {
-      // A Codex TUI redraw can cross the Rust output dispatcher's 8 ms batch
-      // boundary. Briefly collect adjacent batches so xterm never paints the
-      // intermediate cleared composer between those fragments. The first
-      // output after Enter is deliberately exempt: waiting on a WebView timer
-      // here can strand an already-running CLI until the window loses focus.
+      // Background panes coalesce adjacent output to reduce renderer work.
+      // Foreground and launch-sensitive writes stay timer-free so a parked
+      // WebView timer cannot hold output or cumulative ACKs. xterm's native DEC
+      // synchronized-output mode keeps Codex redraws atomic; the explicit
+      // refresh path below respects that frame boundary.
       if (
         !this.shouldDirectPaintOutput() &&
         !this.launchPaintWatchdog.shouldBypassRenderTimers
@@ -2706,9 +2843,14 @@ class TerminalPane {
 
   private async renderOutputBatches(batches: readonly OutputBatch[]) {
     if (this.disposed || this.terminalFailed) return;
-    const shouldFollow = this.canAutoFollow() && this.isAtBottom();
-    const writeEpoch = this.interactionEpoch;
     const data = batches.map((batch) => batch.data).join("");
+    const cursorFrameStateAfterWrite = scanTerminalCursorFrame(
+      this.renderedCursorFrameState,
+      data,
+    );
+    const synchronizedFrameOpen = cursorFrameStateAfterWrite.synchronizedOutputActive;
+    const incompleteCursorFrame =
+      synchronizedFrameOpen || cursorFrameStateAfterWrite.waitingForCursorPosition;
     const bufferTypeBeforeWrite = this.terminal.buffer.active.type;
     // Scan at the actual write boundary. Scanning all accepted batches earlier
     // lets a control-free 64 KiB slice consume a probe that belongs to a later
@@ -2738,6 +2880,12 @@ class TerminalPane {
       ? this.observeInteractiveLaunchOutput(false, expectedRenderVersion)
       : false;
 
+    // Publish the raw DEC frame state before xterm starts parsing. This closes
+    // the narrow interval where xterm could already have entered synchronized
+    // output while a delayed write callback still exposed the previous state
+    // to focus/layout/watchdog refresh paths. On a closing fragment xterm's
+    // native synchronizedOutputMode remains the second guard until parsing ends.
+    this.renderedCursorFrameState = cursorFrameStateAfterWrite;
     await new Promise<void>((resolve) => {
       this.terminal.write(data, () => {
         this.terminalRenderVersion = expectedRenderVersion;
@@ -2751,6 +2899,7 @@ class TerminalPane {
         const paintCheckedAt = performance.now();
         const forceForegroundRefresh =
           directPaint &&
+          !incompleteCursorFrame &&
           shouldForceDirectTerminalRefresh(
             {
               hasUnpaintedOutput:
@@ -2762,21 +2911,12 @@ class TerminalPane {
             FOREGROUND_FORCED_REFRESH_INTERVAL_MS,
           );
         if (
-          forceForegroundRefresh ||
-          (launchSensitiveWrite && observedLaunchCheckpoint)
+          !incompleteCursorFrame &&
+          (forceForegroundRefresh ||
+            (launchSensitiveWrite && observedLaunchCheckpoint))
         ) {
           this.lastForcedForegroundPaintAt = paintCheckedAt;
           this.resumePinnedXtermRenderer(true);
-        }
-        if (
-          !this.disposed &&
-          !this.terminalFailed &&
-          shouldFollow &&
-          writeEpoch === this.interactionEpoch &&
-          this.canAutoFollow() &&
-          !this.isAtBottom()
-        ) {
-          this.terminal.scrollToBottom();
         }
         this.lastRenderedOutputAt = performance.now();
         this.observeCodexSafetyBufferingScreen();
@@ -2801,7 +2941,6 @@ class TerminalPane {
     if (sequenceToAck !== null) {
       void this.sendCumulativeAck(batches[0].sessionId, sequenceToAck);
     }
-    this.scheduleSettledFollow(shouldFollow, writeEpoch);
   }
 
   private async sendCumulativeAck(targetSessionId: string, sequence: number) {
@@ -2971,54 +3110,14 @@ class TerminalPane {
     return buffer.viewportY === buffer.baseY;
   }
 
-  private canAutoFollow() {
-    return (
-      !this.userBrowsingScrollback &&
-      !this.selectionGestureActive &&
-      !this.terminal.hasSelection()
-    );
-  }
-
-  private invalidatePendingFollow() {
-    this.interactionEpoch += 1;
-    window.clearTimeout(this.outputSettledTimer);
-  }
-
-  private pauseAutoFollow() {
-    this.userBrowsingScrollback = true;
-    this.invalidatePendingFollow();
-  }
-
-  private resumeAutoFollowForUserIntent() {
-    this.userBrowsingScrollback = false;
+  private prepareTerminalForUserIntent() {
     this.selectionGestureActive = false;
     if (this.terminal.hasSelection()) this.terminal.clearSelection();
-    this.invalidatePendingFollow();
-    if (!this.isAtBottom()) this.terminal.scrollToBottom();
-  }
-
-  private scheduleSettledFollow(shouldFollow: boolean, writeEpoch: number) {
-    window.clearTimeout(this.outputSettledTimer);
-    if (!shouldFollow || this.disposed) return;
-    this.outputSettledTimer = window.setTimeout(() => {
-      // An empty xterm write creates its own zero-delay parser timer. If real
-      // PTY output arrives in that tiny window, it can become trapped behind
-      // the empty write until WebView2 receives an unrelated focus event.
-      if (
-        !this.disposed &&
-        writeEpoch === this.interactionEpoch &&
-        this.canAutoFollow() &&
-        !this.isAtBottom()
-      ) {
-        this.terminal.scrollToBottom();
-      }
-    }, OUTPUT_SETTLED_DELAY_MS);
   }
 
   private async copySelection(retainedText?: string) {
     const text = retainedText ?? this.terminal.getSelection();
     if (!text) return false;
-    this.pauseAutoFollow();
     try {
       await invoke("write_clipboard_text", { text });
       return true;
@@ -3076,7 +3175,7 @@ class TerminalPane {
     window.setTimeout(() => {
       if (this.disposed) return;
       this.workspace.acknowledgePaneCompletion(this.id);
-      this.resumeAutoFollowForUserIntent();
+      this.prepareTerminalForUserIntent();
       const commit = this.reserveInputSlot();
       if (!commit) return;
       void inputReady.then(({ input, error }) => {
@@ -3098,7 +3197,7 @@ class TerminalPane {
   private scheduleResumeHealthCheck() {
     if (
       this.resumePlan.action !== "resume" ||
-      !this.resumePlan.provider ||
+      (this.resumePlan.provider !== "codex" && this.resumePlan.provider !== "grok") ||
       !this.resumePlan.conversationId ||
       !this.sessionId ||
       this.disposed ||
@@ -3167,6 +3266,10 @@ class TerminalPane {
   }
 
   private scheduleAgentDiscovery(reset: boolean) {
+    if (this.launchProfile === "cline") {
+      this.scheduleClineSessionDiscovery(reset);
+      return;
+    }
     if (
       this.disposed ||
       this.terminalFailed ||
@@ -3229,6 +3332,174 @@ class TerminalPane {
       this.agentDiscoveryTimer = 0;
       void this.discoverAgentConversation();
     }, delayMs);
+  }
+
+  private scheduleClineSessionDiscovery(reset: boolean) {
+    const now = Date.now();
+    if (
+      this.disposed ||
+      this.terminalFailed ||
+      !this.sessionId ||
+      this.paneState !== "running"
+    ) {
+      return;
+    }
+    if (reset) {
+      this.clineDiscoveryDeadlineUnixMs = now + CLINE_DISCOVERY_WINDOW_MS;
+      this.agentDiscoveryAttempts = 0;
+      window.clearTimeout(this.agentDiscoveryTimer);
+      this.agentDiscoveryTimer = 0;
+    }
+    if (now >= this.clineDiscoveryDeadlineUnixMs) return;
+    if (
+      this.agentDiscoveryAttempts >= AGENT_DISCOVERY_DELAYS_MS.length &&
+      now - this.agentDiscoveryLastAttemptAt >= AGENT_DISCOVERY_REARM_MS
+    ) {
+      this.agentDiscoveryAttempts = 0;
+    }
+    if (
+      this.agentDiscoveryAttempts >= AGENT_DISCOVERY_DELAYS_MS.length &&
+      !this.agentDiscoveryPending &&
+      this.agentDiscoveryTimer === 0
+    ) {
+      const remainingMs = Math.max(
+        250,
+        AGENT_DISCOVERY_REARM_MS - (now - this.agentDiscoveryLastAttemptAt),
+      );
+      if (now + remainingMs >= this.clineDiscoveryDeadlineUnixMs) return;
+      this.agentDiscoveryTimer = window.setTimeout(() => {
+        this.agentDiscoveryTimer = 0;
+        this.agentDiscoveryAttempts = 0;
+        void this.discoverClineSession();
+      }, remainingMs);
+      return;
+    }
+    if (
+      this.agentDiscoveryPending ||
+      this.agentDiscoveryTimer !== 0 ||
+      this.agentDiscoveryAttempts >= AGENT_DISCOVERY_DELAYS_MS.length
+    ) {
+      return;
+    }
+    const delayMs = AGENT_DISCOVERY_DELAYS_MS[this.agentDiscoveryAttempts];
+    this.agentDiscoveryAttempts += 1;
+    this.agentDiscoveryTimer = window.setTimeout(() => {
+      this.agentDiscoveryTimer = 0;
+      void this.discoverClineSession();
+    }, delayMs);
+  }
+
+  private async discoverClineSession() {
+    const runtimeSessionId = this.sessionId;
+    if (
+      !runtimeSessionId ||
+      this.disposed ||
+      this.terminalFailed ||
+      this.agentDiscoveryPending
+    ) {
+      return;
+    }
+    this.agentDiscoveryPending = true;
+    this.agentDiscoveryLastAttemptAt = Date.now();
+    let retry = false;
+    try {
+      const sessionId = await invoke<string | null>("discover_cline_session", {
+        request: {
+          sessionId: runtimeSessionId,
+          cwd: this.startDirectory,
+          notBeforeUtc: new Date(this.clineDiscoveryNotBeforeUnixMs).toISOString(),
+          currentSessionId: this.clineSessionId,
+        },
+      });
+      if (!sessionId) {
+        retry = true;
+        return;
+      }
+      if (!isValidClineSessionId(sessionId)) {
+        throw new Error(
+          tr(
+            "The Cline session discovery response is invalid.",
+            "Cline 세션 검색 응답이 올바르지 않습니다.",
+          ),
+        );
+      }
+      if (sessionId === this.clineSessionId) return;
+      const saved = await this.persistClineSession(sessionId, runtimeSessionId);
+      retry = !saved;
+    } catch (error) {
+      retry = true;
+      if (!this.disposed && this.sessionId === runtimeSessionId) {
+        this.setStatusOnly(
+          tr(
+            `Retrying Cline session reconnect: ${String(error)}`,
+            `Cline 세션 자동 연결 재시도 중: ${String(error)}`,
+          ),
+          "error",
+        );
+      }
+    } finally {
+      this.agentDiscoveryPending = false;
+      if (retry) this.scheduleClineSessionDiscovery(false);
+    }
+  }
+
+  private async persistClineSession(
+    sessionId: string,
+    runtimeSessionId: string,
+  ): Promise<boolean> {
+    if (
+      this.clineSessionPersistPending ||
+      this.disposed ||
+      this.sessionId !== runtimeSessionId ||
+      !isValidClineSessionId(sessionId)
+    ) {
+      return false;
+    }
+    this.clineSessionPersistPending = true;
+    try {
+      const saved = await this.workspace.associateClineSession(
+        this.projectId,
+        this.terminalId,
+        runtimeSessionId,
+        sessionId,
+      );
+      if (saved && !this.disposed && this.sessionId === runtimeSessionId) {
+        this.clineSessionId = sessionId;
+        window.clearTimeout(this.agentDiscoveryTimer);
+        this.agentDiscoveryTimer = 0;
+        return true;
+      }
+      return false;
+    } finally {
+      this.clineSessionPersistPending = false;
+    }
+  }
+
+  private async prepareClineResumeTarget(epoch: number): Promise<void> {
+    const savedSessionId = this.clineSessionId;
+    if (this.launchProfile !== "cline" || !savedSessionId) return;
+    const exists = await invoke<boolean>("cline_session_exists", {
+      sessionId: savedSessionId,
+    });
+    if (this.disposed || epoch !== this.lifecycleEpoch) throw new CancelledStart();
+    if (exists) return;
+
+    const cleared = await this.workspace.invalidateClineSession(
+      this.projectId,
+      this.terminalId,
+      savedSessionId,
+      this,
+    );
+    if (this.disposed || epoch !== this.lifecycleEpoch) throw new CancelledStart();
+    if (!cleared) {
+      throw new Error(
+        tr(
+          "The unavailable Cline session could not be removed safely.",
+          "사용할 수 없는 Cline 세션을 안전하게 정리하지 못했습니다.",
+        ),
+      );
+    }
+    if (this.clineSessionId === savedSessionId) this.clineSessionId = null;
   }
 
   private async discoverAgentConversation() {
@@ -3431,13 +3702,13 @@ class TerminalPane {
     );
 
     if (snapshot.kind === "image") {
-      const provider = await this.detectClipboardAgent();
+      const provider = await this.detectClipboardProvider();
       const sequence = selectClipboardImageSequence(provider);
       if (!sequence) {
         this.setStatusOnly(
           tr(
-            "Start Codex or Grok in this PowerShell before pasting an image.",
-            "이미지를 붙여넣으려면 이 PowerShell에서 Codex 또는 Grok을 먼저 실행하세요.",
+            "Start a supported AI agent in this terminal before pasting an image.",
+            "이미지를 붙여넣으려면 이 터미널에서 지원되는 AI 에이전트를 먼저 실행하세요.",
           ),
           "error",
         );
@@ -3449,11 +3720,11 @@ class TerminalPane {
 
     if (snapshot.kind === "empty" || !snapshot.text) return null;
     const uiPick = snapshot.text.startsWith("[IHATECODING UI PICK]");
-    if (uiPick && !(await this.detectClipboardAgent())) {
+    if (uiPick && !(await this.detectClipboardProvider())) {
       this.setStatusOnly(
         tr(
-          "Start Codex or Grok in this PowerShell before pasting UI Pick context.",
-          "UI Pick 정보를 붙여넣으려면 이 PowerShell에서 Codex 또는 Grok을 먼저 실행하세요.",
+          "Start a supported AI agent in this terminal before pasting UI Pick context.",
+          "UI Pick 정보를 붙여넣으려면 이 터미널에서 지원되는 AI 에이전트를 먼저 실행하세요.",
         ),
         "error",
       );
@@ -3468,13 +3739,22 @@ class TerminalPane {
     };
   }
 
-  private async detectClipboardAgent(): Promise<AgentProvider | null> {
+  private async detectClipboardProvider(): Promise<DroppedFileProvider | null> {
     const sessionId = this.sessionId;
-    if (!sessionId) return null;
+    const launchProvider: DroppedFileProvider | null =
+      this.launchProfile === "codex" ||
+      this.launchProfile === "grok" ||
+      this.launchProfile === "claude" ||
+      this.launchProfile === "opencode" ||
+      this.launchProfile === "cline" ||
+      this.launchProfile === "cursor"
+        ? this.launchProfile
+        : null;
+    if (!sessionId) return launchProvider;
     const detected = await invoke<AgentProvider | null>("detect_terminal_agent", {
       sessionId,
     }).catch(() => null);
-    if (detected !== "codex" && detected !== "grok") return null;
+    if (detected !== "codex" && detected !== "grok") return launchProvider;
     if (
       this.agentProvider &&
       this.agentProvider !== detected &&
@@ -3495,7 +3775,9 @@ class TerminalPane {
       this.launchProfile === "codex" ||
       this.launchProfile === "grok" ||
       this.launchProfile === "claude" ||
-      this.launchProfile === "opencode"
+      this.launchProfile === "opencode" ||
+      this.launchProfile === "cline" ||
+      this.launchProfile === "cursor"
         ? this.launchProfile
         : null;
     if (!sessionId) return launchProvider;
@@ -3537,8 +3819,9 @@ class TerminalPane {
         this.resumeHealthTimer = 0;
         this.workspace.releaseSession(exit.sessionId, this.id);
         if (this.sessionId === exit.sessionId) this.sessionId = null;
+        this.renderedCursorFrameState = INITIAL_TERMINAL_CURSOR_FRAME_STATE;
         if (exit.exitCode !== null && exit.exitCode !== 0) {
-          this.notifyPhoneErrorOnce();
+          this.notifyPhoneErrorOnce("terminalExit", exit.sessionId);
         }
         this.editableAnchor = null;
         this.editableShortcutReleasePending = null;
@@ -3615,6 +3898,7 @@ class TerminalPane {
     if (this.sessionId) this.workspace.releaseSession(this.sessionId, this.id);
     this.sessionId = null;
     this.unboundSessionId = null;
+    this.renderedCursorFrameState = INITIAL_TERMINAL_CURSOR_FRAME_STATE;
     this.unboundOutput.length = 0;
     this.unboundOutputBytes = 0;
     this.setState("error", message, "error");
@@ -3628,8 +3912,23 @@ class TerminalPane {
     if (state === "error") this.notifyPhoneErrorOnce();
   }
 
-  private notifyPhoneErrorOnce() {
+  private notifyPhoneErrorOnce(
+    source: "terminal" | "terminalExit" = "terminal",
+    runtimeSessionId: string | null = null,
+  ) {
     if (this.disposed || this.phoneErrorNotifiedEpoch === this.lifecycleEpoch) return;
+    const recentProfileFailure = this.recentProfileFailure;
+    if (
+      source === "terminalExit" &&
+      runtimeSessionId !== null &&
+      recentProfileFailure?.runtimeSessionId === runtimeSessionId &&
+      Date.now() - recentProfileFailure.recordedAtUnixMs <=
+        PROFILE_FAILURE_EXIT_SUPPRESSION_MS
+    ) {
+      this.phoneErrorNotifiedEpoch = this.lifecycleEpoch;
+      this.recentProfileFailure = null;
+      return;
+    }
     this.phoneErrorNotifiedEpoch = this.lifecycleEpoch;
     const labels = this.workspace.phoneNotificationLabels(
       this.projectId,
@@ -3724,6 +4023,7 @@ class BrowserPane {
   private disposed = false;
   private layoutVisible = false;
   private interactionSuspended = false;
+  private nativeOverlayOcclusion: RectangleBounds | null = null;
   private hibernated = false;
   private desiredSleep = false;
   private catalogWritable = true;
@@ -4135,6 +4435,24 @@ class BrowserPane {
     this.scheduleUrlSyncFallback(0);
   }
 
+  setNativeOverlayOcclusion(bounds: RectangleBounds | null) {
+    const next = bounds ? { ...bounds } : null;
+    const previous = this.nativeOverlayOcclusion;
+    if (
+      previous === next ||
+      (previous !== null &&
+        next !== null &&
+        previous.left === next.left &&
+        previous.top === next.top &&
+        previous.right === next.right &&
+        previous.bottom === next.bottom)
+    ) {
+      return;
+    }
+    this.nativeOverlayOcclusion = next;
+    this.scheduleFit(0);
+  }
+
   isVisibleForSettingsPreview() {
     return (
       !this.disposed &&
@@ -4254,18 +4572,6 @@ class BrowserPane {
     const image = preview?.querySelector<HTMLImageElement>("img");
     if (image) image.src = "";
     preview?.remove();
-  }
-
-  overlapsNativeOverlay(bounds: RectangleBounds) {
-    if (
-      this.disposed ||
-      !this.layoutVisible ||
-      this.element.hidden ||
-      !this.element.isConnected
-    ) {
-      return false;
-    }
-    return rectanglesOverlap(this.viewport.getBoundingClientRect(), bounds);
   }
 
   scheduleFit(delay = 35) {
@@ -4721,17 +5027,22 @@ class BrowserPane {
       await webview.hide().catch(() => undefined);
       return;
     }
-    const bounds = this.viewport.getBoundingClientRect();
-    if (bounds.width < 2 || bounds.height < 2) {
+    const bounds = clipRectangleAboveOverlay(
+      this.viewport.getBoundingClientRect(),
+      this.nativeOverlayOcclusion,
+    );
+    if (!bounds) {
       await webview.hide().catch(() => undefined);
       return;
     }
+    const width = bounds.right - bounds.left;
+    const height = bounds.bottom - bounds.top;
     await webview.setPosition(
       new LogicalPosition(Math.round(bounds.left), Math.round(bounds.top)),
     );
     if (this.disposed || generation !== this.generation || this.webview !== webview) return;
     await webview.setSize(
-      new LogicalSize(Math.round(bounds.width), Math.round(bounds.height)),
+      new LogicalSize(Math.round(width), Math.floor(height)),
     );
     if (this.disposed || generation !== this.generation || this.webview !== webview) return;
     await webview.show();
@@ -5098,6 +5409,17 @@ class TerminalWorkspace {
       terminalId: string,
       provider: AgentProvider,
       conversationId: string,
+    ) => Promise<boolean>,
+    private readonly onClineSessionDiscoveredCallback: (
+      projectId: string,
+      terminalId: string,
+      runtimeSessionId: string,
+      sessionId: string,
+    ) => Promise<boolean>,
+    private readonly onClineSessionInvalidatedCallback: (
+      projectId: string,
+      terminalId: string,
+      expectedSessionId: string,
     ) => Promise<boolean>,
     private readonly onTerminalAgentWorkingChangedCallback: (
       projectId: string,
@@ -6019,11 +6341,18 @@ class TerminalWorkspace {
   phoneNotificationLabels(
     projectId: string,
     terminalId: string,
+    provider: WorkspaceTerminalLaunchProfile | null = null,
+    modelName: string | null = null,
   ): PhoneNotificationLabels | null {
     const projectName = this.projectNames.get(projectId);
     const pane = this.panes.get(paneRuntimeId(projectId, terminalId));
     if (!projectName || !pane) return null;
-    return { projectName, terminalName: pane.title };
+    return {
+      projectName,
+      terminalName: pane.title,
+      agent: pane.phoneNotificationAgentProfile(provider),
+      modelName,
+    };
   }
 
   clearActivePane() {
@@ -6507,6 +6836,68 @@ class TerminalWorkspace {
     return true;
   }
 
+  async associateClineSession(
+    projectId: string,
+    terminalId: string,
+    runtimeSessionId: string,
+    sessionId: string,
+  ) {
+    const paneId = paneRuntimeId(projectId, terminalId);
+    const pane = this.panes.get(paneId);
+    if (
+      !isValidClineSessionId(sessionId) ||
+      !pane?.ownsRuntimeSession(runtimeSessionId)
+    ) {
+      return false;
+    }
+    const saved = await this.onClineSessionDiscoveredCallback(
+      projectId,
+      terminalId,
+      runtimeSessionId,
+      sessionId,
+    );
+    return (
+      saved &&
+      !this.disposed &&
+      this.panes.get(paneId) === pane &&
+      pane.ownsRuntimeSession(runtimeSessionId)
+    );
+  }
+
+  async invalidateClineSession(
+    projectId: string,
+    terminalId: string,
+    expectedSessionId: string,
+    expectedPane: TerminalPane,
+  ) {
+    const paneId = paneRuntimeId(projectId, terminalId);
+    if (
+      !isValidClineSessionId(expectedSessionId) ||
+      this.disposed ||
+      this.panes.get(paneId) !== expectedPane
+    ) {
+      return false;
+    }
+    const saved = await this.onClineSessionInvalidatedCallback(
+      projectId,
+      terminalId,
+      expectedSessionId,
+    );
+    return saved && !this.disposed && this.panes.get(paneId) === expectedPane;
+  }
+
+  ownsTerminalRuntimeSession(
+    projectId: string,
+    terminalId: string,
+    runtimeSessionId: string,
+  ) {
+    return (
+      this.panes
+        .get(paneRuntimeId(projectId, terminalId))
+        ?.ownsRuntimeSession(runtimeSessionId) ?? false
+    );
+  }
+
   setAgentTurnWorking(
     projectId: string,
     terminalId: string,
@@ -6528,6 +6919,46 @@ class TerminalWorkspace {
     this.onTerminalAgentWorkingChangedCallback(projectId, terminalId, working);
     if (!working) this.scheduleInactiveAgentSleepSweep();
     return true;
+  }
+
+  setProfileAgentTurnWorking(
+    projectId: string,
+    terminalId: string,
+    runtimeSessionId: string,
+    provider: ProfileLifecycleProvider,
+    working: boolean,
+    turnId: string | null,
+    observedAtUnixMs: number,
+  ) {
+    const pane = this.panes.get(paneRuntimeId(projectId, terminalId));
+    if (
+      !pane?.ownsRuntimeSession(runtimeSessionId) ||
+      !pane.matchesProfileLifecycleProvider(provider)
+    ) {
+      return false;
+    }
+    pane.setAgentTurnWorking(working, turnId, observedAtUnixMs);
+    this.onTerminalAgentWorkingChangedCallback(projectId, terminalId, working);
+    return true;
+  }
+
+  noteProfileAgentOutcome(
+    projectId: string,
+    terminalId: string,
+    runtimeSessionId: string,
+    provider: ProfileLifecycleProvider,
+    succeeded: boolean,
+    phoneNotificationQueued: boolean,
+  ) {
+    const pane = this.panes.get(paneRuntimeId(projectId, terminalId));
+    return (
+      pane?.matchesProfileLifecycleProvider(provider) === true &&
+      pane.noteProfileAgentOutcome(
+        runtimeSessionId,
+        succeeded,
+        phoneNotificationQueued,
+      )
+    );
   }
 
   setAgentContextUsage(
@@ -6566,6 +6997,22 @@ class TerminalWorkspace {
       pane.matchesAgentConversation(provider, conversationId)
     ) {
       pane.queueAgentCompletion(turnKey, route);
+    }
+  }
+
+  queueProfileAgentCompletion(
+    projectId: string,
+    terminalId: string,
+    runtimeSessionId: string,
+    provider: ProfileLifecycleProvider,
+    turnKey: string,
+  ) {
+    const pane = this.panes.get(paneRuntimeId(projectId, terminalId));
+    if (
+      pane?.ownsRuntimeSession(runtimeSessionId) &&
+      pane.matchesProfileLifecycleProvider(provider)
+    ) {
+      pane.queueAgentCompletion(turnKey);
     }
   }
 
@@ -6710,14 +7157,21 @@ class TerminalWorkspace {
     const average = totalWidth / row.columns;
     const dynamicMinimum = Math.min(180, Math.max(80, average * 0.72));
     const minPaneWidth = Math.max(1, Math.min(dynamicMinimum, ...currentWidths));
-    const siblingEdges = [...this.activeRows.values()]
-      .filter((candidate) => candidate !== row)
-      .flatMap((candidate) =>
-        candidate.paneIds
-          .slice(0, -1)
-          .map((candidateId) => this.layoutPane(candidateId)?.element.getBoundingClientRect().right)
-          .filter((edge): edge is number => edge !== undefined),
-      );
+    const siblingEdges = [
+      ...new Set(
+        [...this.activeRows.values()]
+          .filter((candidate) => candidate.element !== row.element)
+          .flatMap((candidate) =>
+            candidate.paneIds
+              .slice(0, -1)
+              .map(
+                (candidateId) =>
+                  this.layoutPane(candidateId)?.element.getBoundingClientRect().right,
+              )
+              .filter((edge): edge is number => edge !== undefined),
+          ),
+      ),
+    ];
     this.resizeState = {
       paneId,
       projectId: pane.projectId,
@@ -6818,6 +7272,7 @@ class TerminalWorkspace {
     if (!acceptedSlot || !nearestSlot) return;
     if (
       nearestSlotIndex !== state.acceptedSlotIndex &&
+      !paneGeometryContainsPoint(nearestSlot, draggedCenter.x, draggedCenter.y) &&
       distanceToPaneCenter(draggedCenter, nearestSlot) +
         PANE_DRAG_SLOT_HYSTERESIS_PX >=
         distanceToPaneCenter(draggedCenter, acceptedSlot)
@@ -7090,8 +7545,15 @@ class TerminalWorkspace {
       );
     }
     this.setBrowserSuspensionReason("layout-interaction", false);
+    const resizedPaneIds = [
+      ...new Set(
+        [...this.activeRows.values()]
+          .filter((candidate) => candidate.element === state.row.element)
+          .flatMap((candidate) => candidate.paneIds),
+      ),
+    ];
     requestAnimationFrame(() => {
-      for (const paneId of state.row.paneIds) this.layoutPane(paneId)?.scheduleFit(0);
+      for (const paneId of resizedPaneIds) this.layoutPane(paneId)?.scheduleFit(0);
     });
   }
 
@@ -7162,7 +7624,8 @@ class TerminalWorkspace {
       pane.setMaximized(pane.id === maximized?.id);
     }
     const visible = maximized ? [maximized] : allVisible;
-    const { columns, rows } = layoutFor(visible.length);
+    const layoutPlan = layoutPlanFor(visible.length);
+    const { columns, rows } = layoutPlan;
     const visibleIds = new Set(visible.map((pane) => pane.id));
     const terminalsNeedingResume = new Set<TerminalPane>();
     if (forceVisibleTerminalResume) {
@@ -7179,79 +7642,163 @@ class TerminalWorkspace {
         this.inactivePaneBin.append(pane.element);
       }
     }
+    for (const pane of this.allPanes()) {
+      const style = pane.element.style;
+      style.gridColumn = "";
+      style.gridRow = "";
+      style.flexGrow = "";
+      style.flexShrink = "";
+      style.flexBasis = "";
+    }
+
     const previousRows = [...this.rowsHost.children].filter(
       (row): row is HTMLDivElement => row instanceof HTMLDivElement,
     );
-    const nextRows: ActiveTerminalRow[] = [];
+    const nextGroups: Array<{
+      element: HTMLDivElement;
+      desiredChildCount: number;
+    }> = [];
     this.activeRows.clear();
     this.rowsHost.style.setProperty("--terminal-row-count", String(rows));
 
     const storedRatios = this.activeProjectId
       ? this.projectRatios.get(this.activeProjectId) ?? {}
       : {};
+    let groupIndex = 0;
+    const revealPane = (
+      pane: LayoutPane,
+      parent: HTMLDivElement,
+      childIndex: number,
+    ) => {
+      const wasHidden = pane.element.hidden;
+      const current = parent.children[childIndex] ?? null;
+      const moved = current !== pane.element;
+      if (moved) parent.insertBefore(pane.element, current);
+      pane.element.hidden = false;
+      if (pane instanceof BrowserPane) pane.setLayoutVisible(true);
+      if (pane instanceof TerminalPane && (wasHidden || moved)) {
+        terminalsNeedingResume.add(pane);
+      }
+    };
+    const bottomFillStartRow =
+      layoutPlan.placements.find((placement) => placement.rowSpan > 1)?.row ?? null;
+    const placementsByRow = Array.from({ length: rows }, () =>
+      [] as (typeof layoutPlan.placements)[number][],
+    );
+    for (const placement of layoutPlan.placements) {
+      placementsByRow[placement.row]?.push(placement);
+    }
+
     for (let rowIndex = 0; rowIndex < rows && visible.length > 0; rowIndex += 1) {
-      const start = rowIndex * columns;
-      const rowPanes = visible.slice(start, start + columns);
-      if (rowPanes.length === 0) break;
+      if (bottomFillStartRow === rowIndex) {
+        const rowElement = previousRows[groupIndex] ?? document.createElement("div");
+        const key = `${columns}x${rows}:row-${rowIndex}`;
+        const ratios = normalizedLayoutRatios(storedRatios[key], columns);
+        const topPlacements = placementsByRow[rowIndex] ?? [];
+        const bottomPlacements = placementsByRow[rowIndex + 1] ?? [];
+        const bandPlacements = [...topPlacements, ...bottomPlacements];
+
+        rowElement.className = "terminal-row terminal-row--bottom-fill-band";
+        rowElement.dataset.bottomFillBand = "true";
+        rowElement.dataset.layoutKey = key;
+        rowElement.dataset.row = `${rowIndex}-${rowIndex + 1}`;
+        rowElement.style.gridRow = "span 2";
+        if (!rowElement.isConnected) this.rowsHost.append(rowElement);
+
+        bandPlacements.forEach((placement, childIndex) => {
+          const pane = visible[placement.index];
+          if (!pane) return;
+          revealPane(pane, rowElement, childIndex);
+          pane.element.style.gridColumn = String(placement.column + 1);
+          const localRow = placement.row - rowIndex + 1;
+          pane.element.style.gridRow =
+            placement.rowSpan > 1
+              ? `${localRow} / span ${placement.rowSpan}`
+              : String(localRow);
+        });
+
+        const topRow: ActiveTerminalRow = {
+          key,
+          element: rowElement,
+          paneIds: topPlacements
+            .map((placement) => visible[placement.index]?.id)
+            .filter((paneId): paneId is string => paneId !== undefined),
+          ratios: [...ratios],
+          columns,
+        };
+        const bottomRow: ActiveTerminalRow = {
+          // The two tracks are one visual grid and intentionally share the
+          // upper row's persistence key and column boundaries.
+          key,
+          element: rowElement,
+          paneIds: bottomPlacements
+            .map((placement) => visible[placement.index]?.id)
+            .filter((paneId): paneId is string => paneId !== undefined),
+          ratios: [...ratios],
+          columns,
+        };
+        this.activeRows.set(`${key}:band-top`, topRow);
+        this.activeRows.set(`${key}:band-bottom`, bottomRow);
+        nextGroups.push({
+          element: rowElement,
+          desiredChildCount: bandPlacements.length,
+        });
+        groupIndex += 1;
+        rowIndex += 1;
+        continue;
+      }
+
+      const rowPlacements = placementsByRow[rowIndex] ?? [];
+      if (rowPlacements.length === 0) break;
+      const rowElement = previousRows[groupIndex] ?? document.createElement("div");
       const key = `${columns}x${rows}:row-${rowIndex}`;
       const ratios = normalizedLayoutRatios(storedRatios[key], columns);
-      const rowElement = previousRows[rowIndex] ?? document.createElement("div");
       rowElement.className = "terminal-row";
+      delete rowElement.dataset.bottomFillBand;
       rowElement.dataset.layoutKey = key;
       rowElement.dataset.row = String(rowIndex);
+      rowElement.style.gridRow = "";
+      rowElement.style.gridTemplateColumns = "";
+      if (!rowElement.isConnected) this.rowsHost.append(rowElement);
+
+      rowPlacements.forEach((placement, childIndex) => {
+        const pane = visible[placement.index];
+        if (pane) revealPane(pane, rowElement, childIndex);
+      });
       const row: ActiveTerminalRow = {
         key,
         element: rowElement,
-        paneIds: rowPanes.map((pane) => pane.id),
+        paneIds: rowPlacements
+          .map((placement) => visible[placement.index]?.id)
+          .filter((paneId): paneId is string => paneId !== undefined),
         ratios,
         columns,
       };
-
-      // Reuse rows by position and connect only genuinely new rows. A no-op
-      // layout therefore leaves every xterm DOM node exactly where it is.
-      if (!rowElement.isConnected) this.rowsHost.append(rowElement);
-
-      for (let column = 0; column < columns; column += 1) {
-        const pane = rowPanes[column];
-        if (pane) {
-          const wasHidden = pane.element.hidden;
-          pane.setResizeHandleEnabled(
-            this.catalogWritable && column < rowPanes.length - 1,
-          );
-          const current = rowElement.children[column] ?? null;
-          const moved = current !== pane.element;
-          if (moved) rowElement.insertBefore(pane.element, current);
-          pane.element.hidden = false;
-          if (pane instanceof BrowserPane) pane.setLayoutVisible(true);
-          if (pane instanceof TerminalPane && (wasHidden || moved)) {
-            terminalsNeedingResume.add(pane);
-          }
-        } else {
-          const current = rowElement.children[column] ?? null;
-          if (
-            !(current instanceof HTMLElement) ||
-            !current.classList.contains("terminal-row-spacer")
-          ) {
-            const spacer = document.createElement("div");
-            spacer.className = "terminal-row-spacer";
-            spacer.setAttribute("aria-hidden", "true");
-            rowElement.insertBefore(spacer, current);
-          }
-        }
-      }
-      nextRows.push(row);
       this.activeRows.set(key, row);
+      nextGroups.push({
+        element: rowElement,
+        desiredChildCount: rowPlacements.length,
+      });
+      groupIndex += 1;
     }
 
-    // All desired panes have now moved between connected rows. Only spacers or
-    // obsolete children remain past each row's declared column count.
-    for (const row of nextRows) {
-      while (row.element.children.length > row.columns) {
-        row.element.lastElementChild?.remove();
+    // All desired panes have now moved between connected groups. Anything
+    // remaining after the declared children belongs to an obsolete layout.
+    for (const group of nextGroups) {
+      while (group.element.children.length > group.desiredChildCount) {
+        group.element.lastElementChild?.remove();
       }
+    }
+    const nextGroupElements = new Set(nextGroups.map((group) => group.element));
+    for (const row of previousRows) {
+      if (!nextGroupElements.has(row)) row.remove();
+    }
+    const ratioAppliedElements = new Set<HTMLDivElement>();
+    for (const row of this.activeRows.values()) {
+      if (ratioAppliedElements.has(row.element)) continue;
+      ratioAppliedElements.add(row.element);
       this.applyRowRatios(row, row.ratios);
     }
-    for (const row of previousRows.slice(nextRows.length)) row.remove();
 
     this.terminalSurface.dataset.empty = String(allVisible.length === 0);
     this.refreshBrowserSuspensions();
@@ -7279,7 +7826,22 @@ class TerminalWorkspace {
   }
 
   private applyRowRatios(row: ActiveTerminalRow, ratios: readonly number[]) {
-    row.ratios = [...ratios];
+    for (const candidate of this.activeRows.values()) {
+      if (candidate.element === row.element) candidate.ratios = [...ratios];
+    }
+    if (row.element.dataset.bottomFillBand === "true") {
+      row.element.style.gridTemplateColumns = ratios
+        .map((ratio) => `${ratio}fr`)
+        .join(" ");
+      for (const child of row.element.children) {
+        if (!(child instanceof HTMLElement)) continue;
+        child.style.flexGrow = "";
+        child.style.flexShrink = "";
+        child.style.flexBasis = "";
+      }
+      return;
+    }
+    row.element.style.gridTemplateColumns = "";
     [...row.element.children].forEach((child, index) => {
       if (!(child instanceof HTMLElement)) return;
       child.style.flexGrow = String(ratios[index] ?? 0);
@@ -7407,10 +7969,10 @@ class TerminalWorkspace {
 
   private applyBrowserSuspension(pane: BrowserPane) {
     const globallySuspended = this.browserSuspensionReasons.size > 0;
-    const overlapsProviderUsage = this.providerUsageOverlayBounds
-      ? pane.overlapsNativeOverlay(this.providerUsageOverlayBounds)
-      : false;
-    pane.setInteractionSuspended(globallySuspended || overlapsProviderUsage);
+    pane.setNativeOverlayOcclusion(
+      globallySuspended ? null : this.providerUsageOverlayBounds,
+    );
+    pane.setInteractionSuspended(globallySuspended);
   }
 
   private scheduleInactiveAgentSleepSweep() {
@@ -7553,6 +8115,386 @@ class TerminalWorkspace {
   }
 }
 
+class AndroidEmulatorLauncherController {
+  private readonly listeners = new AbortController();
+  private operationInFlight = false;
+  private openingDialog = false;
+  private modalOverlayOpen = false;
+  private shuttingDown = false;
+  private disposed = false;
+
+  constructor(
+    private readonly menuButton: HTMLButtonElement,
+    private readonly returnFocusButton: HTMLButtonElement,
+    private readonly dialog: HTMLDialogElement,
+    private readonly form: HTMLFormElement,
+    private readonly title: HTMLElement,
+    private readonly description: HTMLElement,
+    private readonly options: HTMLElement,
+    private readonly optionList: HTMLElement,
+    private readonly status: HTMLElement,
+    private readonly cancelButton: HTMLButtonElement,
+    private readonly confirmButton: HTMLButtonElement,
+    private readonly setFooterStatus: (
+      message: string,
+      tone?: StatusTone,
+    ) => void,
+    private readonly setModalOpen: (open: boolean) => Promise<void>,
+  ) {
+    const signal = this.listeners.signal;
+    this.form.addEventListener(
+      "submit",
+      (event) => {
+        event.preventDefault();
+        void this.launchSelectedDevice();
+      },
+      { signal },
+    );
+    this.cancelButton.addEventListener(
+      "click",
+      () => {
+        if (!this.operationInFlight && this.dialog.open) {
+          this.dialog.close("cancel");
+        }
+      },
+      { signal },
+    );
+    this.optionList.addEventListener("change", () => this.updateControls(), {
+      signal,
+    });
+    this.dialog.addEventListener(
+      "cancel",
+      (event) => {
+        if (this.operationInFlight) event.preventDefault();
+      },
+      { signal },
+    );
+    this.dialog.addEventListener(
+      "close",
+      () => void this.handleDialogClosed(),
+      { signal },
+    );
+    this.updateControls();
+  }
+
+  async open() {
+    if (
+      this.disposed ||
+      this.shuttingDown ||
+      this.operationInFlight ||
+      this.openingDialog ||
+      this.modalOverlayOpen ||
+      this.dialog.open
+    ) {
+      return;
+    }
+    this.operationInFlight = true;
+    this.updateControls();
+    this.setFooterStatus(
+      tr(
+        "Checking Android Emulator and virtual devices...",
+        "Android 에뮬레이터와 가상 기기를 확인하는 중입니다...",
+      ),
+    );
+    try {
+      const response = normalizeAndroidEmulatorStatus(
+        await invoke<unknown>("get_android_emulator_status"),
+      );
+      if (this.disposed || this.shuttingDown) return;
+      if (response.state === "emulatorMissing") {
+        const guidance = tr(
+          "Android Emulator is not installed. Install it from Android Studio > SDK Manager > SDK Tools.",
+          "Android 에뮬레이터가 설치되어 있지 않습니다. Android Studio > SDK Manager > SDK Tools에서 설치하세요.",
+        );
+        this.setFooterStatus(guidance, "error");
+        this.prepareGuidanceDialog(
+          "Android Emulator is required",
+          "Android 에뮬레이터가 필요합니다",
+          "Android Emulator is not installed. Install it from Android Studio > SDK Manager > SDK Tools.",
+          "Android 에뮬레이터가 설치되어 있지 않습니다. Android Studio > SDK Manager > SDK Tools에서 설치하세요.",
+        );
+        await this.showDialog();
+        return;
+      }
+      if (response.state === "noVirtualDevices") {
+        const guidance = tr(
+          "No Android virtual devices were found. Create one in Android Studio > Device Manager.",
+          "Android 가상 기기를 찾지 못했습니다. Android Studio > Device Manager에서 새 기기를 만드세요.",
+        );
+        this.setFooterStatus(guidance, "error");
+        this.prepareGuidanceDialog(
+          "Create a virtual device",
+          "가상 기기를 만들어 주세요",
+          "No Android virtual devices were found. Create one in Android Studio > Device Manager.",
+          "Android 가상 기기를 찾지 못했습니다. Android Studio > Device Manager에서 새 기기를 만드세요.",
+        );
+        await this.showDialog();
+        return;
+      }
+      if (response.avds.length === 1) {
+        await this.launchDevice(response.avds[0].name);
+        return;
+      }
+      this.prepareChoiceDialog();
+      this.renderOptions(response.avds);
+      this.setDialogStatus(
+        tr(
+          "Select a device, then choose Launch.",
+          "기기를 선택한 다음 실행을 누르세요.",
+        ),
+      );
+      await this.showDialog();
+    } catch (error) {
+      if (this.disposed || this.shuttingDown) return;
+      const detail = androidEmulatorErrorMessage(error);
+      this.setFooterStatus(
+        tr(
+          `Failed to check Android Emulator: ${detail}`,
+          `Android 에뮬레이터를 확인하지 못했습니다: ${detail}`,
+        ),
+        "error",
+      );
+    } finally {
+      this.operationInFlight = false;
+      this.updateControls();
+    }
+  }
+
+  beginShutdown() {
+    if (this.shuttingDown) return;
+    this.shuttingDown = true;
+    this.updateControls();
+    if (this.dialog.open) this.dialog.close("shutdown");
+    else void this.releaseModalOverlay();
+  }
+
+  dispose() {
+    if (this.disposed) return;
+    this.disposed = true;
+    this.shuttingDown = true;
+    this.listeners.abort();
+    this.updateControls();
+    if (this.dialog.open) this.dialog.close("shutdown");
+    void this.releaseModalOverlay();
+  }
+
+  private async launchSelectedDevice() {
+    if (
+      this.disposed ||
+      this.shuttingDown ||
+      this.operationInFlight ||
+      !this.dialog.open
+    ) {
+      return;
+    }
+    const selected = this.optionList.querySelector<HTMLInputElement>(
+      'input[name="android-emulator-avd"]:checked',
+    );
+    const avdName = normalizeAndroidVirtualDeviceName(selected?.value);
+    if (!avdName) {
+      this.setDialogStatus(
+        tr("Select a virtual device.", "가상 기기를 선택하세요."),
+        "error",
+      );
+      this.updateControls();
+      return;
+    }
+    this.operationInFlight = true;
+    this.updateControls();
+    try {
+      await this.launchDevice(avdName);
+    } finally {
+      this.operationInFlight = false;
+      this.updateControls();
+    }
+  }
+
+  private async launchDevice(avdName: string) {
+    const startingMessage = tr(
+      `Starting Android Emulator: ${avdName}`,
+      `Android 에뮬레이터를 실행하는 중입니다: ${avdName}`,
+    );
+    this.setFooterStatus(startingMessage);
+    if (this.dialog.open) this.setDialogStatus(startingMessage);
+    try {
+      const result = normalizeAndroidEmulatorLaunchResult(
+        await invoke<unknown>("launch_android_emulator", { avdName }),
+      );
+      if (this.disposed || this.shuttingDown) return;
+      const successMessage = result.alreadyRunning
+        ? tr(
+            `Android Emulator is already running: ${result.avdName}`,
+            `Android 에뮬레이터가 이미 실행 중입니다: ${result.avdName}`,
+          )
+        : tr(
+            `Started Android Emulator: ${result.avdName}`,
+            `Android 에뮬레이터를 실행했습니다: ${result.avdName}`,
+          );
+      if (this.dialog.open) this.dialog.close("launched");
+      this.setFooterStatus(successMessage);
+    } catch (error) {
+      if (this.disposed || this.shuttingDown) return;
+      const detail = androidEmulatorErrorMessage(error);
+      const message = tr(
+        `Failed to launch Android Emulator: ${detail}`,
+        `Android 에뮬레이터를 실행하지 못했습니다: ${detail}`,
+      );
+      if (this.dialog.open) this.setDialogStatus(message, "error");
+      this.setFooterStatus(message, "error");
+    }
+  }
+
+  private renderOptions(avds: readonly AndroidVirtualDevice[]) {
+    const fragment = document.createDocumentFragment();
+    avds.forEach((avd, index) => {
+      const option = document.createElement("label");
+      option.className = "android-emulator-option";
+
+      const input = document.createElement("input");
+      input.type = "radio";
+      input.name = "android-emulator-avd";
+      input.value = avd.name;
+      input.checked = index === 0;
+
+      const copy = document.createElement("span");
+      copy.className = "android-emulator-option-copy";
+      const name = document.createElement("strong");
+      name.textContent = avd.name;
+      copy.append(name);
+      if (avd.running) {
+        const state = document.createElement("small");
+        state.textContent = tr("Running", "실행 중");
+        copy.append(state);
+      }
+
+      option.append(input, copy);
+      fragment.append(option);
+    });
+    this.optionList.replaceChildren(fragment);
+    this.updateControls();
+  }
+
+  private async showDialog() {
+    this.openingDialog = true;
+    this.updateControls();
+    this.modalOverlayOpen = true;
+    try {
+      await this.setModalOpen(true);
+      if (this.disposed || this.shuttingDown) {
+        await this.releaseModalOverlay();
+        return;
+      }
+      this.dialog.showModal();
+      requestAnimationFrame(() => {
+        const selected = this.optionList.querySelector<HTMLInputElement>(
+          'input[name="android-emulator-avd"]:checked',
+        );
+        (this.options.hidden ? this.cancelButton : selected)?.focus();
+      });
+    } catch (error) {
+      await this.releaseModalOverlay();
+      throw error;
+    } finally {
+      this.openingDialog = false;
+      this.updateControls();
+    }
+  }
+
+  private async handleDialogClosed() {
+    this.setDialogStatus("");
+    await this.releaseModalOverlay();
+    this.updateControls();
+    if (
+      !this.disposed &&
+      !this.shuttingDown &&
+      this.returnFocusButton.isConnected &&
+      !this.returnFocusButton.disabled
+    ) {
+      this.returnFocusButton.focus();
+    }
+  }
+
+  private async releaseModalOverlay() {
+    if (!this.modalOverlayOpen) return;
+    this.modalOverlayOpen = false;
+    try {
+      await this.setModalOpen(false);
+    } catch (error) {
+      console.warn("Failed to restore browser panes after Android Emulator dialog", error);
+    }
+  }
+
+  private setDialogStatus(message: string, tone: StatusTone = "normal") {
+    this.status.textContent = message;
+    this.status.dataset.tone = tone;
+  }
+
+  private prepareChoiceDialog() {
+    this.setLocalizedText(
+      this.title,
+      "Choose a virtual device",
+      "가상 기기 선택",
+    );
+    this.setLocalizedText(
+      this.description,
+      "The selected Android Virtual Device opens in its own window.",
+      "선택한 Android 가상 기기가 별도 창으로 열립니다.",
+    );
+    this.setLocalizedText(this.cancelButton, "Cancel", "취소");
+    this.options.hidden = false;
+    this.status.hidden = false;
+    this.confirmButton.hidden = false;
+  }
+
+  private prepareGuidanceDialog(
+    titleEnglish: string,
+    titleKorean: string,
+    guidanceEnglish: string,
+    guidanceKorean: string,
+  ) {
+    this.setLocalizedText(this.title, titleEnglish, titleKorean);
+    this.setLocalizedText(
+      this.description,
+      guidanceEnglish,
+      guidanceKorean,
+    );
+    this.setLocalizedText(this.cancelButton, "Close", "닫기");
+    this.options.hidden = true;
+    this.optionList.replaceChildren();
+    this.status.hidden = true;
+    this.confirmButton.hidden = true;
+    this.setDialogStatus("");
+    this.updateControls();
+  }
+
+  private setLocalizedText(
+    element: HTMLElement,
+    english: string,
+    korean: string,
+  ) {
+    element.dataset.i18nEn = english;
+    element.dataset.i18nKo = korean;
+    element.textContent = tr(english, korean);
+  }
+
+  private updateControls() {
+    const unavailable = this.disposed || this.shuttingDown;
+    this.menuButton.disabled =
+      unavailable ||
+      this.operationInFlight ||
+      this.openingDialog ||
+      this.modalOverlayOpen ||
+      this.dialog.open;
+    this.cancelButton.disabled = unavailable || this.operationInFlight;
+    this.confirmButton.disabled =
+      unavailable ||
+      this.operationInFlight ||
+      !this.optionList.querySelector(
+        'input[name="android-emulator-avd"]:checked',
+      );
+  }
+}
+
 class PaneLauncherController {
   private readonly listeners = new AbortController();
   private shuttingDown = false;
@@ -7566,13 +8508,19 @@ class PaneLauncherController {
     grokButton: HTMLButtonElement,
     claudeButton: HTMLButtonElement,
     openCodeButton: HTMLButtonElement,
+    clineButton: HTMLButtonElement,
+    cursorButton: HTMLButtonElement,
     browserButton: HTMLButtonElement,
+    androidEmulatorButton: HTMLButtonElement,
     addPowerShell: () => void,
     addCodex: () => void,
     addGrok: () => void,
     addClaude: () => void,
     addOpenCode: () => void,
+    addCline: () => void,
+    addCursor: () => void,
     addBrowser: () => void,
+    openAndroidEmulator: () => void,
   ) {
     const signal = this.listeners.signal;
     this.toggleButton.addEventListener(
@@ -7624,11 +8572,35 @@ class PaneLauncherController {
       },
       { signal },
     );
+    clineButton.addEventListener(
+      "click",
+      () => {
+        this.setOpen(false);
+        addCline();
+      },
+      { signal },
+    );
+    cursorButton.addEventListener(
+      "click",
+      () => {
+        this.setOpen(false);
+        addCursor();
+      },
+      { signal },
+    );
     browserButton.addEventListener(
       "click",
       () => {
         this.setOpen(false);
         addBrowser();
+      },
+      { signal },
+    );
+    androidEmulatorButton.addEventListener(
+      "click",
+      () => {
+        this.setOpen(false);
+        openAndroidEmulator();
       },
       { signal },
     );
@@ -7708,9 +8680,13 @@ type ProviderPointerReorder = {
 class ProviderUsageController {
   private timer = 0;
   private resetTimer = 0;
+  private openAiStatusTimer = 0;
   private requestRunning = false;
+  private openAiStatusRequestRunning = false;
   private disposed = false;
   private latestUsage: ProviderUsageResponse | null = null;
+  private latestOpenAiStatus: OpenAiStatusSnapshot | null = null;
+  private openAiStatusRefreshFailed = false;
   private usageStale = false;
   private activeDetailProvider: FooterProviderId | null = null;
   private detailOpener: HTMLButtonElement | null = null;
@@ -7785,12 +8761,25 @@ class ProviderUsageController {
       { signal },
     );
     this.detail.addAccount.addEventListener("click", () => void this.addAccount(), { signal });
+    this.detail.openAiStatus.refreshButton.addEventListener(
+      "click",
+      () => void this.refreshOpenAiStatus(true),
+      { signal },
+    );
     document.addEventListener("pointerdown", (event) => this.onDocumentPointerDown(event), {
       capture: true,
       signal,
     });
     window.addEventListener("keydown", (event) => this.onWindowKeyDown(event), { signal });
     window.addEventListener("resize", () => this.positionDetail(), { signal });
+    window.addEventListener("focus", () => void this.refreshOpenAiStatus(false), { signal });
+    document.addEventListener(
+      "visibilitychange",
+      () => {
+        if (!document.hidden) void this.refreshOpenAiStatus(false);
+      },
+      { signal },
+    );
     this.detail.popover.addEventListener("animationend", () => this.syncNativeOverlayBounds(), {
       signal,
     });
@@ -7798,22 +8787,28 @@ class ProviderUsageController {
 
   start() {
     void this.refresh();
+    void this.refreshOpenAiStatus(false);
     this.timer = window.setInterval(() => {
       this.renderLatestUsage();
       void this.refresh();
     }, 15_000);
+    this.openAiStatusTimer = window.setInterval(() => {
+      if (!document.hidden) void this.refreshOpenAiStatus(false);
+    }, 60_000);
   }
 
   refreshLocalizedUi() {
     this.setUsageStale(this.usageStale);
     this.renderTriggerAria(this.activeDetailProvider);
     this.renderLatestUsage();
+    this.renderOpenAiStatus();
   }
 
   dispose() {
     this.disposed = true;
     this.finishProviderPointerReorder(false);
     window.clearInterval(this.timer);
+    window.clearInterval(this.openAiStatusTimer);
     window.clearTimeout(this.resetTimer);
     this.accountRequestSequence += 1;
     this.listeners.abort();
@@ -7852,6 +8847,138 @@ class ProviderUsageController {
       this.requestRunning = false;
       this.renderDetail();
     }
+  }
+
+  private async refreshOpenAiStatus(forceRefresh: boolean) {
+    if (this.disposed || this.openAiStatusRequestRunning) return;
+    this.openAiStatusRequestRunning = true;
+    this.renderOpenAiStatus();
+    try {
+      this.latestOpenAiStatus = normalizeOpenAiStatusSnapshot(
+        await invoke<unknown>("read_openai_status", { forceRefresh }),
+      );
+      if (this.disposed) return;
+      this.openAiStatusRefreshFailed = false;
+    } catch {
+      if (this.disposed) return;
+      this.openAiStatusRefreshFailed = true;
+    } finally {
+      this.openAiStatusRequestRunning = false;
+      if (!this.disposed) this.renderOpenAiStatus();
+    }
+  }
+
+  private effectiveOpenAiStatus(): {
+    snapshot: OpenAiStatusSnapshot | null;
+    status: OpenAiStatusLevel;
+    stale: boolean;
+  } {
+    const snapshot = this.latestOpenAiStatus;
+    const ageMs = snapshot ? Date.now() - snapshot.checkedAtUnixMs : Number.POSITIVE_INFINITY;
+    const usable = snapshot !== null && ageMs >= 0 && ageMs <= 10 * 60_000;
+    return {
+      snapshot: usable ? snapshot : null,
+      status: usable ? snapshot.status : "unknown",
+      stale: usable
+        ? snapshot.stale || this.openAiStatusRefreshFailed
+        : this.openAiStatusRefreshFailed,
+    };
+  }
+
+  private renderOpenAiStatus() {
+    const view = this.effectiveOpenAiStatus();
+    const locale = getAppLanguage();
+    const waiting = this.openAiStatusRequestRunning && view.snapshot === null;
+    const label = waiting
+      ? tr("Checking", "확인 중")
+      : openAiStatusLabel(view.status, locale);
+    const tone = openAiStatusTone(view.status);
+    const summary = this.detail.openAiStatus.summary;
+    summary.hidden = !waiting && !shouldShowOpenAiStatusSummary(view.status);
+    summary.dataset.tone = tone;
+    summary.dataset.stale = String(view.stale);
+    this.detail.openAiStatus.summaryLabel.textContent = label;
+    summary.title = view.stale
+      ? tr(
+          `OpenAI status: ${label}. Showing the last known result.`,
+          `OpenAI 상태: ${label}. 마지막 확인 결과를 표시합니다.`,
+        )
+      : tr(`OpenAI status: ${label}`, `OpenAI 상태: ${label}`);
+    this.renderTriggerAria(this.activeDetailProvider);
+
+    const detail = this.detail.openAiStatus;
+    detail.root.hidden = this.activeDetailProvider !== "codex";
+    if (detail.root.hidden) return;
+
+    detail.statusLabel.dataset.tone = tone;
+    detail.statusLabel.textContent = label;
+    detail.refreshButton.disabled = this.openAiStatusRequestRunning;
+    detail.root.setAttribute("aria-busy", String(this.openAiStatusRequestRunning));
+
+    const snapshot = view.snapshot;
+    if (!snapshot) {
+      detail.description.textContent = waiting
+        ? tr("Checking the official OpenAI status.", "공식 OpenAI 상태를 확인하는 중입니다.")
+        : tr(
+            "The official OpenAI status is temporarily unavailable.",
+            "공식 OpenAI 상태를 현재 확인할 수 없습니다.",
+          );
+      detail.services.replaceChildren();
+      detail.incidents.hidden = true;
+      detail.incidentList.replaceChildren();
+      detail.checkedAt.textContent = tr("Not checked yet", "아직 확인하지 않음");
+      return;
+    }
+
+    const overallLabel = openAiStatusLabel(snapshot.overallStatus, locale);
+    detail.description.textContent = view.stale
+      ? tr(
+          `OpenAI overall: ${overallLabel} · last known result`,
+          `OpenAI 전체: ${overallLabel} · 마지막 확인 결과`,
+        )
+      : tr(`OpenAI overall: ${overallLabel}`, `OpenAI 전체: ${overallLabel}`);
+    detail.services.replaceChildren(
+      ...snapshot.services.map((service) => {
+        const row = document.createElement("div");
+        row.className = "openai-status-service";
+        row.dataset.tone = openAiStatusTone(service.status);
+        const name = document.createElement("span");
+        name.textContent = service.name;
+        const state = document.createElement("span");
+        state.textContent = openAiStatusLabel(service.status, locale);
+        row.append(name, state);
+        return row;
+      }),
+    );
+
+    detail.incidents.hidden = snapshot.incidents.length === 0;
+    detail.incidentList.replaceChildren(
+      ...snapshot.incidents.map((incident) => {
+        const item = document.createElement("article");
+        item.className = "openai-status-incident";
+        const title = document.createElement("strong");
+        title.textContent = incident.name;
+        const state = document.createElement("span");
+        state.textContent = openAiIncidentStatusLabel(incident.status, locale);
+        item.append(title, state);
+        if (incident.latestUpdate) {
+          const update = document.createElement("p");
+          update.textContent = incident.latestUpdate;
+          item.append(update);
+        }
+        return item;
+      }),
+    );
+    const checkedAt = new Intl.DateTimeFormat(appLocale(), {
+      month: "numeric",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+    }).format(new Date(snapshot.checkedAtUnixMs));
+    detail.checkedAt.textContent = view.stale
+      ? tr(`Last successful check ${checkedAt}`, `마지막 정상 확인 ${checkedAt}`)
+      : tr(`Checked ${checkedAt}`, `${checkedAt} 확인`);
   }
 
   private scheduleNextResetRefresh() {
@@ -7924,12 +9051,18 @@ class ProviderUsageController {
       const active = provider === activeProvider;
       const name = footerProviderName(provider);
       const trigger = this.triggers[provider];
+      const statusSuffix = provider === "codex"
+        ? tr(
+            `. OpenAI status: ${openAiStatusLabel(this.effectiveOpenAiStatus().status, "en")}`,
+            `. OpenAI 상태: ${openAiStatusLabel(this.effectiveOpenAiStatus().status, "ko")}`,
+          )
+        : "";
       trigger.setAttribute("aria-expanded", String(active));
       trigger.setAttribute(
         "aria-label",
         active
-          ? tr(`Close ${name} usage details`, `${name} 사용량 상세 닫기`)
-          : tr(`View ${name} usage details`, `${name} 사용량 상세 보기`),
+          ? tr(`Close ${name} usage details${statusSuffix}`, `${name} 사용량 상세 닫기${statusSuffix}`)
+          : tr(`View ${name} usage details${statusSuffix}`, `${name} 사용량 상세 보기${statusSuffix}`),
       );
     }
   }
@@ -8174,6 +9307,7 @@ class ProviderUsageController {
     this.positionDetail();
     this.renderDetail();
     void this.refresh();
+    if (provider === "codex") void this.refreshOpenAiStatus(false);
     if (isManagedFooterProvider(provider)) {
       void this.refreshAccount(provider);
     } else {
@@ -8564,6 +9698,7 @@ class ProviderUsageController {
     this.detail.popover.dataset.provider = provider;
     this.detail.title.textContent = providerName;
     this.renderDetailAccount();
+    this.renderOpenAiStatus();
 
     const usage = this.latestUsage?.[provider] ?? null;
     if (!isManagedFooterProvider(provider)) {
@@ -9030,6 +10165,8 @@ class PhoneNotificationController {
             eventId: delivery.eventId,
             projectName: delivery.labels.projectName,
             terminalName: delivery.labels.terminalName,
+            agent: delivery.labels.agent,
+            modelName: delivery.labels.modelName,
             language: getAppLanguage(),
           },
         });
@@ -9241,6 +10378,8 @@ class PhoneNotificationController {
           eventId: createPhoneNotificationEventId("test"),
           projectName: "IHATECODING",
           terminalName: tr("Test notification", "테스트 알림"),
+          agent: "powershell",
+          modelName: null,
           language: getAppLanguage(),
         },
       });
@@ -9330,6 +10469,7 @@ class AgentEventController {
   private readonly latestLifecycleDeliveryByCorrelation = new Map<string, number>();
   private readonly latestContextDeliveryByCorrelation = new Map<string, number>();
   private readonly phoneNotifiedFinishedTurns = new Set<string>();
+  private readonly activeProfileIdentitiesByScope = new Map<string, Set<string>>();
   private lifecycleDeliverySequence = 0;
   private contextDeliverySequence = 0;
   private disposed = false;
@@ -9363,6 +10503,7 @@ class AgentEventController {
     this.latestLifecycleDeliveryByCorrelation.clear();
     this.latestContextDeliveryByCorrelation.clear();
     this.phoneNotifiedFinishedTurns.clear();
+    this.activeProfileIdentitiesByScope.clear();
     this.channel.onmessage = () => undefined;
   }
 
@@ -9370,6 +10511,13 @@ class AgentEventController {
     if (this.disposed || !isRecord(value)) return;
     const event = value.event;
     const data = isRecord(value.data) ? value.data : null;
+    if (
+      (event === "providerTurnStarted" || event === "providerTurnFinished") &&
+      data
+    ) {
+      this.onProfileLifecycle(event, data);
+      return;
+    }
     if (event === "contextUpdated" && data) {
       this.onContextUpdated(data);
       return;
@@ -9441,6 +10589,226 @@ class AgentEventController {
       deliveryVersion,
       0,
     );
+  }
+
+  private onProfileLifecycle(
+    event: "providerTurnStarted" | "providerTurnFinished",
+    data: Record<string, unknown>,
+  ) {
+    const terminalKey = isRecord(data.terminalKey) ? data.terminalKey : null;
+    const provider = isProfileLifecycleProvider(data.provider)
+      ? data.provider
+      : null;
+    const rawProviderSessionId = data.providerSessionId;
+    const rawTurnId = data.turnId;
+    const providerSessionId = normalizeProfileLifecycleIdentifier(rawProviderSessionId);
+    const turnId = normalizeProfileLifecycleIdentifier(rawTurnId);
+    if (
+      !terminalKey ||
+      provider === null ||
+      typeof data.runtimeSessionId !== "string" ||
+      typeof terminalKey.projectId !== "string" ||
+      typeof terminalKey.terminalId !== "string" ||
+      typeof data.observedAtUnixMs !== "number" ||
+      !isSafeNonNegativeInteger(data.observedAtUnixMs) ||
+      (rawProviderSessionId !== undefined &&
+        rawProviderSessionId !== null &&
+        providerSessionId === null) ||
+      (rawTurnId !== undefined && rawTurnId !== null && turnId === null) ||
+      (event === "providerTurnFinished" && typeof data.succeeded !== "boolean")
+    ) {
+      return;
+    }
+
+    const projectId = terminalKey.projectId;
+    const terminalId = terminalKey.terminalId;
+    const runtimeSessionId = data.runtimeSessionId;
+    const observedAtUnixMs = data.observedAtUnixMs;
+    const lifecycleIdentity = profileAgentLifecycleIdentity(
+      providerSessionId,
+      turnId,
+    );
+    const lifecycleScopeKey = profileAgentLifecycleScopeKey(
+      projectId,
+      terminalId,
+      runtimeSessionId,
+      provider,
+    );
+    const correlationKey = profileAgentLifecycleCorrelationKey(
+      lifecycleScopeKey,
+      lifecycleIdentity,
+    );
+    const deliveryVersion = ++this.lifecycleDeliverySequence;
+    this.latestLifecycleDeliveryByCorrelation.set(correlationKey, deliveryVersion);
+    this.deliverProfileLifecycle(
+      event,
+      projectId,
+      terminalId,
+      runtimeSessionId,
+      provider,
+      providerSessionId,
+      turnId,
+      observedAtUnixMs,
+      event === "providerTurnFinished" && data.succeeded === true,
+      lifecycleScopeKey,
+      lifecycleIdentity,
+      correlationKey,
+      deliveryVersion,
+      0,
+    );
+  }
+
+  private deliverProfileLifecycle(
+    event: "providerTurnStarted" | "providerTurnFinished",
+    projectId: string,
+    terminalId: string,
+    runtimeSessionId: string,
+    provider: ProfileLifecycleProvider,
+    providerSessionId: string | null,
+    turnId: string | null,
+    observedAtUnixMs: number,
+    succeeded: boolean,
+    lifecycleScopeKey: string,
+    lifecycleIdentity: string,
+    correlationKey: string,
+    deliveryVersion: number,
+    attempt: number,
+  ) {
+    if (
+      this.disposed ||
+      this.latestLifecycleDeliveryByCorrelation.get(correlationKey) !== deliveryVersion
+    ) {
+      return;
+    }
+    const activeIdentities = this.activeProfileIdentitiesByScope.get(lifecycleScopeKey);
+    const workingAfterEvent =
+      event === "providerTurnStarted" ||
+      (activeIdentities !== undefined &&
+        activeIdentities.size > (activeIdentities.has(lifecycleIdentity) ? 1 : 0));
+    const accepted = this.workspace.setProfileAgentTurnWorking(
+      projectId,
+      terminalId,
+      runtimeSessionId,
+      provider,
+      workingAfterEvent,
+      turnId,
+      observedAtUnixMs,
+    );
+    if (!accepted) {
+      const delayMs = AGENT_EVENT_BIND_RETRY_DELAYS_MS[attempt];
+      if (delayMs !== undefined) {
+        const timer = window.setTimeout(() => {
+          this.retryTimers.delete(timer);
+          this.deliverProfileLifecycle(
+            event,
+            projectId,
+            terminalId,
+            runtimeSessionId,
+            provider,
+            providerSessionId,
+            turnId,
+            observedAtUnixMs,
+            succeeded,
+            lifecycleScopeKey,
+            lifecycleIdentity,
+            correlationKey,
+            deliveryVersion,
+            attempt + 1,
+          );
+        }, delayMs);
+        this.retryTimers.add(timer);
+      }
+      return;
+    }
+    if (event === "providerTurnStarted") {
+      this.markProfileIdentityActive(lifecycleScopeKey, lifecycleIdentity);
+      return;
+    }
+    this.markProfileIdentityFinished(lifecycleScopeKey, lifecycleIdentity);
+
+    const finishedTurnKey = profileAgentTurnNotificationEventId(
+      provider,
+      providerSessionId,
+      turnId,
+      observedAtUnixMs,
+    );
+    let phoneNotificationQueued = this.phoneNotifiedFinishedTurns.has(finishedTurnKey);
+    if (!this.phoneNotifiedFinishedTurns.has(finishedTurnKey)) {
+      const labels = this.workspace.phoneNotificationLabels(
+        projectId,
+        terminalId,
+        provider,
+      );
+      if (labels) {
+        phoneNotificationQueued = true;
+        this.phoneNotifiedFinishedTurns.add(finishedTurnKey);
+        if (this.phoneNotifiedFinishedTurns.size > 512) {
+          const oldest = this.phoneNotifiedFinishedTurns.values().next().value;
+          if (typeof oldest === "string") {
+            this.phoneNotifiedFinishedTurns.delete(oldest);
+          }
+        }
+        void phoneNotifications.sendBackground(
+          succeeded ? "success" : "error",
+          finishedTurnKey,
+          labels,
+        );
+      } else {
+        console.warn("Discord notification skipped: terminal label mapping unavailable");
+      }
+    }
+    this.workspace.noteProfileAgentOutcome(
+      projectId,
+      terminalId,
+      runtimeSessionId,
+      provider,
+      succeeded,
+      phoneNotificationQueued,
+    );
+    if (
+      this.latestLifecycleDeliveryByCorrelation.get(correlationKey) === deliveryVersion
+    ) {
+      this.latestLifecycleDeliveryByCorrelation.delete(correlationKey);
+    }
+    this.workspace.queueProfileAgentCompletion(
+      projectId,
+      terminalId,
+      runtimeSessionId,
+      provider,
+      finishedTurnKey,
+    );
+  }
+
+  private markProfileIdentityActive(scopeKey: string, identity: string) {
+    let identities = this.activeProfileIdentitiesByScope.get(scopeKey);
+    if (!identities) {
+      if (
+        this.activeProfileIdentitiesByScope.size >=
+        MAX_ACTIVE_PROFILE_LIFECYCLE_SCOPES
+      ) {
+        const oldestScope = this.activeProfileIdentitiesByScope.keys().next().value;
+        if (typeof oldestScope === "string") {
+          this.activeProfileIdentitiesByScope.delete(oldestScope);
+        }
+      }
+      identities = new Set<string>();
+      this.activeProfileIdentitiesByScope.set(scopeKey, identities);
+    }
+    if (
+      !identities.has(identity) &&
+      identities.size >= MAX_ACTIVE_PROFILE_IDENTITIES_PER_SCOPE
+    ) {
+      const oldestIdentity = identities.values().next().value;
+      if (typeof oldestIdentity === "string") identities.delete(oldestIdentity);
+    }
+    identities.add(identity);
+  }
+
+  private markProfileIdentityFinished(scopeKey: string, identity: string) {
+    const identities = this.activeProfileIdentitiesByScope.get(scopeKey);
+    if (!identities) return;
+    identities.delete(identity);
+    if (identities.size === 0) this.activeProfileIdentitiesByScope.delete(scopeKey);
   }
 
   private onContextUpdated(data: Record<string, unknown>) {
@@ -9613,7 +10981,11 @@ class AgentEventController {
         notificationObservedAtUnixMs ?? observedAtUnixMs,
       );
       if (!this.phoneNotifiedFinishedTurns.has(phoneTurnKey)) {
-        const labels = this.workspace.phoneNotificationLabels(projectId, terminalId);
+        const labels = this.workspace.phoneNotificationLabels(
+          projectId,
+          terminalId,
+          provider,
+        );
         if (labels) {
           // Do not consume the dedupe key until the stable project/terminal
           // labels exist. A lifecycle event may beat workspace initialization;
@@ -9783,6 +11155,34 @@ function agentLifecycleCorrelationKey(
   ]);
 }
 
+function profileAgentLifecycleScopeKey(
+  projectId: string,
+  terminalId: string,
+  runtimeSessionId: string,
+  provider: ProfileLifecycleProvider,
+) {
+  return JSON.stringify([
+    projectId,
+    terminalId,
+    runtimeSessionId,
+    "profile",
+    provider,
+  ]);
+}
+
+function profileAgentLifecycleIdentity(
+  providerSessionId: string | null,
+  turnId: string | null,
+) {
+  if (providerSessionId !== null) return JSON.stringify(["session", providerSessionId]);
+  if (turnId !== null) return JSON.stringify(["turn", turnId]);
+  return JSON.stringify(["pane"]);
+}
+
+function profileAgentLifecycleCorrelationKey(scopeKey: string, identity: string) {
+  return JSON.stringify([scopeKey, identity]);
+}
+
 function rectContainsPoint(rect: DOMRectReadOnly, x: number, y: number) {
   return x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom;
 }
@@ -9794,6 +11194,15 @@ function paneCenter(slot: PaneGeometry) {
   };
 }
 
+function paneGeometryContainsPoint(slot: PaneGeometry, x: number, y: number) {
+  return (
+    x >= slot.left &&
+    x < slot.left + slot.width &&
+    y >= slot.top &&
+    y < slot.top + slot.height
+  );
+}
+
 function distanceToPaneCenter(point: { x: number; y: number }, slot: PaneGeometry) {
   const center = paneCenter(slot);
   return Math.hypot(point.x - center.x, point.y - center.y);
@@ -9803,6 +11212,10 @@ function closestPaneSlotIndex(
   point: { x: number; y: number },
   slots: readonly PaneGeometry[],
 ) {
+  const containingIndex = slots.findIndex((slot) =>
+    paneGeometryContainsPoint(slot, point.x, point.y),
+  );
+  if (containingIndex >= 0) return containingIndex;
   let closestIndex = 0;
   let closestDistance = Number.POSITIVE_INFINITY;
   slots.forEach((slot, index) => {
@@ -9872,6 +11285,41 @@ function normalizeAgentTurnId(value: unknown) {
     : null;
 }
 
+function isProfileLifecycleProvider(
+  value: unknown,
+): value is ProfileLifecycleProvider {
+  return (
+    value === "claude" ||
+    value === "opencode" ||
+    value === "cline" ||
+    value === "cursor"
+  );
+}
+
+function normalizeProfileLifecycleIdentifier(value: unknown) {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "string") return null;
+  const normalized = value.trim();
+  return normalized.length > 0 &&
+    normalized.length <= 512 &&
+    !/[\u0000-\u001f\u007f]/.test(normalized)
+    ? normalized
+    : null;
+}
+
+function compactLifecycleIdentity(value: string) {
+  let first = 0x811c9dc5;
+  let second = 0x9e3779b9;
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    first = Math.imul(first ^ code, 0x01000193);
+    second = Math.imul(second ^ code, 0x85ebca6b);
+  }
+  return `${(first >>> 0).toString(16).padStart(8, "0")}${(second >>> 0)
+    .toString(16)
+    .padStart(8, "0")}`;
+}
+
 function agentTurnPhoneNotificationEventId(
   provider: AgentProvider,
   conversationId: string,
@@ -9882,6 +11330,18 @@ function agentTurnPhoneNotificationEventId(
     return `agent-turn:v2:${provider}:${conversationId.toLowerCase()}:${turnId}`;
   }
   return `agent-turn:v1:${provider}:${conversationId.toLowerCase()}:${observedAtUnixMs}`;
+}
+
+function profileAgentTurnNotificationEventId(
+  provider: ProfileLifecycleProvider,
+  providerSessionId: string | null,
+  turnId: string | null,
+  observedAtUnixMs: number,
+) {
+  const identity = compactLifecycleIdentity(
+    JSON.stringify([providerSessionId ?? "pane", turnId ?? "turn"]),
+  );
+  return `profile-turn:v1:${provider}:${identity}:${observedAtUnixMs}`;
 }
 
 function createPhoneNotificationEventId(prefix: "turn" | "terminal" | "test") {
@@ -9930,6 +11390,167 @@ function isSafePositiveInteger(value: unknown): value is number {
   return isSafeNonNegativeInteger(value) && value > 0;
 }
 
+function normalizeAndroidVirtualDeviceName(value: unknown) {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim();
+  return normalized.length > 0 &&
+    normalized.length <= 256 &&
+    !/[\u0000-\u001f\u007f]/.test(normalized)
+    ? normalized
+    : null;
+}
+
+function normalizeAndroidEmulatorStatus(value: unknown): AndroidEmulatorStatus {
+  const invalidResponse = () =>
+    new Error(
+      tr(
+        "The Android Emulator status response is invalid.",
+        "Android 에뮬레이터 상태 응답이 올바르지 않습니다.",
+      ),
+    );
+  if (
+    !isRecord(value) ||
+    (value.state !== "ready" &&
+      value.state !== "emulatorMissing" &&
+      value.state !== "noVirtualDevices") ||
+    !Array.isArray(value.avds)
+  ) {
+    throw invalidResponse();
+  }
+  const avds: AndroidVirtualDevice[] = [];
+  const names = new Set<string>();
+  for (const candidate of value.avds) {
+    if (!isRecord(candidate) || typeof candidate.running !== "boolean") {
+      throw invalidResponse();
+    }
+    const name = normalizeAndroidVirtualDeviceName(candidate.name);
+    const identity = name?.toLocaleLowerCase("en-US") ?? "";
+    if (!name || names.has(identity)) throw invalidResponse();
+    names.add(identity);
+    avds.push({ name, running: candidate.running });
+  }
+  if (
+    (value.state === "ready" && avds.length === 0) ||
+    (value.state !== "ready" && avds.length > 0)
+  ) {
+    throw invalidResponse();
+  }
+  return { state: value.state, avds };
+}
+
+function normalizeAndroidEmulatorLaunchResult(
+  value: unknown,
+): AndroidEmulatorLaunchResult {
+  const avdName = isRecord(value)
+    ? normalizeAndroidVirtualDeviceName(value.avdName)
+    : null;
+  if (
+    !isRecord(value) ||
+    !avdName ||
+    typeof value.alreadyRunning !== "boolean" ||
+    (value.processId !== null && !isSafePositiveInteger(value.processId))
+  ) {
+    throw new Error(
+      tr(
+        "The Android Emulator launch response is invalid.",
+        "Android 에뮬레이터 실행 응답이 올바르지 않습니다.",
+      ),
+    );
+  }
+  return {
+    avdName,
+    alreadyRunning: value.alreadyRunning,
+    processId: value.processId,
+  };
+}
+
+function normalizeAndroidEmulatorCommandError(
+  value: unknown,
+): AndroidEmulatorCommandError | null {
+  if (
+    !isRecord(value) ||
+    (value.code !== "accessDenied" &&
+      value.code !== "workerFailed" &&
+      value.code !== "emulatorMissing" &&
+      value.code !== "avdListFailed" &&
+      value.code !== "noVirtualDevices" &&
+      value.code !== "invalidAvdName" &&
+      value.code !== "launchFailed") ||
+    typeof value.message !== "string" ||
+    value.message.length === 0 ||
+    value.message.length > 512 ||
+    /[\u0000-\u001f\u007f]/.test(value.message) ||
+    typeof value.retryable !== "boolean"
+  ) {
+    return null;
+  }
+  return {
+    code: value.code,
+    message: value.message,
+    retryable: value.retryable,
+  };
+}
+
+function androidEmulatorErrorMessage(error: unknown) {
+  const structured = normalizeAndroidEmulatorCommandError(error);
+  if (structured) {
+    switch (structured.code) {
+      case "accessDenied":
+        return tr(
+          "Android Emulator is unavailable from this view.",
+          "이 화면에서는 Android 에뮬레이터를 사용할 수 없습니다.",
+        );
+      case "workerFailed":
+        return tr(
+          "The Android Emulator operation did not complete. Try again.",
+          "Android 에뮬레이터 작업이 완료되지 않았습니다. 다시 시도하세요.",
+        );
+      case "emulatorMissing":
+        return tr(
+          "Android Emulator is not installed. Install it from Android Studio > SDK Manager > SDK Tools.",
+          "Android 에뮬레이터가 설치되어 있지 않습니다. Android Studio > SDK Manager > SDK Tools에서 설치하세요.",
+        );
+      case "avdListFailed":
+        return tr(
+          "Android Emulator could not read the virtual device list. Check Android Studio, then try again.",
+          "Android 에뮬레이터가 가상 기기 목록을 읽지 못했습니다. Android Studio를 확인한 다음 다시 시도하세요.",
+        );
+      case "noVirtualDevices":
+        return tr(
+          "No Android virtual devices were found. Create one in Android Studio > Device Manager.",
+          "Android 가상 기기를 찾지 못했습니다. Android Studio > Device Manager에서 새 기기를 만드세요.",
+        );
+      case "invalidAvdName":
+        return tr(
+          "The selected virtual device is no longer available. Reopen the launcher and choose again.",
+          "선택한 가상 기기를 더 이상 사용할 수 없습니다. 런처를 다시 열어 기기를 선택하세요.",
+        );
+      case "launchFailed":
+        return tr(
+          "Android Emulator could not be started. Check the device in Android Studio, then try again.",
+          "Android 에뮬레이터를 시작하지 못했습니다. Android Studio에서 기기를 확인한 다음 다시 시도하세요.",
+        );
+    }
+  }
+  if (error instanceof Error) {
+    const knownFrontendMessages = new Set([
+      tr(
+        "The Android Emulator status response is invalid.",
+        "Android 에뮬레이터 상태 응답이 올바르지 않습니다.",
+      ),
+      tr(
+        "The Android Emulator launch response is invalid.",
+        "Android 에뮬레이터 실행 응답이 올바르지 않습니다.",
+      ),
+    ]);
+    if (knownFrontendMessages.has(error.message)) return error.message;
+  }
+  return tr(
+    "The Android Emulator operation failed. Try again.",
+    "Android 에뮬레이터 작업에 실패했습니다. 다시 시도하세요.",
+  );
+}
+
 function normalizePhoneNotificationSettings(value: unknown): PhoneNotificationSettings {
   if (
     !isRecord(value) ||
@@ -9960,6 +11581,7 @@ const AGENT_SETTINGS_PROVIDER_ORDER = [
   "grok",
   "claudeCode",
   "openCode",
+  "cline",
   "cursor",
 ] as const satisfies readonly AgentSettingsProvider[];
 
@@ -10036,6 +11658,8 @@ function agentProviderDisplayName(provider: AgentSettingsProvider) {
       return "OpenCode";
     case "cursor":
       return "Cursor";
+    case "cline":
+      return "Cline";
   }
 }
 
@@ -10044,9 +11668,13 @@ function agentLaunchProfileDisplayName(profile: AgentSettingsLaunchProfile) {
     ? "Claude Code"
     : profile === "opencode"
       ? "OpenCode"
+      : profile === "cline"
+        ? "Cline"
+      : profile === "cursor"
+        ? "Cursor"
       : profile === "codex"
         ? "Codex"
-        : "Grok";
+       : "Grok";
 }
 
 function normalizeClipboardSnapshot(value: unknown): NativeClipboardSnapshot {
@@ -10111,7 +11739,8 @@ function requireAgentConnectionRows(panel: HTMLElement): AgentConnectionRowEleme
     ["grok", "grok"],
     ["claudeCode", "claude"],
     ["openCode", "opencode"],
-    ["cursor", null],
+    ["cline", "cline"],
+    ["cursor", "cursor"],
   ] as const satisfies readonly (readonly [
     AgentSettingsProvider,
     AgentSettingsLaunchProfile | null,
@@ -10149,6 +11778,19 @@ type ProviderUsageDetailLimitElements = {
   reset: HTMLElement;
 };
 
+type OpenAiStatusDetailElements = {
+  summary: HTMLElement;
+  summaryLabel: HTMLElement;
+  root: HTMLElement;
+  statusLabel: HTMLElement;
+  description: HTMLElement;
+  services: HTMLElement;
+  incidents: HTMLElement;
+  incidentList: HTMLElement;
+  checkedAt: HTMLElement;
+  refreshButton: HTMLButtonElement;
+};
+
 type ProviderUsageDetailElements = {
   popover: HTMLElement;
   title: HTMLElement;
@@ -10160,6 +11802,7 @@ type ProviderUsageDetailElements = {
   fiveHour: ProviderUsageDetailLimitElements;
   weekly: ProviderUsageDetailLimitElements;
   usageState: HTMLElement;
+  openAiStatus: OpenAiStatusDetailElements;
 };
 
 function formatProviderUsageTimestamp(value: string) {
@@ -10217,6 +11860,18 @@ function requireProviderUsageDetail(): ProviderUsageDetailElements {
     fiveHour: requireProviderUsageDetailLimit("provider-usage-detail-five-hour"),
     weekly: requireProviderUsageDetailLimit("provider-usage-detail-weekly"),
     usageState: requireElement("provider-usage-detail-state"),
+    openAiStatus: {
+      summary: requireElement("openai-status-summary"),
+      summaryLabel: requireElement("openai-status-summary-label"),
+      root: requireElement("openai-status-detail"),
+      statusLabel: requireElement("openai-status-detail-label"),
+      description: requireElement("openai-status-detail-description"),
+      services: requireElement("openai-status-services"),
+      incidents: requireElement("openai-status-incidents"),
+      incidentList: requireElement("openai-status-incident-list"),
+      checkedAt: requireElement("openai-status-checked-at"),
+      refreshButton: requireButton("refresh-openai-status"),
+    },
   };
 }
 
@@ -10230,7 +11885,19 @@ const addCodexButton = requireButton("add-codex-pane");
 const addGrokButton = requireButton("add-grok-pane");
 const addClaudeCodeButton = requireButton("add-claude-code-pane");
 const addOpenCodeButton = requireButton("add-opencode-pane");
+const addClineButton = requireButton("add-cline-pane");
+const addCursorButton = requireButton("add-cursor-pane");
 const addBrowserButton = requireButton("add-browser-pane");
+const launchAndroidEmulatorButton = requireButton("launch-android-emulator");
+const androidEmulatorDialog = requireDialog("android-emulator-dialog");
+const androidEmulatorForm = requireForm("android-emulator-form");
+const androidEmulatorTitle = requireElement("android-emulator-title");
+const androidEmulatorDescription = requireElement("android-emulator-description");
+const androidEmulatorOptions = requireElement("android-emulator-options");
+const androidEmulatorOptionList = requireElement("android-emulator-option-list");
+const androidEmulatorStatus = requireElement("android-emulator-status");
+const cancelAndroidEmulatorButton = requireButton("cancel-android-emulator");
+const confirmAndroidEmulatorButton = requireButton("confirm-android-emulator");
 const statusElement = requireElement("status");
 const projectSidebar = requireElement("project-sidebar");
 const toggleProjectSidebarButton = requireButton("toggle-project-sidebar");
@@ -10413,6 +12080,17 @@ const workspace = new TerminalWorkspace(
       provider,
       conversationId,
     ) ?? Promise.resolve(false),
+  (projectId, terminalId, runtimeSessionId, sessionId) =>
+    controller?.onClineSessionDiscovered(
+      projectId,
+      terminalId,
+      runtimeSessionId,
+      sessionId,
+    ) ??
+    Promise.resolve(false),
+  (projectId, terminalId, expectedSessionId) =>
+    controller?.onClineSessionInvalidated(projectId, terminalId, expectedSessionId) ??
+    Promise.resolve(false),
   (projectId, terminalId, working) =>
     controller?.setTerminalAgentWorking(projectId, terminalId, working),
   (projectId, terminalId) =>
@@ -10591,6 +12269,21 @@ mediaDrawer = new MediaDrawer(
     restoreFocus: () => workspace.focusActivePane(),
   },
 );
+const androidEmulatorLauncher = new AndroidEmulatorLauncherController(
+  launchAndroidEmulatorButton,
+  addButton,
+  androidEmulatorDialog,
+  androidEmulatorForm,
+  androidEmulatorTitle,
+  androidEmulatorDescription,
+  androidEmulatorOptions,
+  androidEmulatorOptionList,
+  androidEmulatorStatus,
+  cancelAndroidEmulatorButton,
+  confirmAndroidEmulatorButton,
+  (message, tone) => workspace.setFooterStatus(message, tone),
+  (open) => workspace.setModalOverlayOpen("android-emulator", open),
+);
 const paneLauncher = new PaneLauncherController(
   paneLauncherRoot,
   addButton,
@@ -10600,13 +12293,19 @@ const paneLauncher = new PaneLauncherController(
   addGrokButton,
   addClaudeCodeButton,
   addOpenCodeButton,
+  addClineButton,
+  addCursorButton,
   addBrowserButton,
+  launchAndroidEmulatorButton,
   () => void controller?.addTerminal(),
   () => void controller?.addTerminal("codex"),
   () => void controller?.addTerminal("grok"),
   () => void controller?.addTerminal("claude"),
   () => void controller?.addTerminal("opencode"),
+  () => void controller?.addTerminal("cline"),
+  () => void controller?.addTerminal("cursor"),
   () => void controller?.addBrowserPane(),
+  () => void androidEmulatorLauncher.open(),
 );
 let productionMigrationError: string | null = null;
 const productionMigrationPromise = invoke("import_discovered_production_catalog").catch(
@@ -10689,6 +12388,7 @@ void currentAppWindow.onCloseRequested(async (event) => {
     unsubscribeAppLanguage();
     mediaDrawer?.dispose();
     controller?.dispose();
+    androidEmulatorLauncher.dispose();
     paneLauncher.dispose();
     void workspace.dispose();
     await currentAppWindow.destroy();
@@ -10696,6 +12396,7 @@ void currentAppWindow.onCloseRequested(async (event) => {
   }
 
   closeBarrierRunning = true;
+  androidEmulatorLauncher.beginShutdown();
   paneLauncher.beginShutdown();
   try {
     await initializationPromise;
@@ -10710,6 +12411,7 @@ void currentAppWindow.onCloseRequested(async (event) => {
     unsubscribeAppLanguage();
     mediaDrawer?.dispose();
     controller?.dispose();
+    androidEmulatorLauncher.dispose();
     paneLauncher.dispose();
     // Use one backend-owned barrier instead of twenty pane-local stop IPCs. It
     // rejects queued starts, waits until every spawned child belongs to a Job
@@ -10736,6 +12438,7 @@ window.addEventListener("beforeunload", () => {
   unsubscribeAppLanguage();
   mediaDrawer?.dispose();
   controller?.dispose();
+  androidEmulatorLauncher.dispose();
   paneLauncher.dispose();
   void workspace.dispose();
 });

@@ -862,10 +862,10 @@ button:disabled {
 .sidebar-footer {
   grid-area: footer;
   display: grid;
-  min-height: 54px;
+  min-height: 40px;
   gap: 7px;
   align-content: center;
-  padding: 9px 10px;
+  padding: 2px 10px;
   border-top: 1px solid var(--line-soft);
 }
 
@@ -1167,16 +1167,91 @@ button:disabled {
 }
 
 .pane-launcher-toggle {
-  display: inline-flex;
+  display: inline-grid;
+  height: 30px;
+  grid-template-columns: auto 22px;
   align-items: center;
-  gap: 8px;
+  gap: 0;
+  padding: 0;
+  overflow: hidden;
+  border-color: var(--line);
+  border-radius: 5px;
+  color: var(--text-secondary);
+  background: #111111;
+  box-shadow:
+    inset 0 1px 0 rgb(255 255 255 / 4%),
+    0 1px 2px rgb(0 0 0 / 24%);
+}
+
+.pane-launcher-primary {
+  display: inline-flex;
+  height: 100%;
+  align-items: center;
+  gap: 5px;
+  padding: 0 7px 0 8px;
+}
+
+.pane-launcher-plus {
+  width: 11px;
+  height: 11px;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-width: 1.45;
 }
 
 .pane-launcher-chevron {
-  color: currentColor;
-  font-size: 10px;
-  opacity: 0.7;
-  transform: translateY(-1px);
+  display: grid;
+  width: 22px;
+  height: 100%;
+  place-items: center;
+  border-left: 1px solid var(--line);
+  color: var(--muted);
+  transition:
+    color 120ms ease,
+    background-color 120ms ease;
+}
+
+.pane-launcher-chevron svg {
+  width: 10px;
+  height: 10px;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.35;
+  transition: transform 140ms ease;
+}
+
+.pane-launcher-toggle:hover:not(:disabled) {
+  border-color: var(--line-strong);
+  color: #ffffff;
+  background: var(--surface-hover);
+}
+
+.pane-launcher-toggle:hover:not(:disabled) .pane-launcher-chevron {
+  color: var(--text-secondary);
+  background: var(--surface-active);
+}
+
+.pane-launcher-toggle:active:not(:disabled) {
+  background: var(--surface);
+  box-shadow: inset 0 1px 3px rgb(0 0 0 / 55%);
+}
+
+.pane-launcher-toggle[aria-expanded="true"] {
+  border-color: var(--line-strong);
+  color: #ffffff;
+  background: var(--surface-active);
+}
+
+.pane-launcher-toggle[aria-expanded="true"] .pane-launcher-chevron {
+  color: var(--text);
+  background: var(--line);
+}
+
+.pane-launcher-toggle[aria-expanded="true"] .pane-launcher-chevron svg {
+  transform: rotate(180deg);
 }
 
 .pane-launcher-menu {
@@ -1224,6 +1299,22 @@ button:disabled {
   justify-self: center;
   object-fit: contain;
   opacity: 0.88;
+}
+
+.pane-launcher-menu > .pane-launcher-external {
+  position: relative;
+  margin-top: 7px;
+}
+
+.pane-launcher-menu > .pane-launcher-external::before {
+  position: absolute;
+  top: -4px;
+  right: 7px;
+  left: 7px;
+  height: 1px;
+  background: var(--line);
+  content: "";
+  pointer-events: none;
 }
 
 .toolbar-spacer {
@@ -1390,6 +1481,8 @@ button:disabled {
 }
 
 .media-card {
+  --content-file-accent: #8d8d8d;
+  --content-file-tint: rgb(141 141 141 / 8%);
   position: relative;
   display: grid;
   min-width: 0;
@@ -1404,6 +1497,66 @@ button:disabled {
   background: #0e0e0e;
   text-align: left;
   user-select: none;
+}
+
+:is(.media-card, .content-file-drag-ghost, .media-card-file-icon)[data-file-family="folder"] {
+  --content-file-accent: #b09a6a;
+  --content-file-tint: rgb(176 154 106 / 10%);
+}
+
+:is(.media-card, .content-file-drag-ghost, .media-card-file-icon)[data-file-family="image"] {
+  --content-file-accent: #9587ac;
+  --content-file-tint: rgb(149 135 172 / 10%);
+}
+
+:is(.media-card, .content-file-drag-ghost, .media-card-file-icon)[data-file-family="video"] {
+  --content-file-accent: #aa7d83;
+  --content-file-tint: rgb(170 125 131 / 10%);
+}
+
+:is(.media-card, .content-file-drag-ghost, .media-card-file-icon)[data-file-family="audio"] {
+  --content-file-accent: #b48c66;
+  --content-file-tint: rgb(180 140 102 / 10%);
+}
+
+:is(.media-card, .content-file-drag-ghost, .media-card-file-icon)[data-file-family="code"] {
+  --content-file-accent: #7896aa;
+  --content-file-tint: rgb(120 150 170 / 10%);
+}
+
+:is(.media-card, .content-file-drag-ghost, .media-card-file-icon)[data-file-family="document"] {
+  --content-file-accent: #7f9b82;
+  --content-file-tint: rgb(127 155 130 / 10%);
+}
+
+:is(.media-card, .content-file-drag-ghost, .media-card-file-icon)[data-file-family="data"] {
+  --content-file-accent: #719a94;
+  --content-file-tint: rgb(113 154 148 / 10%);
+}
+
+:is(.media-card, .content-file-drag-ghost, .media-card-file-icon)[data-file-family="config"] {
+  --content-file-accent: #9385a5;
+  --content-file-tint: rgb(147 133 165 / 10%);
+}
+
+:is(.media-card, .content-file-drag-ghost, .media-card-file-icon)[data-file-family="archive"] {
+  --content-file-accent: #a89568;
+  --content-file-tint: rgb(168 149 104 / 10%);
+}
+
+:is(.media-card, .content-file-drag-ghost, .media-card-file-icon)[data-file-family="font"] {
+  --content-file-accent: #8e9e79;
+  --content-file-tint: rgb(142 158 121 / 10%);
+}
+
+:is(.media-card, .content-file-drag-ghost, .media-card-file-icon)[data-file-family="executable"] {
+  --content-file-accent: #aa7171;
+  --content-file-tint: rgb(170 113 113 / 11%);
+}
+
+:is(.media-card, .content-file-drag-ghost, .media-card-file-icon)[data-file-family="generic"] {
+  --content-file-accent: #8d8d8d;
+  --content-file-tint: rgb(141 141 141 / 8%);
 }
 
 .media-card[data-kind="image"],
@@ -1425,6 +1578,11 @@ button:disabled {
   outline: none;
 }
 
+.media-card[data-file-family]:hover,
+.media-card[data-file-family]:focus-visible {
+  border-color: var(--content-file-accent);
+}
+
 .media-card-preview {
   position: relative;
   display: grid;
@@ -1433,6 +1591,7 @@ button:disabled {
   place-items: center;
   overflow: hidden;
   background:
+    linear-gradient(180deg, var(--content-file-tint), transparent 62%),
     linear-gradient(45deg, #111 25%, transparent 25%) 0 0 / 14px 14px,
     linear-gradient(-45deg, #111 25%, transparent 25%) 0 7px / 14px 14px,
     linear-gradient(45deg, transparent 75%, #111 75%) 7px -7px / 14px 14px,
@@ -1458,17 +1617,21 @@ button:disabled {
 }
 
 .media-card-file-icon {
+  --content-file-accent: #8d8d8d;
+  --content-file-tint: rgb(141 141 141 / 8%);
   position: relative;
   display: grid;
-  width: 40px;
-  height: 50px;
+  width: 42px;
+  height: 52px;
   place-items: end center;
-  padding: 0 3px 8px;
+  padding: 0 4px 7px;
   overflow: hidden;
-  border: 1px solid #6c6c6c;
+  border: 1px solid var(--content-file-accent);
   border-radius: 4px;
-  color: #bcbcbc;
-  background: #161616;
+  color: var(--content-file-accent);
+  background:
+    linear-gradient(155deg, var(--content-file-tint), transparent 68%),
+    #151515;
   box-shadow: inset 0 0 0 1px rgb(255 255 255 / 2%);
 }
 
@@ -1478,11 +1641,27 @@ button:disabled {
   right: -1px;
   width: 12px;
   height: 12px;
-  border-bottom: 1px solid #6c6c6c;
-  border-left: 1px solid #6c6c6c;
+  border-bottom: 1px solid var(--content-file-accent);
+  border-left: 1px solid var(--content-file-accent);
   background: #0b0b0b;
   content: "";
   transform: translate(4px, -4px) rotate(45deg);
+}
+
+.media-card-file-marker {
+  position: absolute;
+  top: 8px;
+  left: 6px;
+  max-width: 27px;
+  overflow: hidden;
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 8px;
+  font-weight: 700;
+  letter-spacing: -0.04em;
+  line-height: 1;
+  opacity: 0.78;
+  text-overflow: clip;
+  white-space: nowrap;
 }
 
 .media-card-file-extension {
@@ -1491,7 +1670,10 @@ button:disabled {
   max-width: 100%;
   overflow: hidden;
   font-family: "Cascadia Mono", Consolas, monospace;
-  font-size: 7px;
+  padding: 2px 3px;
+  border-radius: 2px;
+  background: var(--content-file-tint);
+  font-size: 8px;
   font-weight: 700;
   letter-spacing: 0.03em;
   text-overflow: ellipsis;
@@ -1517,9 +1699,11 @@ button:disabled {
   position: relative;
   width: 48px;
   height: 34px;
-  border: 1px solid #767676;
+  border: 1px solid var(--content-file-accent);
   border-radius: 4px;
-  background: #171717;
+  background:
+    linear-gradient(155deg, var(--content-file-tint), transparent 72%),
+    #171717;
 }
 
 .media-card-folder-icon::before {
@@ -1528,7 +1712,7 @@ button:disabled {
   left: 5px;
   width: 20px;
   height: 9px;
-  border: 1px solid #767676;
+  border: 1px solid var(--content-file-accent);
   border-bottom: 0;
   border-radius: 4px 4px 0 0;
   background: #171717;
@@ -1581,6 +1765,10 @@ button:disabled {
   background: #111;
 }
 
+.media-card[data-file-family] .media-card-details {
+  box-shadow: inset 2px 0 0 var(--content-file-accent);
+}
+
 .media-card-details strong,
 .media-card-details small {
   overflow: hidden;
@@ -1597,6 +1785,16 @@ button:disabled {
 .media-card-details small {
   color: var(--faint);
   font-size: 8px;
+}
+
+.media-card[data-file-family] .media-card-details small {
+  color: var(--content-file-accent);
+}
+
+.media-card[data-file-restricted="true"] .media-card-file-icon {
+  box-shadow:
+    inset 0 -2px 0 #aa7171,
+    inset 0 0 0 1px rgb(255 255 255 / 2%);
 }
 
 .media-drawer-message {
@@ -1737,6 +1935,24 @@ button:disabled {
   font-size: 5px;
 }
 
+.content-file-drag-ghost-icon .media-card-file-marker {
+  display: none;
+}
+
+@media (forced-colors: active) {
+  .media-card[data-file-family],
+  .content-file-drag-ghost[data-file-family],
+  .media-card-file-icon[data-file-family] {
+    --content-file-accent: ButtonText;
+    --content-file-tint: transparent;
+  }
+
+  .media-card[data-file-family] .media-card-details {
+    border-left: 2px solid ButtonText;
+    box-shadow: none;
+  }
+}
+
 .content-file-delete-dialog {
   width: min(410px, calc(100vw - 40px));
 }
@@ -1855,28 +2071,29 @@ button:disabled {
 
 .terminal-rows {
   --terminal-row-count: 1;
+  --terminal-layout-gap: 5px;
   position: absolute;
   inset: 6px;
   z-index: 1;
   display: grid;
   grid-template-rows: repeat(var(--terminal-row-count), minmax(0, 1fr));
-  gap: 5px;
+  gap: var(--terminal-layout-gap);
   min-width: 0;
   min-height: 0;
 }
 
 .terminal-row {
   display: flex;
-  gap: 5px;
+  gap: var(--terminal-layout-gap);
   min-width: 0;
   min-height: 0;
   overflow: visible;
 }
 
-.terminal-row-spacer {
-  min-width: 0;
-  min-height: 0;
-  pointer-events: none;
+.terminal-row--bottom-fill-band {
+  display: grid;
+  grid-template-rows: repeat(2, minmax(0, 1fr));
+  gap: var(--terminal-layout-gap);
 }
 
 .inactive-pane-bin {
@@ -2640,7 +2857,8 @@ body[data-pane-resizing="true"] .terminal-resize-handle::after {
 
 .statusbar {
   position: relative;
-  z-index: 10;
+  /* Keep remaining-usage controls above the content browser drawer. */
+  z-index: 80;
   display: flex;
   align-items: center;
   gap: 16px;
@@ -2768,6 +2986,66 @@ img.provider-icon {
   font-size: 8px;
   font-weight: 700;
   letter-spacing: 0.065em;
+}
+
+.openai-service-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-right: 5px;
+  color: var(--muted);
+  font-size: 8px;
+  font-variant-numeric: tabular-nums;
+}
+
+.openai-service-state[hidden] {
+  display: none;
+}
+
+.openai-service-state-dot {
+  width: 5px;
+  height: 5px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: #686868;
+}
+
+.openai-service-state-name {
+  color: var(--faint);
+  font-weight: 650;
+  letter-spacing: 0.035em;
+}
+
+.openai-service-state[data-tone="normal"] .openai-service-state-dot {
+  background: #b8b8b8;
+}
+
+.openai-service-state[data-tone="warning"] {
+  color: #d6b84b;
+}
+
+.openai-service-state[data-tone="warning"] .openai-service-state-dot {
+  background: #d6b84b;
+}
+
+.openai-service-state[data-tone="error"] {
+  color: #e05a5a;
+}
+
+.openai-service-state[data-tone="error"] .openai-service-state-dot {
+  background: #e05a5a;
+}
+
+.openai-service-state[data-tone="maintenance"] {
+  color: #9a9a9a;
+}
+
+.openai-service-state[data-tone="maintenance"] .openai-service-state-dot {
+  background: #9a9a9a;
+}
+
+.openai-service-state[data-stale="true"] {
+  opacity: 0.62;
 }
 
 .usage-label {
@@ -2963,6 +3241,152 @@ img.provider-icon {
   border-color: #ffffff !important;
   color: #000000;
   background: #ffffff !important;
+}
+
+.android-emulator-dialog {
+  width: min(440px, calc(100vw - 36px));
+}
+
+.android-emulator-dialog form {
+  gap: 14px;
+}
+
+.android-emulator-options {
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.android-emulator-options[hidden] {
+  display: none;
+}
+
+.android-emulator-options legend {
+  margin-bottom: 7px;
+  padding: 0;
+  color: var(--muted);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.025em;
+  text-transform: uppercase;
+}
+
+.android-emulator-option-list {
+  display: grid;
+  max-height: min(300px, 44dvh);
+  gap: 4px;
+  padding: 1px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-color: #4a4a4a transparent;
+  scrollbar-width: thin;
+}
+
+.project-dialog .android-emulator-option {
+  display: grid;
+  min-height: 46px;
+  grid-template-columns: 18px minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  color: var(--text-secondary);
+  background: var(--canvas);
+  cursor: pointer;
+  transition:
+    border-color 120ms ease,
+    background-color 120ms ease;
+}
+
+.project-dialog .android-emulator-option:hover {
+  border-color: var(--line-strong);
+  background: var(--surface-hover);
+}
+
+.project-dialog .android-emulator-option:has(input:checked) {
+  border-color: #525252;
+  background: var(--surface-active);
+}
+
+.project-dialog .android-emulator-option:has(input:focus-visible) {
+  outline: 1px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+.project-dialog .android-emulator-option input {
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  accent-color: #e8e8e8;
+  background: transparent;
+  cursor: pointer;
+  user-select: none;
+}
+
+.project-dialog .android-emulator-option input:focus-visible {
+  outline: 0;
+}
+
+.android-emulator-option-copy {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.android-emulator-option-copy strong {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text);
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 10px;
+  font-weight: 550;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.android-emulator-option-copy small {
+  flex: 0 0 auto;
+  padding: 2px 5px;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  color: var(--text-secondary);
+  font-size: 8px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.android-emulator-status {
+  min-height: 30px;
+  margin: -2px 0 0;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.android-emulator-status[hidden] {
+  display: none;
+}
+
+.android-emulator-status[data-tone="error"] {
+  color: var(--text-secondary);
+  font-weight: 600;
+}
+
+@media (forced-colors: active) {
+  .project-dialog .android-emulator-option:has(input:checked) {
+    border-color: Highlight;
+  }
+
+  .android-emulator-option-copy small {
+    border-color: ButtonText;
+  }
 }
 
 .project-delete-dialog {
@@ -3623,6 +4047,158 @@ img.provider-icon {
   letter-spacing: 0.055em;
 }
 
+.openai-status-detail {
+  display: grid;
+  gap: 8px;
+  padding: 11px 2px;
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.openai-status-detail[hidden] {
+  display: none;
+}
+
+.openai-status-detail-heading,
+.openai-status-service,
+.openai-status-detail-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.openai-status-detail-heading > span,
+.openai-status-incidents-heading {
+  color: var(--faint);
+  font-size: 9px;
+}
+
+.openai-status-detail-heading > strong {
+  color: var(--text-secondary);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.openai-status-detail-heading > strong[data-tone="warning"] {
+  color: #d6b84b;
+}
+
+.openai-status-detail-heading > strong[data-tone="error"] {
+  color: #e05a5a;
+}
+
+.openai-status-detail-heading > strong[data-tone="maintenance"] {
+  color: #9a9a9a;
+}
+
+.openai-status-detail-description {
+  margin: 0;
+  color: var(--muted);
+  font-size: 9px;
+  line-height: 1.45;
+}
+
+.openai-status-detail-description:empty {
+  display: none;
+}
+
+.openai-status-services {
+  display: grid;
+  gap: 5px;
+}
+
+.openai-status-service {
+  min-height: 17px;
+  color: var(--muted);
+  font-size: 9px;
+}
+
+.openai-status-service > span:last-child {
+  color: var(--text-secondary);
+}
+
+.openai-status-service[data-tone="warning"] > span:last-child {
+  color: #d6b84b;
+}
+
+.openai-status-service[data-tone="error"] > span:last-child {
+  color: #e05a5a;
+}
+
+.openai-status-service[data-tone="maintenance"] > span:last-child {
+  color: #9a9a9a;
+}
+
+.openai-status-incidents {
+  display: grid;
+  gap: 6px;
+  padding-top: 2px;
+}
+
+.openai-status-incidents[hidden] {
+  display: none;
+}
+
+.openai-status-incident-list {
+  display: grid;
+  gap: 6px;
+}
+
+.openai-status-incident {
+  display: grid;
+  gap: 3px;
+  padding-left: 8px;
+  border-left: 1px solid #555555;
+}
+
+.openai-status-incident strong {
+  color: var(--text-secondary);
+  font-size: 9px;
+  font-weight: 650;
+  line-height: 1.4;
+}
+
+.openai-status-incident span,
+.openai-status-incident p {
+  margin: 0;
+  color: var(--faint);
+  font-size: 8px;
+  line-height: 1.45;
+}
+
+.openai-status-detail-footer {
+  min-height: 22px;
+  padding-top: 2px;
+  color: var(--faint);
+  font-size: 8px;
+}
+
+.openai-status-detail-footer button {
+  display: grid;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  color: var(--muted);
+  background: transparent;
+  place-items: center;
+  font: inherit;
+  font-size: 13px;
+}
+
+.openai-status-detail-footer button:hover:not(:disabled),
+.openai-status-detail-footer button:focus-visible {
+  color: var(--text);
+  background: #1b1b1b;
+}
+
+.openai-status-detail-footer button:disabled {
+  color: var(--faint);
+  cursor: wait;
+  opacity: 0.55;
+}
+
 .provider-usage-popover-close {
   display: grid;
   width: 22px;
@@ -3916,6 +4492,18 @@ img.provider-icon {
 }
 
 @media (max-width: 620px) {
+  .android-emulator-dialog {
+    width: min(440px, calc(100vw - 24px));
+  }
+
+  .android-emulator-dialog form {
+    padding: 18px;
+  }
+
+  .android-emulator-option-list {
+    max-height: 38dvh;
+  }
+
   .settings-dialog {
     width: min(520px, calc(100vw - 24px));
   }
